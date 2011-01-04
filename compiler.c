@@ -6,10 +6,161 @@
 #include "utils/syscache.h"
 
 
-Plpsm_stmt *plpsm_parser_result;
+Plpsm_stmt *plpsm_parser_tree;
 
-static void compile(Plpsm_stmt *stmt, Plpsm_pcode_module *m);
+typedef struct
+{
+	Plpsm_object *top_scope;
+	Plpsm_object *current_scope;			/* pointer to outer compound statement */
+	int16	variables;
+	int16		max_variables;			/* max variables in one visible scope */
+	int16	current_offset;
+} CompilationContextData;
 
+typedef CompilationContextData *CompilationContext;
+
+static void compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m);
+
+/*
+ * It registers a psm object to nested objects. 
+ */
+static void
+append_object(Plpsm_object *parent, Plpsm_object *child)
+{
+	Assert(parent != NULL);
+	Assert(child != NULL);
+
+	child->last = child;
+	child->inner = NULL;
+	child->next = NULL;
+
+	child->outer = parent;
+	if (parent->inner != NULL)
+	{
+		Assert (parent->inner->last->next == NULL);
+
+		parent->inner->last->next = child;
+		parent->inner->last = child;
+	}
+	else
+		parent->inner = child;
+}
+
+/*
+ * Create a compiler object for any stmt statement
+ * and append it to nested compiler objects.
+ */
+static Plpsm_object *
+new_object_for(Plpsm_stmt *stmt, Plpsm_object *outer)
+{
+	Plpsm_object *new = palloc0(sizeof(Plpsm_object));
+	new->typ = stmt->typ;
+	new->stmt = stmt;
+	if (outer != NULL)
+		append_object(outer, new);
+	if (stmt)
+		new->name = stmt->name;
+	return new;
+}
+
+/*
+ * Search a label in current scope
+ */
+static Plpsm_object *
+get_object_with_label_in_scope(Plpsm_object *scope, char *name)
+{
+	Plpsm_object *iterator;
+
+	if (scope == NULL)
+		return NULL;
+
+	iterator = scope->inner;
+
+	while (iterator != NULL)
+	{
+		switch (iterator->typ)
+		{
+			case PLPSM_STMT_COMPOUND_STATEMENT:
+			case PLPSM_STMT_LOOP:
+			case PLPSM_STMT_WHILE:
+			case PLPSM_STMT_REPEAT_UNTIL:
+			case PLPSM_STMT_FOR:
+				if (iterator->name && strcmp(iterator->stmt->name, name) == 0)
+					return iterator;
+				break;
+			default:
+				/* be compiler quite */;
+		}
+		iterator = iterator->next;
+	}
+
+	/* try to find label in outer scope */
+	return get_object_with_label_in_scope(scope->outer, name);
+}
+
+/*
+ * new variable
+ */
+static Plpsm_object *
+new_variable(Plpsm_object *scope, char *name, Plpsm_stmt *stmt)
+{
+	Plpsm_object *iterator = scope->inner;
+	Plpsm_object *var;
+
+	Assert(scope->typ == PLPSM_STMT_COMPOUND_STATEMENT);
+
+	while (iterator != NULL)
+	{
+		switch (iterator->typ)
+		{
+			case PLPSM_STMT_DECLARE_VARIABLE:
+			case PLPSM_STMT_DECLARE_CURSOR:
+				if (strcmp(iterator->name, name) == 0)
+					elog(ERROR, "identifier \"%s\" is used yet", name);
+				break;
+			default:
+				/* be compiler quite */;
+		}
+		iterator = iterator->next;
+	}
+	var = new_object_for(stmt, scope);
+	var->name = name;
+
+	return var;
+}
+
+/*
+ * create a new psm object for psm statement
+ */
+static Plpsm_object *
+new_psm_object_for(Plpsm_stmt *stmt, CompilationContext ctxt, int iterate_addr)
+{
+	Plpsm_object *new;
+
+	switch (stmt->typ)
+	{
+		case PLPSM_STMT_COMPOUND_STATEMENT:
+		case PLPSM_STMT_LOOP:
+		case PLPSM_STMT_WHILE:
+		case PLPSM_STMT_REPEAT_UNTIL:
+		case PLPSM_STMT_FOR:
+			if (stmt->name && get_object_with_label_in_scope(ctxt->current_scope, stmt->name) != NULL)
+				elog(ERROR, "label \"%s\" is defined in current scope", stmt->name);
+			new = new_object_for(stmt, ctxt->current_scope);
+			new->iterate_addr = iterate_addr;
+			ctxt->current_scope = new;
+			break;
+		default:
+			new = new_object_for(stmt, ctxt->current_scope);
+			break;
+	}
+	
+	return new;
+}
+
+/*
+ * Create a overdimensioned module
+ */
 static Plpsm_pcode_module *
 init_module(void)
 {
@@ -72,6 +223,15 @@ list(Plpsm_pcode_module *m)
 			case PCODE_IF_NOTEXIST_PREPARE:
 				appendStringInfo(&ds, "prepere_ifnexist %s as %s", m->code[pc].prep.name, m->code[pc].prep.expr);
 				break;
+			case PCODE_SET_NULL:
+				appendStringInfo(&ds, "set_to_null %d", m->code[pc].offset);
+				break;
+			case PCODE_PALLOC:
+				appendStringInfo(&ds, "palloc %dB", m->code[pc].size);
+				break;
+			case PCODE_SAVETO:
+				appendStringInfo(&ds, "store to %d", m->code[pc].offset);
+				break;
 		}
 		appendStringInfoChar(&ds, '\n');
 	}
@@ -88,6 +248,8 @@ list(Plpsm_pcode_module *m)
 #define SET_TARGET(a, ta)		m->code[a].addr = ta
 #define PC(m)				m->length
 #define SET_PREP(m, n, q)		m->code[m->length].prep.name = n; m->code[m->length].prep.expr = q
+#define SET_SIZE(m, a, s)		m->code[a].size = s
+#define SET_OFFSET(m, o)		m->code[m->length].offset = o
 
 static void
 store_debug_info(Plpsm_pcode_module *m, char *str)
@@ -153,6 +315,14 @@ store_print(Plpsm_pcode_module *m)
 }
 
 static void
+store_saveto(Plpsm_pcode_module *m, int16 offset)
+{
+	CHECK_MODULE_SIZE(m);
+	SET_OFFSET(m, offset);
+	SET_AND_INC_PC(m, PCODE_SAVETO);
+}
+
+static void
 store_return(Plpsm_pcode_module *m)
 {
 	CHECK_MODULE_SIZE(m);
@@ -166,14 +336,10 @@ store_done(Plpsm_pcode_module *m)
 	SET_AND_INC_PC(m, PCODE_DONE);
 }
 
-static void
-push_label(char *name, int addr)
+static Plpsm_object *
+release_psm_object(Plpsm_object *obj)
 {
-}
-
-static void
-pop_label(char *name, int addr)
-{
+	return obj->outer;
 }
 
 /*
@@ -184,27 +350,117 @@ pop_label(char *name, int addr)
  * to dynamic object is necessary, then dynamic SQL must be used. ???
  */
 static void 
-compile(Plpsm_stmt *stmt, Plpsm_pcode_module *m)
+compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 {
 	int	addr1;
 	int	addr2;
+	Plpsm_object *obj;
 
 	while (stmt != NULL)
 	{
-		if (stmt->debug != NULL)
-			store_debug_info(m, stmt->debug);
+		//if (stmt->debug != NULL)
+		//	store_debug_info(m, stmt->debug);
 
 		switch (stmt->typ)
 		{
+			case PLPSM_STMT_LOOP:
+				obj = new_psm_object_for(stmt, ctxt, PC(m));
+				addr1 = PC(m);
+				compile(ctxt, stmt->inner_left, m);
+				store_jmp(m, addr1);
+				ctxt->current_scope = release_psm_object(obj);
+				break;
+
+			case PLPSM_STMT_WHILE:
+				obj = new_psm_object_for(stmt, ctxt, PC(m));
+				addr1 = PC(m);
+				store_exec_expr(m, stmt->expr, BOOLOID);
+				addr2 = store_jmp_not_true_unknown(m);
+				compile(ctxt, stmt->inner_left, m);
+				store_jmp(m, addr1);
+				SET_TARGET(addr2, PC(m));
+				ctxt->current_scope = release_psm_object(obj);
+				break;
+
+			case PLPSM_STMT_REPEAT_UNTIL:
+				obj = new_psm_object_for(stmt, ctxt, PC(m));
+				addr1 = PC(m);
+				compile(ctxt, stmt->inner_left, m);
+				store_exec_expr(m, stmt->expr, BOOLOID);
+				addr2 = store_jmp_not_true_unknown(m);
+				store_jmp(m, addr1);
+				SET_TARGET(addr2, PC(m));
+				ctxt->current_scope = release_psm_object(obj);
+				break;
+
+			case PLPSM_STMT_COMPOUND_STATEMENT:
+				{
+					int16	offset = ctxt->current_offset;
+					int16	variables = ctxt->variables;
+
+					obj = new_psm_object_for(stmt, ctxt, PC(m));
+					compile(ctxt, stmt->inner_left, m);
+					ctxt->current_offset = offset;
+					if (ctxt->variables > ctxt->max_variables)
+						ctxt->max_variables = ctxt->variables;
+					ctxt->variables = variables;
+
+					/* generate release block */
+					if (obj->has_release_block)
+					{
+						if (obj->release_address_list != NULL)
+						{
+							/* generate a release block as subrotine */
+							addr1 = store_call_unknown(m);
+							addr2 = store_jmp_unknown(m);
+							SET_TARGET(addr1, PC(m));
+							store_return(m);
+							SET_TARGET(addr2, PC(m));
+						}
+						else
+						{
+						}
+					}
+					
+					ctxt->current_scope = release_psm_object(obj);
+					break;
+				}
+
+			case PLPSM_STMT_DECLARE_VARIABLE:
+				{
+					ListCell *l;
+				foreach(l, stmt->compound_target)
+				{
+					char *name = strVal(lfirst(l));
+			elog(NOTICE, ">>>>%s", name);
+
+				obj = new_variable(ctxt->current_scope, name, stmt);
+				obj->offset = ctxt->current_offset++;
+				if (stmt->expr != NULL)
+				{
+					store_exec_expr(m, stmt->expr, stmt->vartype.typoid);
+					store_saveto(m, obj->offset);
+				}
+				else
+				{
+					CHECK_MODULE_SIZE(m);
+					SET_OFFSET(m, obj->offset);
+					SET_AND_INC_PC(m, PCODE_SET_NULL);
+				}
+				ctxt->variables += 1;
+				}
+				}
+				break;
+
 			case PLPSM_STMT_IF:
 				store_exec_expr(m, stmt->expr, BOOLOID);
 				addr1 = store_jmp_not_true_unknown(m);
-				compile(stmt->inner_left, m);
+				compile(ctxt, stmt->inner_left, m);
 				if (stmt->inner_right)
 				{
 					addr2 = store_jmp_unknown(m);
 					SET_TARGET(addr1, PC(m));
-					compile(stmt->inner_right, m);
+					compile(ctxt, stmt->inner_right, m);
 					SET_TARGET(addr2, PC(m));
 				}
 				else
@@ -216,55 +472,8 @@ compile(Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 				store_print(m);
 				break;
 
-			case PLPSM_STMT_LOOP:
-				if (stmt->name != NULL)
-					push_label(stmt->name, PC(m));
-				addr1 = PC(m);
-				compile(stmt->inner_left, m);
-				store_jmp(m, addr1);
-				if (stmt->name != NULL)
-					pop_label(stmt->name, PC(m));		/* set all leave statements */
-				break;
-
-			case PLPSM_STMT_WHILE:
-				if (stmt->name != NULL)
-					push_label(stmt->name, PC(m));
-				addr1 = PC(m);
-				store_exec_expr(m, stmt->expr, BOOLOID);
-				addr2 = store_jmp_not_true_unknown(m);
-				compile(stmt->inner_left, m);
-				store_jmp(m, addr1);
-				if (stmt->name != NULL)
-					pop_label(stmt->name, PC(m));
-				SET_TARGET(addr2, PC(m));
-				break;
-
-			case PLPSM_STMT_REPEAT_UNTIL:
-				if (stmt->name != NULL)
-					push_label(stmt->name, PC(m));
-				addr1 = PC(m);
-				compile(stmt->inner_left, m);
-				store_exec_expr(m, stmt->expr, BOOLOID);
-				addr2 = store_jmp_not_true_unknown(m);
-				store_jmp(m, addr1);
-				if (stmt->name != NULL)
-					pop_label(stmt->name, PC(m));
-				SET_TARGET(addr2, PC(m));
-				break;
-
-			case PLPSM_STMT_COMPOUND_STATEMENT:
-				//push_frame(PC, stmt);
-				compile(stmt->inner_left, m);
-				addr1 = store_call_unknown(m);
-				addr2 = store_jmp_unknown(m);
-				SET_TARGET(addr1, PC(m));
-				//pop_frame(PC);
-				store_return(m);
-				SET_TARGET(addr2, PC(m));
-				break;
-
 			case PLPSM_STMT_SET:
-				store_exec_expr(m, stmt->expr, UNKNOWNOID);
+				//store_exec_expr(m, stmt->expr, UNKNOWNOID);
 				break;
 
 			default:
@@ -285,6 +494,8 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	Datum	prosrcdatum;
 	bool		isnull;
 	Plpsm_pcode_module *module;
+	CompilationContextData ctxt;
+	Plpsm_object outer_scope;
 
 	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcOid));
 	if (!HeapTupleIsValid(procTup))
@@ -308,9 +519,22 @@ plpsm_compile(Oid funcOid, bool forValidator)
 
 	plpsm_scanner_finish();
 
+	memset(&outer_scope, 0, sizeof(Plpsm_object));
+	outer_scope.typ = PLPSM_STMT_COMPOUND_STATEMENT;
+	outer_scope.name = pstrdup(NameStr(procStruct->proname));
+
+	ctxt.top_scope = &outer_scope;
+	ctxt.top_scope->name = outer_scope.name;
+	ctxt.current_scope = ctxt.top_scope;
+	ctxt.variables = 0;
+	ctxt.max_variables = 0;
+	ctxt.current_offset = 0;
+
 	module = init_module();
 	module->fn_name = pstrdup(NameStr(procStruct->proname));
-	compile(plpsm_parser_result, module);
+	SET_AND_INC_PC(module, PCODE_PALLOC);
+	compile(&ctxt, plpsm_parser_tree, module);
+	SET_SIZE(module, 0, ctxt.max_variables  * sizeof(Plpsm_value));
 	store_done(module);
 	list(module);
 

@@ -67,7 +67,16 @@ typedef struct Plpsm_stmt
 	char *name;
 	List *target;
 	List 	*compound_target;
-	void			*frame;
+	union
+	{
+		void *data;
+		struct
+		{
+			Oid	typoid;
+			int16	typmod;
+			char	*typename;
+		} vartype;
+	};
 	void			*data;
 	int	option;
 	char	*query;
@@ -78,6 +87,24 @@ typedef struct Plpsm_stmt
 	struct Plpsm_stmt *inner_left;
 	struct Plpsm_stmt *inner_right;
 } Plpsm_stmt;
+
+typedef struct Plpsm_object
+{
+	Plpsm_stmt_type		typ;
+	char	*name;
+	Plpsm_stmt	*stmt;
+	bool			has_release_block;
+	List		*release_address_list;
+	union
+	{
+		int		iterate_addr;
+		int16		offset;
+	};
+	struct Plpsm_object *next;
+	struct Plpsm_object *last;
+	struct Plpsm_object *inner;
+	struct Plpsm_object *outer;
+} Plpsm_object;
 
 typedef enum
 {
@@ -92,7 +119,10 @@ typedef enum
 	PCODE_DEBUG,
 	PCODE_DONE,
 	PCODE_IF_NOTEXIST_PREPARE,
-	PCODE_EXECUTE
+	PCODE_EXECUTE,
+	PCODE_SET_NULL,
+	PCODE_PALLOC,
+	PCODE_SAVETO
 } Plpsm_pcode_type;
 
 typedef struct
@@ -112,6 +142,8 @@ typedef struct
 			char *expr;
 			char *name;
 		} prep;
+		int offset;
+		int	size;
 	};
 } Plpsm_pcode;
 
@@ -124,7 +156,14 @@ typedef struct
 	Plpsm_pcode code[1];
 } Plpsm_pcode_module;
 
-extern Plpsm_stmt *plpsm_parser_result;
+typedef struct
+{
+	Datum	value;
+	bool	isnull;
+} Plpsm_value;
+
+extern Plpsm_stmt *plpsm_parser_tree;
+extern Plpsm_object *plpsm_parser_objects;
 
 extern Datum psm0_call_handler(PG_FUNCTION_ARGS);
 extern Datum psm0_inline_handler(PG_FUNCTION_ARGS);
@@ -139,5 +178,6 @@ extern void plpsm_push_back_token(int token);
 extern void plpsm_append_source_text(StringInfo buf, int startlocation, int endlocation);
 
 extern void plpsm_compile(Oid funcOid, bool forValidator);
+
 
 #endif

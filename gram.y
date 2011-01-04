@@ -180,8 +180,8 @@ static void elog_stmt(int level, Plpsm_stmt *stmt);
 function:
 			dstmt opt_semi
 				{
-					plpsm_parser_result = $1;
-					//elog_stmt(NOTICE, $1);
+					plpsm_parser_tree = $1;
+					elog_stmt(NOTICE, $1);
 				}
 		;
 
@@ -701,6 +701,7 @@ stmt_iterate:		ITERATE WORD
  *
  * LEAVE label
  *
+ * note: LEAVE can be used inside compound statement too
  */
 stmt_leave:		LEAVE WORD
 				{
@@ -1244,9 +1245,9 @@ declare_prefetch(void)
 
 			datatype = read_until(';', DEFAULT, 0, "; or \"DEFAULT\"", false, true, &endtok, startlocation);
 			parse_datatype(datatype, &type_id, &typmod);
-			result->data = list_make3(makeString(datatype),
-							    makeInteger(type_id),
-							    makeInteger(typmod));
+			result->vartype.typoid = type_id;
+			result->vartype.typmod = typmod;
+			result->vartype.typename = datatype;
 
 			if (endtok == ';')
 				break;
@@ -1564,7 +1565,7 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 	appendStringInfo(ds, "%s| Name: %s\n", ident, stmt->name);
 	appendStringInfo(ds, "%s| Target: %s\n", ident, nodeToString(stmt->target));
 	appendStringInfo(ds, "%s| Compound target: %s\n", ident, nodeToString(stmt->compound_target));
-	appendStringInfo(ds, "%s| Data: %s\n", ident, nodeToString(stmt->data));
+	//appendStringInfo(ds, "%s| Data: %s\n", ident, nodeToString(stmt->data));
 	appendStringInfo(ds, "%s| Option: %d\n", ident, stmt->option);
 	appendStringInfo(ds, "%s| Query: %s\n", ident, stmt->query);
 	appendStringInfo(ds, "%s| Expr: %s\n", ident, stmt->expr);
@@ -1595,3 +1596,4 @@ elog_stmt(int level, Plpsm_stmt *stmt)
 	elog(level, "Parser stage result:\n%s", ds.data);
 	pfree(ds.data);
 }
+
