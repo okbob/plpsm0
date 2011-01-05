@@ -15,6 +15,7 @@
 #include "parser/scanner.h"
 #include "parser/parser.h"
 #include "parser/parse_type.h"
+#include "utils/lsyscache.h"
 
 /* Location tracking support --- simpler than bison's default */
 #define YYLLOC_DEFAULT(Current, Rhs, N) \
@@ -1239,15 +1240,21 @@ declare_prefetch(void)
 			char *datatype;
 			Oid	type_id;
 			int32	typmod;
-			
+			int16		typlen;
+			bool		typbyval;
+
 			result->typ = PLPSM_STMT_DECLARE_VARIABLE;
 			result->compound_target = varnames;
 
 			datatype = read_until(';', DEFAULT, 0, "; or \"DEFAULT\"", false, true, &endtok, startlocation);
 			parse_datatype(datatype, &type_id, &typmod);
+			get_typlenbyval(type_id, &typlen, &typbyval);
+
 			result->vartype.typoid = type_id;
 			result->vartype.typmod = typmod;
 			result->vartype.typename = datatype;
+			result->vartype.typlen = typlen;
+			result->vartype.typbyval = typbyval;
 
 			if (endtok == ';')
 				break;

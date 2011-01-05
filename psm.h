@@ -75,6 +75,8 @@ typedef struct Plpsm_stmt
 			Oid	typoid;
 			int16	typmod;
 			char	*typename;
+			bool	typbyval;
+			int16	typlen;
 		} vartype;
 	};
 	void			*data;
@@ -135,14 +137,20 @@ typedef struct
 		struct 
 		{
 			char *expr;
-			Oid	oid;
+			int	nparams;
+			Oid	*typoids;
 		} expr;
 		struct
 		{
 			char *expr;
 			char *name;
 		} prep;
-		int offset;
+		struct
+		{
+			int offset;
+			int16	typlen;
+			bool	typbyval;
+		} target;
 		int	size;
 	};
 } Plpsm_pcode;
