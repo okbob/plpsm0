@@ -1,11 +1,13 @@
 #include "psm.h"
 
+#include "funcapi.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/syscache.h"
+#include "utils/lsyscache.h"
 
 #include "parser/parse_node.h"
 
@@ -32,7 +34,20 @@ typedef struct
 	{
 		SQLObjRef   *objects;				/* list of substituted parameters */
 		int	nobjects;				/* list of generated placeholders */
+		bool	has_params;
 	} pdata;
+	struct
+	{
+		Oid	typoid;
+		int16	typmod;
+		bool	typbyval;
+		int16	typlen;
+	} resulttyp;
+	struct
+	{
+		int	nargs;
+		char *fn_name;
+	} finfo;
 } CompilationContextData;
 
 typedef CompilationContextData *CompilationContext;
@@ -42,6 +57,10 @@ static void compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_modul
 static Node *resolve_column_ref(CompilationContext ctxt, ColumnRef *cref);
 
 void plpsm_parser_setup(struct ParseState *pstate, CompilationContext ctxt);
+
+static Plpsm_object *lookup_var(Plpsm_object *scope, const char *name);
+
+static void store_debug_info(Plpsm_pcode_module *m, char *str);
 
 
 /*
@@ -125,12 +144,14 @@ lookup_object_with_label_in_scope(Plpsm_object *scope, char *name)
  * new variable
  */
 static Plpsm_object *
-new_variable(Plpsm_object *scope, char *name, Plpsm_stmt *stmt)
+create_variable_for(Plpsm_stmt *decl_stmt, CompilationContext ctxt, 
+						char *name, bool increment_offset)
 {
-	Plpsm_object *iterator = scope->inner;
+	Plpsm_object *iterator = ctxt->current_scope->inner;
 	Plpsm_object *var;
 
-	Assert(scope->typ == PLPSM_STMT_COMPOUND_STATEMENT);
+	Assert(ctxt->current_scope->typ == PLPSM_STMT_COMPOUND_STATEMENT);
+	Assert(decl_stmt->typ == PLPSM_STMT_DECLARE_VARIABLE);
 
 	while (iterator != NULL)
 	{
@@ -146,8 +167,23 @@ new_variable(Plpsm_object *scope, char *name, Plpsm_stmt *stmt)
 		}
 		iterator = iterator->next;
 	}
-	var = new_object_for(stmt, scope);
+	var = new_object_for(decl_stmt, ctxt->current_scope);
+	/* variable uses a target, not name */
 	var->name = name;
+
+	if (increment_offset)
+	{
+		var->offset = ctxt->current_offset++;
+		if (var->offset > ctxt->ntypoids)
+		{
+			ctxt->ntypoids *= 2;
+			ctxt->typoids = repalloc(ctxt->typoids, ctxt->ntypoids * sizeof (Oid));
+		}
+		ctxt->typoids[var->offset] = decl_stmt->vartype.typoid;
+		ctxt->variables += 1;
+		if (ctxt->variables > ctxt->max_variables)
+			ctxt->max_variables = ctxt->variables;
+	}
 
 	return var;
 }
@@ -207,7 +243,37 @@ plpsm_post_column_ref(ParseState *pstate, ColumnRef *cref, Node *var)
 				 parser_errposition(pstate, cref->location)));
 	}
 
+	ctxt->pdata.has_params = true;
+
 	return myvar;
+}
+
+/*
+ * Allow only args variables accessable via $n syntax
+ */
+static Node *
+plpsm_paramref_hook(ParseState *pstate, ParamRef *pref)
+{
+	CompilationContext ctxt = (CompilationContext) pstate->p_ref_hook_state;
+	int	paramno = pref->number;
+	Param	*param;
+
+	if (paramno <= 0 || paramno > ctxt->finfo.nargs)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_PARAMETER),
+				 errmsg("there is no parameter $%d", paramno),
+				 parser_errposition(pstate, pref->location)));
+
+	param = makeNode(Param);
+	param->paramkind = PARAM_EXTERN;
+	param->paramid = paramno;
+	param->paramtype = ctxt->typoids[paramno - 1];
+	param->paramtypmod = -1;
+	param->location = pref->location;
+
+	ctxt->pdata.has_params = true;
+
+	return (Node *) param;
 }
 
 /*
@@ -361,6 +427,7 @@ void
 plpsm_parser_setup(struct ParseState *pstate, CompilationContext ctxt)
 {
 	pstate->p_post_columnref_hook = plpsm_post_column_ref;
+	pstate->p_paramref_hook = plpsm_paramref_hook;
 	pstate->p_ref_hook_state = (void *) ctxt;
 }
 
@@ -393,6 +460,7 @@ compile_expr_simple_target(CompilationContext ctxt, char *expr, Oid typoid, int1
 
 	ctxt->pdata.objects = (SQLObjRef *) palloc(ctxt->variables * sizeof(SQLObjRef));
 	ctxt->pdata.nobjects = 0;
+	ctxt->pdata.has_params = false;
 
 	raw_parsetree_list = pg_parse_query(ds.data);
 
@@ -406,7 +474,7 @@ compile_expr_simple_target(CompilationContext ctxt, char *expr, Oid typoid, int1
 	/* fast path, there are no params */
 	if (ctxt->pdata.nobjects == 0)
 	{
-		*no_params = true;
+		*no_params = !ctxt->pdata.has_params;
 		return ds.data;
 	}
 
@@ -480,6 +548,84 @@ compile_expr_simple_target(CompilationContext ctxt, char *expr, Oid typoid, int1
 }
 
 /*
+ * returns a target objects for assign statement. When target is composite type with 
+ * specified field, then fieldname is filled.
+ */
+static Plpsm_object *
+resolve_target(CompilationContext ctxt, List *target, const char **fieldname, int location)
+{
+	const char *name1;
+	const char *name2 = NULL;
+	Plpsm_object *var;
+
+	switch (list_length(target))
+	{
+		case 1:
+			{
+				Node	*field1 = (Node *) linitial(target);
+				Assert(IsA(field1, String));
+				name1 = strVal(field1);
+				var = lookup_var(ctxt->current_scope, name1);
+				if (var == NULL)
+					elog(ERROR, "a missing target variable \"%s\"", name1);
+				return var;
+			}
+		case 2:
+			{
+				/* 
+				 * if we found a label A with variable B and variable A,
+				 * then we have to raise a error, because there are not
+				 * clean what situation is: label.var or record.field
+				 */
+				Node	*field1 = (Node *) linitial(target);
+				Node	*field2 = (Node *) lsecond(target);
+				Assert(IsA(field1, String));
+				name1 = strVal(field1);
+				Assert(IsA(field2, String));
+				name2 = strVal(field2);
+
+				var = lookup_qualified_var(ctxt->current_scope, name1, name2);
+				if (var != NULL)
+				{
+					if (lookup_var(ctxt->current_scope, name1))
+						elog(ERROR, "there is conflict between compound statement label and composite variable");
+					return var;
+				}
+				else
+				{
+					var = lookup_var(ctxt->current_scope, name1);
+					if (var == NULL)
+						elog(ERROR, "a missing target variable \"%s\"", name1);
+					*fieldname = name2;
+					return var;
+				}
+			}
+		case 3:
+			{
+				Node	*field1 = (Node *) linitial(target);
+				Node	*field2 = (Node *) lsecond(target);
+				Node	*field3 = (Node *) lthird(target);
+				const char *name3;
+
+				Assert(IsA(field1, String));
+				name1 = strVal(field1);
+				Assert(IsA(field2, String));
+				name2 = strVal(field2);
+				Assert(IsA(field3, String));
+				name3 = strVal(field3);
+
+				var = lookup_qualified_var(ctxt->current_scope, name1, name2);
+				if (var == NULL)
+					elog(ERROR, "a missing target variable \"%s\" with label \"%s\"", name2, name1);
+				*fieldname = name3;
+			}
+	}
+
+	return NULL;
+}
+
+
+/*
  * Create a overdimensioned module
  */
 static Plpsm_pcode_module *
@@ -488,7 +634,6 @@ init_module(void)
 	Plpsm_pcode_module *m = palloc(10000 * sizeof(Plpsm_pcode) + offsetof(Plpsm_pcode_module, code));
 	m->max_length = 10000;
 	m->length = 0;
-	m->prep_statements_nums = 0;
 	return m;
 }
 
@@ -499,6 +644,10 @@ list(Plpsm_pcode_module *m)
 	int pc;
 
 	initStringInfo(&ds);
+
+	appendStringInfo(&ds, "   Datums: %d variables \n", m->ndatums);
+	appendStringInfo(&ds, "   Size: %d instruction\n\n", m->length);
+
 	for (pc = 0; pc < m->length; pc++)
 	{
 		appendStringInfo(&ds, "%5d", pc);
@@ -509,19 +658,20 @@ list(Plpsm_pcode_module *m)
 		switch (m->code[pc].typ)
 		{
 			case PCODE_JMP_FALSE_UNKNOWN:
-				appendStringInfo(&ds, "jmp false_unknown, %d", m->code[pc].addr);
+				appendStringInfo(&ds, "Jmp_false_unknown %d", m->code[pc].addr);
 				break;
 			case PCODE_JMP:
-				appendStringInfo(&ds, "jmp %d", m->code[pc].addr);
+				appendStringInfo(&ds, "Jmp %d", m->code[pc].addr);
 				break;
 			case PCODE_JMP_NOT_FOUND:
-				appendStringInfo(&ds, "jmp not_found, %d", m->code[pc].addr);
+				appendStringInfo(&ds, "Jmp_not_found %d", m->code[pc].addr);
 				break;
 			case PCODE_CALL:
 				appendStringInfo(&ds, "call %d", m->code[pc].addr);
 				break;
 			case PCODE_RETURN:
-				appendStringInfo(&ds, "return");
+				appendStringInfo(&ds, "Return size:%d, byval:%s", m->code[pc].target.typlen,
+										m->code[pc].target.typbyval ? "BYVAL" : "BYREF");
 				break;
 			case PCODE_EXEC_EXPR:
 				{
@@ -540,13 +690,13 @@ list(Plpsm_pcode_module *m)
 				}
 				break;
 			case PCODE_PRINT:
-				appendStringInfo(&ds, "print");
+				appendStringInfo(&ds, "Print");
 				break;
 			case PCODE_DEBUG:
 				appendStringInfo(&ds, "/* %s */", m->code[pc].str);
 				break;
 			case PCODE_NOOP:
-				appendStringInfo(&ds, "noop");
+				appendStringInfo(&ds, "Noop");
 				break;
 			case PCODE_DONE:
 				appendStringInfoString(&ds, "Done.");
@@ -560,12 +710,19 @@ list(Plpsm_pcode_module *m)
 			case PCODE_SET_NULL:
 				appendStringInfo(&ds, "SetNull %d", m->code[pc].target.offset);
 				break;
-			case PCODE_PALLOC:
-				appendStringInfo(&ds, "Palloc %dB", m->code[pc].size);
-				break;
 			case PCODE_SAVETO:
-				appendStringInfo(&ds, "SaveTo %d, %d, %s", m->code[pc].target.offset, m->code[pc].target.typlen,
+				appendStringInfo(&ds, "SaveTo %d, size:%d, byval:%s", m->code[pc].target.offset, m->code[pc].target.typlen,
 										m->code[pc].target.typbyval ? "BYVAL" : "BYREF");
+				break;
+			case PCODE_COPY_PARAM:
+				appendStringInfo(&ds, "CopyParam %d, %d, size:%d, byval:%s", 
+										m->code[pc].copyto.src,
+										m->code[pc].copyto.dest,
+										m->code[pc].copyto.typlen,
+										m->code[pc].copyto.typbyval ? "BYVAL" : "BYREF");
+				break;
+			case PCODE_RETURN_VOID:
+				appendStringInfo(&ds, "Return 0");
 				break;
 		}
 		appendStringInfoChar(&ds, '\n');
@@ -666,6 +823,18 @@ store_saveto(Plpsm_pcode_module *m, int16 offset, int16 typlen, bool typbyval)
 }
 
 static void
+store_copy_parameter(Plpsm_pcode_module *m, Plpsm_object *var, int paramid)
+{
+	CHECK_MODULE_SIZE(m);
+	m->code[m->length].copyto.src = paramid;
+	m->code[m->length].copyto.dest = var->offset;
+	m->code[m->length].copyto.typlen = var->stmt->vartype.typlen; 
+	m->code[m->length].copyto.typbyval = var->stmt->vartype.typbyval;
+	SET_AND_INC_PC(m, PCODE_COPY_PARAM);
+}
+
+
+static void
 store_return(Plpsm_pcode_module *m)
 {
 	CHECK_MODULE_SIZE(m);
@@ -701,8 +870,8 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 
 	while (stmt != NULL)
 	{
-		//if (stmt->debug != NULL)
-		//	store_debug_info(m, stmt->debug);
+		if (stmt->debug != NULL && 0)
+			store_debug_info(m, stmt->debug);
 
 		switch (stmt->typ)
 		{
@@ -775,15 +944,8 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 					foreach(l, stmt->compound_target)
 					{
 						char *name = strVal(lfirst(l));
+						obj = create_variable_for(stmt, ctxt, name, true);
 
-						obj = new_variable(ctxt->current_scope, name, stmt);
-						obj->offset = ctxt->current_offset++;
-						if (obj->offset > ctxt->ntypoids)
-						{
-							ctxt->ntypoids *= 2;
-							ctxt->typoids = repalloc(ctxt->typoids, ctxt->ntypoids * sizeof (Oid));
-						}
-						ctxt->typoids[obj->offset] = stmt->vartype.typoid;
 						if (stmt->expr != NULL)
 						{
 							store_exec_expr(ctxt, m, stmt->expr, stmt->vartype.typoid, stmt->vartype.typmod);
@@ -795,7 +957,6 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 							SET_OFFSET(m, obj->offset);
 							SET_AND_INC_PC(m, PCODE_SET_NULL);
 						}
-						ctxt->variables += 1;
 					}
 				}
 				break;
@@ -821,8 +982,32 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 				break;
 
 			case PLPSM_STMT_SET:
-				store_exec_expr(ctxt, m, stmt->expr, INT4OID, -1);
-				break;
+				{
+					const char *fieldname;
+
+					obj = resolve_target(ctxt, stmt->target,  &fieldname, stmt->location);
+					store_exec_expr(ctxt, m, stmt->expr, obj->stmt->vartype.typoid, obj->stmt->vartype.typmod);
+					store_saveto(m, obj->offset, obj->stmt->vartype.typlen, obj->stmt->vartype.typbyval);
+					break;
+				}
+
+			case PLPSM_STMT_RETURN:
+				{
+					if (ctxt->resulttyp.typoid != VOIDOID)
+					{
+						store_exec_expr(ctxt, m, stmt->expr, ctxt->resulttyp.typoid, -1);
+						SET_DATUM_PROP(m, ctxt->resulttyp.typlen, ctxt->resulttyp.typbyval);
+						SET_AND_INC_PC(m, PCODE_RETURN);
+					}
+					else
+					{
+						if (stmt->expr != NULL)
+							elog(ERROR, "returned a value in VOID function");
+						SET_AND_INC_PC(m, PCODE_RETURN_VOID);
+					}
+					break;
+				}
+				
 
 			default:
 				elog(ERROR, "unknown command typeid");
@@ -832,7 +1017,7 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 }
 
 
-void
+Plpsm_pcode_module *
 plpsm_compile(Oid funcOid, bool forValidator)
 {
 	HeapTuple	procTup;
@@ -844,6 +1029,14 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	Plpsm_pcode_module *module;
 	CompilationContextData ctxt;
 	Plpsm_object outer_scope;
+	int			numargs;
+	Oid		   *argtypes;
+	char	  **argnames;
+	char	   *argmodes;
+	int	i;
+	int16	typlen;
+	bool	typbyval;
+
 
 	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcOid));
 	if (!HeapTupleIsValid(procTup))
@@ -857,8 +1050,6 @@ plpsm_compile(Oid funcOid, bool forValidator)
 		elog(ERROR, "null prosrc");
 
 	proc_source = TextDatumGetCString(prosrcdatum);
-
-	elog(NOTICE, "source code: %s", proc_source);
 
 	plpsm_scanner_init(proc_source);
 	parse_rc = plpsm_yyparse();
@@ -880,14 +1071,75 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	ctxt.ntypoids = 256;
 	ctxt.typoids = palloc(256 * sizeof(Oid));
 
+	ctxt.resulttyp.typoid = procStruct->prorettype;
+	get_typlenbyval(ctxt.resulttyp.typoid, &ctxt.resulttyp.typlen, &ctxt.resulttyp.typbyval);
+
 	module = init_module();
-	module->fn_name = pstrdup(NameStr(procStruct->proname));
-	SET_AND_INC_PC(module, PCODE_PALLOC);
+
+	/* 
+	 * append to scope a variables for parameters, and store 
+	 * instruction for copy from fcinfo
+	 */
+	numargs = get_func_arg_info(procTup,
+						&argtypes, &argnames, &argmodes);
+	ctxt.finfo.nargs = numargs;
+	ctxt.finfo.fn_name = pstrdup(NameStr(procStruct->proname));
+
+	for (i = 0; i < numargs; i++)
+	{
+		Oid			argtypid = argtypes[i];
+		char	argmode = argmodes ? argmodes[i] : PROARGMODE_IN;
+		Plpsm_stmt *decl_stmt;
+		char		buf[32];
+		Plpsm_object *var;
+		Plpsm_object *alias;
+
+		/* Create $n name for variable */
+		snprintf(buf, sizeof(buf), "$%d", i + 1);
+
+		/* append a fake statements for parameter variable */
+		decl_stmt = plpsm_new_stmt(PLPSM_STMT_DECLARE_VARIABLE, -1);
+		decl_stmt->target = list_make1(makeString(pstrdup(buf)));
+		get_typlenbyval(argtypid, &typlen, &typbyval);
+
+		decl_stmt->vartype.typoid = argtypid;
+		decl_stmt->vartype.typmod = -1;
+		decl_stmt->vartype.typename = NULL;
+		decl_stmt->vartype.typlen = typlen;
+		decl_stmt->vartype.typbyval = typbyval;
+
+		/* append implicit name to scope */
+		var = create_variable_for(decl_stmt, &ctxt, pstrdup(buf), true);
+		/* append explicit name to scope */
+		if (argnames && argnames[i][0] != '\0')
+		{
+			alias = create_variable_for(decl_stmt, &ctxt, pstrdup(argnames[i]), false);
+			alias->offset = var->offset; 
+		}
+
+		/* append a initialization instruction */
+		if (argmode == PROARGMODE_IN || 
+			argmode == PROARGMODE_INOUT ||
+			argmode == PROARGMODE_VARIADIC)
+		{
+			store_copy_parameter(module, var, i);
+		}
+		else
+		{
+			/* initialize OUT variables to NULL */
+			CHECK_MODULE_SIZE(module);
+			SET_OFFSET(module, var->offset);
+			SET_AND_INC_PC(module, PCODE_SET_NULL);
+		}
+	}
+
 	compile(&ctxt, plpsm_parser_tree, module);
-	SET_SIZE(module, 0, ctxt.max_variables  * (sizeof(Datum) + sizeof(bool)));
+	module->ndatums = ctxt.max_variables;
 	store_done(module);
 	list(module);
 
 	ReleaseSysCache(procTup);
+	
+	return module;
 }
 

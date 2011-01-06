@@ -116,6 +116,7 @@ typedef enum
 	PCODE_JMP_NOT_FOUND,
 	PCODE_CALL,
 	PCODE_RETURN,
+	PCODE_RETURN_VOID,
 	PCODE_EXEC_EXPR,
 	PCODE_PRINT,
 	PCODE_DEBUG,
@@ -123,8 +124,8 @@ typedef enum
 	PCODE_IF_NOTEXIST_PREPARE,
 	PCODE_EXECUTE,
 	PCODE_SET_NULL,
-	PCODE_PALLOC,
-	PCODE_SAVETO
+	PCODE_SAVETO,
+	PCODE_COPY_PARAM
 } Plpsm_pcode_type;
 
 typedef struct
@@ -139,6 +140,7 @@ typedef struct
 			char *expr;
 			int	nparams;
 			Oid	*typoids;
+			void	*data;
 		} expr;
 		struct
 		{
@@ -147,20 +149,26 @@ typedef struct
 		} prep;
 		struct
 		{
-			int offset;
 			int16	typlen;
 			bool	typbyval;
+			int offset;
 		} target;
+		struct
+		{
+			int16	typlen;
+			bool	typbyval;
+			int	src;
+			int	dest;
+		} copyto;
 		int	size;
 	};
 } Plpsm_pcode;
 
 typedef struct
 {
-	char *fn_name;
 	int max_length;
 	int	length;
-	int		prep_statements_nums;	/* number of prepared_statements */
+	int		ndatums;
 	Plpsm_pcode code[1];
 } Plpsm_pcode_module;
 
@@ -185,7 +193,11 @@ extern void plpsm_scanner_finish(void);
 extern void plpsm_push_back_token(int token);
 extern void plpsm_append_source_text(StringInfo buf, int startlocation, int endlocation);
 
-extern void plpsm_compile(Oid funcOid, bool forValidator);
+extern Plpsm_pcode_module *plpsm_compile(Oid funcOid, bool forValidator);
+extern Datum plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo);
+
+extern Plpsm_stmt *plpsm_new_stmt(Plpsm_stmt_type typ, int location);
+
 
 
 #endif

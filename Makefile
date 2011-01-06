@@ -17,7 +17,7 @@ override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
 SHLIB_LINK = $(filter -lintl, $(LIBS))
 rpath =
 
-OBJS = gram.o handler.o scanner.o compiler.o
+OBJS = gram.o handler.o scanner.o compiler.o executor.o
 
 all: all-lib
 

@@ -40,7 +40,6 @@ static void parse_datatype(const char *string, Oid *type_id, int32 *typmod);
 
 static char *read_expr_until_semi(void);
 static Plpsm_stmt *declare_prefetch(void);
-static Plpsm_stmt *new_stmt(Plpsm_stmt_type typ, int location);
 static void check_labels(const char *label1, const char *label2);
 static bool is_unreserved_keyword(int tok);
 
@@ -262,7 +261,7 @@ stmt:
 stmt_compound:
 			opt_label BEGIN statements ';' END opt_end_label
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
 					new->name = $1;
 					new->inner_left = $3;
 					check_labels($1, $6);
@@ -270,7 +269,7 @@ stmt_compound:
 				}
 			| opt_label BEGIN declarations ';' END opt_end_label
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
 					new->name = $1;
 					new->inner_left = $3;
 					check_labels($1, $6);
@@ -278,7 +277,7 @@ stmt_compound:
 				}
 			| opt_label BEGIN declarations ';' statements ';' END opt_end_label
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
 					new->name = $1;
 					/* join declarations and statements */
 					$3->last->next = $5;
@@ -289,7 +288,7 @@ stmt_compound:
 				}
 			| opt_label BEGIN END opt_end_label
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
 					new->name = $1;
 					check_labels($1, $4);
 					$$ = new;
@@ -491,7 +490,7 @@ opt_value:
  */
 stmt_if:		IF expr_until_then statements ';' stmt_else END IF
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_IF, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_IF, @1);
 					new->expr = $2;
 					new->inner_left = $3;
 					new->inner_right = $5;
@@ -505,7 +504,7 @@ stmt_else:
 				}
 			| ELSEIF expr_until_then statements ';' stmt_else
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_IF, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_IF, @1);
 					DEBUG_INIT;
 					new->expr = $2;
 					new->inner_left = $3;
@@ -560,13 +559,13 @@ assign_item:		target '=' expr_until_semi_or_coma
 target:
 			qual_identif
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_UNKNOWN, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_UNKNOWN, @1);
 					new->target = $1;
 					$$ = new;
 				}
 			| '(' qual_identif_list ')'
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_UNKNOWN, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_UNKNOWN, @1);
 					new->compound_target = $2;
 					$$ = new;
 				}
@@ -603,7 +602,7 @@ qual_identif:
  */
 stmt_print:		PRINT expr_until_semi
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_PRINT, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_PRINT, @1);
 					new->expr = $2;
 					$$ = new;
 				}
@@ -619,7 +618,7 @@ stmt_return:
 			RETURN
 				{
 					int tok = yylex();
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_RETURN, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RETURN, @1);
 					if (tok == ';' || tok == 0)
 					{
 						plpsm_push_back_token(tok);
@@ -641,7 +640,7 @@ stmt_return:
  */
 stmt_loop:		opt_label LOOP statements ';' END LOOP opt_end_label
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_LOOP, $1 ? @1 : @2);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_LOOP, $1 ? @1 : @2);
 					new->name = $1;
 					new->inner_left = $3;
 					check_labels($1, $7);
@@ -657,7 +656,7 @@ stmt_loop:		opt_label LOOP statements ';' END LOOP opt_end_label
  */
 stmt_while:		opt_label WHILE expr_until_do statements ';' END WHILE opt_end_label
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_WHILE, $1 ? @1 : @2);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_WHILE, $1 ? @1 : @2);
 					new->name = $1;
 					new->expr = $3;
 					new->inner_left = $4;
@@ -674,7 +673,7 @@ stmt_while:		opt_label WHILE expr_until_do statements ';' END WHILE opt_end_labe
  */
 stmt_repeat_until:	opt_label REPEAT statements ';' UNTIL expr_until_end REPEAT opt_end_label
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_REPEAT_UNTIL, $1 ? @1 : @2);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_REPEAT_UNTIL, $1 ? @1 : @2);
 					new->name = $1;
 					new->expr = $6;
 					new->inner_left = $3;
@@ -691,7 +690,7 @@ stmt_repeat_until:	opt_label REPEAT statements ';' UNTIL expr_until_end REPEAT o
  */
 stmt_iterate:		ITERATE WORD
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_ITERATE, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_ITERATE, @1);
 					new->name = $2.ident;
 					$$ = new;
 				}
@@ -706,7 +705,7 @@ stmt_iterate:		ITERATE WORD
  */
 stmt_leave:		LEAVE WORD
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_LEAVE, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_LEAVE, @1);
 					new->name = $2.ident;
 					$$ = new;
 				}
@@ -732,7 +731,7 @@ stmt_prepare:		PREPARE WORD param_types_opt FROM expr_until_semi
 param_types_opt:
 				{
 					int tok = yylex();
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_PREPARE, -1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_PREPARE, -1);
 
 					if (tok == '(')
 					{
@@ -771,7 +770,7 @@ param_types_opt:
 stmt_execute:
 			EXECUTE WORD 
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_EXECUTE, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE, @1);
 					new->name = $2.ident;
 					$$ = new;
 				}
@@ -794,7 +793,7 @@ stmt_execute:
 				}
 			| EXECUTE WORD USING expr_list
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_EXECUTE, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE, @1);
 					new->name = $2.ident;
 					new->data = $4;
 					$$ = new;
@@ -810,7 +809,7 @@ stmt_execute:
 stmt_execute_immediate:
 			EXECUTE IMMEDIATE expr_until_semi_into_using
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_EXECUTE_IMMEDIATE, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE_IMMEDIATE, @1);
 					new->expr = $3;
 					$$ = new;
 				}
@@ -824,7 +823,7 @@ stmt_execute_immediate:
 				}
 			| EXECUTE IMMEDIATE expr_until_semi_into_using USING expr_list
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_EXECUTE_IMMEDIATE, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE_IMMEDIATE, @1);
 					new->expr = $3;
 					new->data = $5;
 					$$ = new;
@@ -850,13 +849,13 @@ stmt_execute_immediate:
 stmt_open:
 			OPEN qual_identif
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_OPEN, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_OPEN, @1);
 					new->target = $2;
 					$$ = new;
 				}
 			| OPEN qual_identif USING expr_list
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_OPEN, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_OPEN, @1);
 					new->target = $2;
 					new->data = $4;
 					$$ = new;
@@ -871,7 +870,7 @@ stmt_open:
  */
 stmt_fetch:		FETCH qual_identif INTO qual_identif_list
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_FETCH, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_FETCH, @1);
 					new->compound_target = $4;
 					new->data = $2;
 					$$ = new;
@@ -886,7 +885,7 @@ stmt_fetch:		FETCH qual_identif INTO qual_identif_list
  */
 stmt_close:		CLOSE qual_identif
 				{
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_CLOSE, @1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_CLOSE, @1);
 					new->target = $2;
 					$$ = new;
 				}
@@ -920,7 +919,7 @@ for_prefetch:
 					char *cursor_name = NULL;
 					int tok;
 					int	startloc = -1;
-					Plpsm_stmt *new = new_stmt(PLPSM_STMT_FOR, -1);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_FOR, -1);
 
 					/* read a possible namespace */
 					tok = yylex(); startloc = yylloc;
@@ -1230,7 +1229,7 @@ declare_prefetch(void)
 	int	option;
 	int		startlocation = -1;
 
-	result = new_stmt(PLPSM_STMT_UNKNOWN, -1);
+	result = plpsm_new_stmt(PLPSM_STMT_UNKNOWN, -1);
 
 	for (;;)
 	{
@@ -1477,8 +1476,8 @@ parse_datatype(const char *string, Oid *type_id, int32 *typmod)
 	parseTypeString(string, type_id, typmod);
 }
 
-static Plpsm_stmt *
-new_stmt(Plpsm_stmt_type typ, int location)
+Plpsm_stmt *
+plpsm_new_stmt(Plpsm_stmt_type typ, int location)
 {
 	Plpsm_stmt *n = palloc0(sizeof(Plpsm_stmt));
 	n->typ = typ;
