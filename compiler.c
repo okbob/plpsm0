@@ -35,6 +35,7 @@ typedef struct
 		SQLObjRef   *objects;				/* list of substituted parameters */
 		int	nobjects;				/* list of generated placeholders */
 		bool	has_params;
+		bool	is_expression;				/* show a message about missing variables instead missing columns */
 	} pdata;
 	struct
 	{
@@ -48,6 +49,7 @@ typedef struct
 		int	nargs;
 		char *fn_name;
 	} finfo;
+
 } CompilationContextData;
 
 typedef CompilationContextData *CompilationContext;
@@ -61,6 +63,8 @@ void plpsm_parser_setup(struct ParseState *pstate, CompilationContext ctxt);
 static Plpsm_object *lookup_var(Plpsm_object *scope, const char *name);
 
 static void store_debug_info(Plpsm_pcode_module *m, char *str);
+
+bool	plpsm_debug_compiler = false;
 
 
 /*
@@ -243,6 +247,9 @@ plpsm_post_column_ref(ParseState *pstate, ColumnRef *cref, Node *var)
 				 parser_errposition(pstate, cref->location)));
 	}
 
+	if (myvar == NULL && ctxt->pdata.is_expression)
+		elog(ERROR, "variable \"%s\" isn't available in current scope", NameListToString(cref->fields));
+
 	ctxt->pdata.has_params = true;
 
 	return myvar;
@@ -299,8 +306,29 @@ make_param(Plpsm_object *var, ColumnRef *cref)
 static Plpsm_object *
 lookup_qualified_var(Plpsm_object *scope, const char *label, const char *name)
 {
-	elog(ERROR, "lookup %s.%s", label, name);
-	return NULL;
+	Plpsm_object *iterator;
+	Plpsm_object *var;
+
+	if (scope == NULL)
+		return NULL;
+
+	/* fast path, we are in current scope */
+	if (scope->typ == PLPSM_STMT_COMPOUND_STATEMENT && scope->name && 
+				    strcmp(scope->name, label) == 0)
+	{
+		/* search a variable in this scope */
+		iterator = scope->inner;
+
+		while (iterator != NULL)
+		{
+			if (iterator->typ == PLPSM_STMT_DECLARE_VARIABLE && strcmp(iterator->name, name) == 0)
+				return iterator;
+			iterator = iterator->next;
+		}
+		return NULL;
+	}
+
+	return lookup_qualified_var(scope->outer, label, name);
 }
 
 static Plpsm_object *
@@ -461,6 +489,7 @@ compile_expr_simple_target(CompilationContext ctxt, char *expr, Oid typoid, int1
 	ctxt->pdata.objects = (SQLObjRef *) palloc(ctxt->variables * sizeof(SQLObjRef));
 	ctxt->pdata.nobjects = 0;
 	ctxt->pdata.has_params = false;
+	ctxt->pdata.is_expression = true;
 
 	raw_parsetree_list = pg_parse_query(ds.data);
 
@@ -760,6 +789,15 @@ store_jmp_not_true_unknown(Plpsm_pcode_module *m)
 }
 
 static void
+store_jmp_not_true(Plpsm_pcode_module *m, int addr)
+{
+	CHECK_MODULE_SIZE(m);
+	SET_ADDR(m, addr);
+	SET_AND_INC_PC(m, PCODE_JMP_FALSE_UNKNOWN);
+}
+
+
+static void
 store_jmp(Plpsm_pcode_module *m, int addr)
 {
 	CHECK_MODULE_SIZE(m);
@@ -899,9 +937,7 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 				addr1 = PC(m);
 				compile(ctxt, stmt->inner_left, m);
 				store_exec_expr(ctxt, m, stmt->expr, BOOLOID, -1);
-				addr2 = store_jmp_not_true_unknown(m);
-				store_jmp(m, addr1);
-				SET_TARGET(addr2, PC(m));
+				store_jmp_not_true(m, addr1);
 				ctxt->current_scope = release_psm_object(obj);
 				break;
 
@@ -1136,10 +1172,11 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	compile(&ctxt, plpsm_parser_tree, module);
 	module->ndatums = ctxt.max_variables;
 	store_done(module);
-	list(module);
+	if (plpsm_debug_compiler)
+		list(module);
 
 	ReleaseSysCache(procTup);
-	
+
 	return module;
 }
 

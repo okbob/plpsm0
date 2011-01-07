@@ -43,15 +43,25 @@ next_op:
 				break;
 			case PCODE_RETURN:
 				{
-					if (!isnull)
+					/*
+					 * If the function's return type isn't by value, copy the value
+					 * into upper executor memory context.
+					 */
+					if (!isnull && !pcode->target.typbyval)
 					{
-						result = datumCopy(result, pcode->target.typbyval, pcode->target.typlen);
+
+		    				Size		len;
+						void	   *tmp;
+
+						len = datumGetSize(result, false, pcode->target.typlen);
+						tmp = SPI_palloc(len);
+						memcpy(tmp, DatumGetPointer(result), len);
 						fcinfo->isnull = false;
-						pfree(values); pfree(nulls);
-						return result;
+						return PointerGetDatum(tmp);
 					}
-					fcinfo->isnull = true;
-					return (Datum) 0;
+
+					fcinfo->isnull = isnull;
+					return (Datum) result;
 				}
 			case PCODE_EXEC_EXPR:
 				{

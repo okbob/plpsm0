@@ -181,6 +181,9 @@ typedef struct
 extern Plpsm_stmt *plpsm_parser_tree;
 extern Plpsm_object *plpsm_parser_objects;
 
+extern bool plpsm_debug_parser;
+extern bool plpsm_debug_compiler;
+
 extern Datum psm0_call_handler(PG_FUNCTION_ARGS);
 extern Datum psm0_inline_handler(PG_FUNCTION_ARGS);
 extern Datum psm0_validator(PG_FUNCTION_ARGS);

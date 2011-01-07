@@ -31,6 +31,9 @@
 
 union YYSTYPE;
 
+bool	plpsm_debug_parser = false;
+
+
 static char * read_until(int until1, int until2, int until3, const char *expected, 
 							bool is_expr, bool is_datatype, 
 							int *endtoken,
@@ -181,7 +184,8 @@ function:
 			dstmt opt_semi
 				{
 					plpsm_parser_tree = $1;
-					elog_stmt(NOTICE, $1);
+					if (plpsm_debug_parser)
+						elog_stmt(NOTICE, $1);
 				}
 		;
 
@@ -590,6 +594,13 @@ qual_identif:
 			| CWORD
 				{
 					$$ = $1.idents;
+				}
+			| PARAM
+				{
+					/* ToDo: Plpsm_object should be a param type too */
+					char buf[32];
+					snprintf(buf, sizeof(buf), "$%d", $1);
+					$$ = list_make1(makeString(pstrdup(buf)));
 				}
 		;
 
