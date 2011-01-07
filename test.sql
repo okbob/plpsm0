@@ -118,7 +118,14 @@ returns int as $$
     end;
 $$ language psm0;
 
-
+create or replace function test12(a int)
+returns int as $$
+begin
+  declare b,c,d int default 0;
+  set b = a + 1, c = b + 1, d = c + 1;
+  return d;
+end;
+$$ language psm0;
 
 /*************************************************
  *
@@ -156,6 +163,7 @@ begin
   perform assert('test09', 15, test09(3));
   perform assert('test10', 15, test10(3));
   perform assert('test11', 13, test11(10));
+  perform assert('test12',  4, test12(1));
 
   raise notice '******* All tests are ok *******';
 end;
