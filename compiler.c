@@ -4,6 +4,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "nodes/bitmapset.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/syscache.h"
@@ -47,6 +48,7 @@ typedef struct
 	struct
 	{
 		int	nargs;
+		char		*default_return_expr;
 		char *fn_name;
 	} finfo;
 
@@ -307,7 +309,6 @@ static Plpsm_object *
 lookup_qualified_var(Plpsm_object *scope, const char *label, const char *name)
 {
 	Plpsm_object *iterator;
-	Plpsm_object *var;
 
 	if (scope == NULL)
 		return NULL;
@@ -880,8 +881,15 @@ store_return(Plpsm_pcode_module *m)
 }
 
 static void
-store_done(Plpsm_pcode_module *m)
+store_done(CompilationContext ctxt, Plpsm_pcode_module *m)
 {
+	if (ctxt->finfo.default_return_expr != NULL && ctxt->resulttyp.typoid != VOIDOID)
+	{
+		store_exec_expr(ctxt, m, ctxt->finfo.default_return_expr,
+						ctxt->resulttyp.typoid, -1);
+		SET_DATUM_PROP(m, ctxt->resulttyp.typlen, ctxt->resulttyp.typbyval);
+		SET_AND_INC_PC(m, PCODE_RETURN);
+	}
 	CHECK_MODULE_SIZE(m);
 	SET_AND_INC_PC(m, PCODE_DONE);
 }
@@ -1031,12 +1039,21 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 				{
 					if (ctxt->resulttyp.typoid != VOIDOID)
 					{
-						store_exec_expr(ctxt, m, stmt->expr, ctxt->resulttyp.typoid, -1);
+						if (ctxt->finfo.default_return_expr != NULL && 
+							stmt->expr != NULL)
+							elog(ERROR, "using RETURN expr in function with OUT arguments");
+
+						if (stmt->expr != NULL)
+							store_exec_expr(ctxt, m, stmt->expr, ctxt->resulttyp.typoid, -1);
+						else
+							store_exec_expr(ctxt, m, ctxt->finfo.default_return_expr,
+											ctxt->resulttyp.typoid, -1);
 						SET_DATUM_PROP(m, ctxt->resulttyp.typlen, ctxt->resulttyp.typbyval);
 						SET_AND_INC_PC(m, PCODE_RETURN);
 					}
 					else
 					{
+						Assert(ctxt->finfo.default_return_expr == NULL);
 						if (stmt->expr != NULL)
 							elog(ERROR, "returned a value in VOID function");
 						SET_AND_INC_PC(m, PCODE_RETURN_VOID);
@@ -1072,7 +1089,7 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	int	i;
 	int16	typlen;
 	bool	typbyval;
-
+	Bitmapset	*outargs = NULL;
 
 	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcOid));
 	if (!HeapTupleIsValid(procTup))
@@ -1153,6 +1170,10 @@ plpsm_compile(Oid funcOid, bool forValidator)
 			alias->offset = var->offset; 
 		}
 
+		if (argmode == PROARGMODE_OUT ||
+			argmode == PROARGMODE_INOUT)
+			outargs = bms_add_member(outargs, i);
+
 		/* append a initialization instruction */
 		if (argmode == PROARGMODE_IN || 
 			argmode == PROARGMODE_INOUT ||
@@ -1169,9 +1190,40 @@ plpsm_compile(Oid funcOid, bool forValidator)
 		}
 	}
 
+	if (outargs != NULL)
+	{
+		StringInfoData ds;
+
+		initStringInfo(&ds);
+		if (bms_num_members(outargs) > 1)
+		{
+			bool first = true;
+			int	paramno;
+
+			while ((paramno = bms_first_member(outargs)) >= 0)
+			{
+				if (first)
+				{
+					first = false;
+					appendStringInfo(&ds, "($%d", paramno + 1);
+				}
+				else
+					appendStringInfo(&ds, ",$%d", paramno + 1);
+			}
+			appendStringInfoChar(&ds, ')');
+		}
+		else
+			appendStringInfo(&ds, "$%d", bms_singleton_member(outargs) + 1);
+		ctxt.finfo.default_return_expr = ds.data;
+
+		bms_free(outargs);
+	}
+	else
+		ctxt.finfo.default_return_expr = NULL;
+
 	compile(&ctxt, plpsm_parser_tree, module);
 	module->ndatums = ctxt.max_variables;
-	store_done(module);
+	store_done(&ctxt, module);
 	if (plpsm_debug_compiler)
 		list(module);
 

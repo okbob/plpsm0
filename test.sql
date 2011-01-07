@@ -127,6 +127,14 @@ begin
 end;
 $$ language psm0;
 
+create or replace function test13(inout a int) as $$
+set a = a + 10;
+$$ language psm0;
+
+create or replace function test14(out a int, out b int) as $$
+set a = 1, b = 2;
+$$ language psm0;
+
 /*************************************************
  *
  */
@@ -164,6 +172,8 @@ begin
   perform assert('test10', 15, test10(3));
   perform assert('test11', 13, test11(10));
   perform assert('test12',  4, test12(1));
+  perform assert('test13', 10, test13(0));
+  perform assert('test14', 2, (test14()).b);
 
   raise notice '******* All tests are ok *******';
 end;
