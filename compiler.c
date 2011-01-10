@@ -20,47 +20,54 @@ typedef struct
 	const char *name1;
 	const char *name2;
 	int16 offset;
-} SQLObjRef;
+} SQLHostVar;
 
 typedef struct
 {
 	Plpsm_object *top_scope;
 	Plpsm_object *current_scope;			/* pointer to outer compound statement */
-	int16	variables;
-	int16		max_variables;			/* max variables in one visible scope */
-	int16	current_offset;
-	int16	ntypoids;				/* number of vector with oids */
-	Oid 	*typoids;
+	struct
+	{
+		int16 ndatums;				/* number of datums in current scope */
+		int16 mdatums;				/* number of datums global 		*/
+		struct
+		{
+			int size;			/* size of preallocated data for datums oids vector */
+			Oid	*data;
+		}			oids;
+	}			stack;
 	struct						/* used as data for parsing a SQL expression */
 	{
-		SQLObjRef   *objects;				/* list of substituted parameters */
-		int	nobjects;				/* list of generated placeholders */
-		bool	has_params;
+		SQLHostVar   *vars;				/* list of found host variables */
+		int	nvars;				/* number of variables */
+		bool	has_external_params;			/* true, when expr need a external parameters - detected host var. or param */
 		bool	is_expression;				/* show a message about missing variables instead missing columns */
 	} pdata;
 	struct
 	{
-		Oid	typoid;
-		int16	typmod;
-		bool	typbyval;
-		int16	typlen;
-	} resulttyp;
-	struct
-	{
 		int	nargs;
-		char		*default_return_expr;
-		char *fn_name;
+		char *name;
+		struct
+		{
+			struct
+			{
+				Oid	typoid;
+				int16	typmod;
+				bool	typbyval;
+				int16	typlen;
+			} datum;
+		} result;
+		char		*return_expr;		/* generated result expression for function with OUT params */
 	} finfo;
+} CompileStateData;
 
-} CompilationContextData;
+typedef CompileStateData *CompileState;
 
-typedef CompilationContextData *CompilationContext;
+static void compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m);
 
-static void compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m);
+static Node *resolve_column_ref(CompileState cstate, ColumnRef *cref);
 
-static Node *resolve_column_ref(CompilationContext ctxt, ColumnRef *cref);
-
-void plpsm_parser_setup(struct ParseState *pstate, CompilationContext ctxt);
+void plpsm_parser_setup(struct ParseState *pstate, CompileState cstate);
 
 static Plpsm_object *lookup_var(Plpsm_object *scope, const char *name);
 
@@ -150,13 +157,13 @@ lookup_object_with_label_in_scope(Plpsm_object *scope, char *name)
  * new variable
  */
 static Plpsm_object *
-create_variable_for(Plpsm_stmt *decl_stmt, CompilationContext ctxt, 
-						char *name, bool increment_offset)
+create_variable_for(Plpsm_stmt *decl_stmt, CompileState cstate, 
+						char *name, Plpsm_usage_variable_type typ)
 {
-	Plpsm_object *iterator = ctxt->current_scope->inner;
+	Plpsm_object *iterator = cstate->current_scope->inner;
 	Plpsm_object *var;
 
-	Assert(ctxt->current_scope->typ == PLPSM_STMT_COMPOUND_STATEMENT);
+	Assert(cstate->current_scope->typ == PLPSM_STMT_COMPOUND_STATEMENT);
 	Assert(decl_stmt->typ == PLPSM_STMT_DECLARE_VARIABLE);
 
 	while (iterator != NULL)
@@ -173,22 +180,22 @@ create_variable_for(Plpsm_stmt *decl_stmt, CompilationContext ctxt,
 		}
 		iterator = iterator->next;
 	}
-	var = new_object_for(decl_stmt, ctxt->current_scope);
+	var = new_object_for(decl_stmt, cstate->current_scope);
 	/* variable uses a target, not name */
 	var->name = name;
 
-	if (increment_offset)
+	if (typ == PLPSM_VARIABLE)
 	{
-		var->offset = ctxt->current_offset++;
-		if (var->offset > ctxt->ntypoids)
+		var->offset = cstate->stack.ndatums++;
+
+		if (var->offset >= cstate->stack.oids.size)
 		{
-			ctxt->ntypoids *= 2;
-			ctxt->typoids = repalloc(ctxt->typoids, ctxt->ntypoids * sizeof (Oid));
+			cstate->stack.oids.size += 128;
+			cstate->stack.oids.data = repalloc(cstate->stack.oids.data, cstate->stack.oids.size * sizeof(Oid));
 		}
-		ctxt->typoids[var->offset] = decl_stmt->vartype.typoid;
-		ctxt->variables += 1;
-		if (ctxt->variables > ctxt->max_variables)
-			ctxt->max_variables = ctxt->variables;
+		cstate->stack.oids.data[var->offset] = decl_stmt->datum.typoid;
+		if (cstate->stack.ndatums > cstate->stack.mdatums)
+			cstate->stack.mdatums = cstate->stack.ndatums;
 	}
 
 	return var;
@@ -198,7 +205,7 @@ create_variable_for(Plpsm_stmt *decl_stmt, CompilationContext ctxt,
  * create a new psm object for psm statement
  */
 static Plpsm_object *
-new_psm_object_for(Plpsm_stmt *stmt, CompilationContext ctxt, int iterate_addr)
+new_psm_object_for(Plpsm_stmt *stmt, CompileState cstate, int iterate_addr)
 {
 	Plpsm_object *new;
 
@@ -209,14 +216,14 @@ new_psm_object_for(Plpsm_stmt *stmt, CompilationContext ctxt, int iterate_addr)
 		case PLPSM_STMT_WHILE:
 		case PLPSM_STMT_REPEAT_UNTIL:
 		case PLPSM_STMT_FOR:
-			if (stmt->name && lookup_object_with_label_in_scope(ctxt->current_scope, stmt->name) != NULL)
+			if (stmt->name && lookup_object_with_label_in_scope(cstate->current_scope, stmt->name) != NULL)
 				elog(ERROR, "label \"%s\" is defined in current scope", stmt->name);
-			new = new_object_for(stmt, ctxt->current_scope);
+			new = new_object_for(stmt, cstate->current_scope);
 			new->iterate_addr = iterate_addr;
-			ctxt->current_scope = new;
+			cstate->current_scope = new;
 			break;
 		default:
-			new = new_object_for(stmt, ctxt->current_scope);
+			new = new_object_for(stmt, cstate->current_scope);
 			break;
 	}
 	
@@ -230,10 +237,10 @@ new_psm_object_for(Plpsm_stmt *stmt, CompilationContext ctxt, int iterate_addr)
 static Node *
 plpsm_post_column_ref(ParseState *pstate, ColumnRef *cref, Node *var)
 {
-	CompilationContext ctxt = (CompilationContext) pstate->p_ref_hook_state;
+	CompileState cstate = (CompileState) pstate->p_ref_hook_state;
 	Node *myvar;
 
-	myvar = resolve_column_ref(ctxt, cref);
+	myvar = resolve_column_ref(cstate, cref);
 
 	if (myvar != NULL && var != NULL)
 	{
@@ -249,10 +256,10 @@ plpsm_post_column_ref(ParseState *pstate, ColumnRef *cref, Node *var)
 				 parser_errposition(pstate, cref->location)));
 	}
 
-	if (myvar == NULL && ctxt->pdata.is_expression)
+	if (myvar == NULL && cstate->pdata.is_expression)
 		elog(ERROR, "variable \"%s\" isn't available in current scope", NameListToString(cref->fields));
 
-	ctxt->pdata.has_params = true;
+	cstate->pdata.has_external_params = true;
 
 	return myvar;
 }
@@ -263,11 +270,11 @@ plpsm_post_column_ref(ParseState *pstate, ColumnRef *cref, Node *var)
 static Node *
 plpsm_paramref_hook(ParseState *pstate, ParamRef *pref)
 {
-	CompilationContext ctxt = (CompilationContext) pstate->p_ref_hook_state;
+	CompileState cstate = (CompileState) pstate->p_ref_hook_state;
 	int	paramno = pref->number;
 	Param	*param;
 
-	if (paramno <= 0 || paramno > ctxt->finfo.nargs)
+	if (paramno <= 0 || paramno > cstate->finfo.nargs)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_PARAMETER),
 				 errmsg("there is no parameter $%d", paramno),
@@ -276,11 +283,11 @@ plpsm_paramref_hook(ParseState *pstate, ParamRef *pref)
 	param = makeNode(Param);
 	param->paramkind = PARAM_EXTERN;
 	param->paramid = paramno;
-	param->paramtype = ctxt->typoids[paramno - 1];
+	param->paramtype = cstate->stack.oids.data[paramno - 1];
 	param->paramtypmod = -1;
 	param->location = pref->location;
 
-	ctxt->pdata.has_params = true;
+	cstate->pdata.has_external_params = true;
 
 	return (Node *) param;
 }
@@ -295,8 +302,8 @@ make_param(Plpsm_object *var, ColumnRef *cref)
 
 	param->paramkind = PARAM_EXTERN;
 	param->paramid = var->offset + 1;
-	param->paramtype = var->stmt->vartype.typoid;
-	param->paramtypmod = var->stmt->vartype.typmod;
+	param->paramtype = var->stmt->datum.typoid;
+	param->paramtypmod = var->stmt->datum.typmod;
 	param->location = cref->location;
 
 	return (Node *) param;
@@ -358,13 +365,13 @@ lookup_var(Plpsm_object *scope, const char *name)
  * Assign info about Object reference to state 
  */
 static void
-appendObjRef(CompilationContext ctxt, int location, const char *name1, const char *name2, int offset)
+appendHostVar(CompileState cstate, int location, const char *name1, const char *name2, int offset)
 {
-	SQLObjRef *ro = &ctxt->pdata.objects[ctxt->pdata.nobjects++];
-	ro->location = location;
-	ro->name1 = name1;
-	ro->name2 = name2;
-	ro->offset = offset;
+	SQLHostVar *var = &cstate->pdata.vars[cstate->pdata.nvars++];
+	var->location = location;
+	var->name1 = name1;
+	var->name2 = name2;
+	var->offset = offset;
 } 
 
 /*
@@ -377,7 +384,7 @@ appendObjRef(CompilationContext ctxt, int location, const char *name1, const cha
  * A.B.C      Qualified record reference
  */
 static Node *
-resolve_column_ref(CompilationContext ctxt, ColumnRef *cref)
+resolve_column_ref(CompileState cstate, ColumnRef *cref)
 {
 	const char *name1;
 	const char *name2 = NULL;
@@ -390,10 +397,10 @@ resolve_column_ref(CompilationContext ctxt, ColumnRef *cref)
 				Node	*field1 = (Node *) linitial(cref->fields);
 				Assert(IsA(field1, String));
 				name1 = strVal(field1);
-				var = lookup_var(ctxt->current_scope, name1);
+				var = lookup_var(cstate->current_scope, name1);
 				if (var != NULL)
 				{
-					appendObjRef(ctxt, cref->location, name1, NULL, var->offset + 1);
+					appendHostVar(cstate, cref->location, name1, NULL, var->offset + 1);
 					return make_param(var, cref);
 				}
 				break;
@@ -412,20 +419,20 @@ resolve_column_ref(CompilationContext ctxt, ColumnRef *cref)
 				Assert(IsA(field2, String));
 				name2 = strVal(field2);
 
-				var = lookup_qualified_var(ctxt->current_scope, name1, name2);
+				var = lookup_qualified_var(cstate->current_scope, name1, name2);
 				if (var != NULL)
 				{
-					if (lookup_var(ctxt->current_scope, name1))
+					if (lookup_var(cstate->current_scope, name1))
 						elog(ERROR, "there is conflict between compound statement label and composite variable");
-					appendObjRef(ctxt, cref->location, name1, name2, var->offset + 1);
+					appendHostVar(cstate, cref->location, name1, name2, var->offset + 1);
 					return make_param(var, cref);
 				}
 				else
 				{
-					var = lookup_var(ctxt->current_scope, name1);
+					var = lookup_var(cstate->current_scope, name1);
 					if (var != NULL)
 					{
-						appendObjRef(ctxt, cref->location, name1, NULL, var->offset + 1);
+						appendHostVar(cstate, cref->location, name1, NULL, var->offset + 1);
 						return make_param(var, cref);
 					}
 				}
@@ -440,10 +447,10 @@ resolve_column_ref(CompilationContext ctxt, ColumnRef *cref)
 				Assert(IsA(field2, String));
 				name2 = strVal(field2);
 
-				var = lookup_qualified_var(ctxt->current_scope, name1, name2);
+				var = lookup_qualified_var(cstate->current_scope, name1, name2);
 				if (var != NULL)
 				{
-					appendObjRef(ctxt, cref->location, name1, name2, var->offset + 1);
+					appendHostVar(cstate, cref->location, name1, name2, var->offset + 1);
 					return make_param(var, cref);
 				}
 			}
@@ -453,13 +460,12 @@ resolve_column_ref(CompilationContext ctxt, ColumnRef *cref)
 }
 
 void
-plpsm_parser_setup(struct ParseState *pstate, CompilationContext ctxt)
+plpsm_parser_setup(struct ParseState *pstate, CompileState cstate)
 {
 	pstate->p_post_columnref_hook = plpsm_post_column_ref;
 	pstate->p_paramref_hook = plpsm_paramref_hook;
-	pstate->p_ref_hook_state = (void *) ctxt;
+	pstate->p_ref_hook_state = (void *) cstate;
 }
-
 
 /*
  * Compile a expression - replace a variables by placeholders,
@@ -468,7 +474,7 @@ plpsm_parser_setup(struct ParseState *pstate, CompilationContext ctxt)
  * but necessary methods are not accesable now.
  */
 static char *
-compile_expr_simple_target(CompilationContext ctxt, char *expr, Oid typoid, int16 typmod, bool *no_params)
+compile_expr_simple_target(CompileState cstate, char *expr, Oid typoid, int16 typmod, bool *no_params)
 {
 
 	List       *raw_parsetree_list;
@@ -477,9 +483,8 @@ compile_expr_simple_target(CompilationContext ctxt, char *expr, Oid typoid, int1
 	int i = 0;
 	int				loc = 0;
 	int		j;
-	SQLObjRef *objects;
-	SQLObjRef	auxObjRef;
-	int	nobjects;
+	SQLHostVar	*vars;
+	int	nvars;
 	bool	not_sorted;
 	char *ptr;
 	ListCell *li;
@@ -487,10 +492,10 @@ compile_expr_simple_target(CompilationContext ctxt, char *expr, Oid typoid, int1
 	initStringInfo(&ds);
 	appendStringInfo(&ds, "SELECT (%s)::%s", expr, format_type_with_typemod(typoid, typmod));
 
-	ctxt->pdata.objects = (SQLObjRef *) palloc(ctxt->variables * sizeof(SQLObjRef));
-	ctxt->pdata.nobjects = 0;
-	ctxt->pdata.has_params = false;
-	ctxt->pdata.is_expression = true;
+	cstate->pdata.vars = (SQLHostVar *) palloc(cstate->stack.ndatums * sizeof(SQLHostVar));
+	cstate->pdata.nvars = 0;
+	cstate->pdata.has_external_params = false;
+	cstate->pdata.is_expression = true;
 
 	raw_parsetree_list = pg_parse_query(ds.data);
 
@@ -498,34 +503,36 @@ compile_expr_simple_target(CompilationContext ctxt, char *expr, Oid typoid, int1
 	{
 		 Node       *parsetree = (Node *) lfirst(li);
 
-		pg_analyze_and_rewrite_params((Node *) parsetree, ds.data, (ParserSetupHook) plpsm_parser_setup, (void *) ctxt);
+		pg_analyze_and_rewrite_params((Node *) parsetree, ds.data, (ParserSetupHook) plpsm_parser_setup, (void *) cstate);
 	}
 
 	/* fast path, there are no params */
-	if (ctxt->pdata.nobjects == 0)
+	if (cstate->pdata.nvars == 0)
 	{
-		*no_params = !ctxt->pdata.has_params;
+		*no_params = !cstate->pdata.has_external_params;
 		return ds.data;
 	}
 
 	*no_params = false;
 
 	/* now, pdata.params and pdata.cref_list contains a info about placeholders */
-	objects = ctxt->pdata.objects;
-	nobjects = ctxt->pdata.nobjects;
+	vars = cstate->pdata.vars;
+	nvars = cstate->pdata.nvars;
 
 	/* simple bublesort */
 	not_sorted = true;
 	while (not_sorted)
 	{
 		not_sorted = false;
-		for (i = 0; i < nobjects - 1; i++)
+		for (i = 0; i < nvars - 1; i++)
 		{
-			if (objects[i].location > objects[i+1].location)
+			SQLHostVar	var;
+
+			if (vars[i].location > vars[i+1].location)
 			{
 				not_sorted = true;
-				auxObjRef = objects[i];
-				objects[i] = objects[i+1]; objects[i+1] = auxObjRef;
+				var = vars[i];
+				vars[i] = vars[i+1]; vars[i+1] = var;
 			}
 		}
 	}
@@ -538,31 +545,31 @@ compile_expr_simple_target(CompilationContext ctxt, char *expr, Oid typoid, int1
 		char *str;
 
 		/* copy content to position of replaced object reference */
-		while (loc < objects[j].location)
+		while (loc < vars[j].location)
 		{
 			appendStringInfoChar(&cds, *ptr++);
 			loc++;
 		}
 
 		/* replace ref. object by placeholder */
-		appendStringInfo(&cds,"$%d", (int) objects[j].offset);
+		appendStringInfo(&cds,"$%d", (int) vars[j].offset);
 
 		/* find and skip a referenced object */
-		str = strstr(ptr, objects[j].name1);
+		str = strstr(ptr, vars[j].name1);
 		Assert(str != NULL);
-		str += strlen(objects[j].name1);
+		str += strlen(vars[j].name1);
 		loc += str - ptr; ptr = str;
 
 		/* when object was referenced with qualified name, then skip second identif */
-		if (objects[j].name2 != NULL)
+		if (vars[j].name2 != NULL)
 		{
-			str = strstr(ptr, objects[j].name2);
+			str = strstr(ptr, vars[j].name2);
 			Assert(str != NULL);
-			str += strlen(objects[j].name2);
+			str += strlen(vars[j].name2);
 			loc += str - ptr; ptr = str;
 		}
 
-		if (++j >= nobjects)
+		if (++j >= nvars)
 		{
 			/* copy to end and leave */
 			while (*ptr)
@@ -572,7 +579,9 @@ compile_expr_simple_target(CompilationContext ctxt, char *expr, Oid typoid, int1
 	}
 
 	pfree(ds.data);
-	pfree(objects);
+	pfree(vars);
+
+	cstate->pdata.vars = NULL;
 
 	return cds.data;
 }
@@ -582,7 +591,7 @@ compile_expr_simple_target(CompilationContext ctxt, char *expr, Oid typoid, int1
  * specified field, then fieldname is filled.
  */
 static Plpsm_object *
-resolve_target(CompilationContext ctxt, List *target, const char **fieldname, int location)
+resolve_target(CompileState cstate, List *target, const char **fieldname, int location)
 {
 	const char *name1;
 	const char *name2 = NULL;
@@ -595,7 +604,7 @@ resolve_target(CompilationContext ctxt, List *target, const char **fieldname, in
 				Node	*field1 = (Node *) linitial(target);
 				Assert(IsA(field1, String));
 				name1 = strVal(field1);
-				var = lookup_var(ctxt->current_scope, name1);
+				var = lookup_var(cstate->current_scope, name1);
 				if (var == NULL)
 					elog(ERROR, "a missing target variable \"%s\"", name1);
 				return var;
@@ -614,16 +623,16 @@ resolve_target(CompilationContext ctxt, List *target, const char **fieldname, in
 				Assert(IsA(field2, String));
 				name2 = strVal(field2);
 
-				var = lookup_qualified_var(ctxt->current_scope, name1, name2);
+				var = lookup_qualified_var(cstate->current_scope, name1, name2);
 				if (var != NULL)
 				{
-					if (lookup_var(ctxt->current_scope, name1))
+					if (lookup_var(cstate->current_scope, name1))
 						elog(ERROR, "there is conflict between compound statement label and composite variable");
 					return var;
 				}
 				else
 				{
-					var = lookup_var(ctxt->current_scope, name1);
+					var = lookup_var(cstate->current_scope, name1);
 					if (var == NULL)
 						elog(ERROR, "a missing target variable \"%s\"", name1);
 					*fieldname = name2;
@@ -644,7 +653,7 @@ resolve_target(CompilationContext ctxt, List *target, const char **fieldname, in
 				Assert(IsA(field3, String));
 				name3 = strVal(field3);
 
-				var = lookup_qualified_var(ctxt->current_scope, name1, name2);
+				var = lookup_qualified_var(cstate->current_scope, name1, name2);
 				if (var == NULL)
 					elog(ERROR, "a missing target variable \"%s\" with label \"%s\"", name2, name1);
 				*fieldname = name3;
@@ -654,15 +663,14 @@ resolve_target(CompilationContext ctxt, List *target, const char **fieldname, in
 	return NULL;
 }
 
-
 /*
- * Create a overdimensioned module
+ * Create a extensible module
  */
 static Plpsm_pcode_module *
 init_module(void)
 {
 	Plpsm_pcode_module *m = palloc(10000 * sizeof(Plpsm_pcode) + offsetof(Plpsm_pcode_module, code));
-	m->max_length = 10000;
+	m->mlength = 10000;
 	m->length = 0;
 	return m;
 }
@@ -761,7 +769,7 @@ list(Plpsm_pcode_module *m)
 	pfree(ds.data);
 }
 
-#define CHECK_MODULE_SIZE(m)		if (m->length == m->max_length) elog(ERROR, "module is too long")
+#define CHECK_MODULE_SIZE(m)		if (m->length == m->mlength) elog(ERROR, "module is too long")
 #define SET_AND_INC_PC(m, t)	m->code[m->length++].typ = t
 #define SET_ADDR(m, a)			m->code[m->length].addr = a
 #define SET_STR(m, s)			m->code[m->length].str = s
@@ -821,7 +829,7 @@ store_call_unknown(Plpsm_pcode_module *m)
 }
 
 static void
-store_exec_expr(CompilationContext ctxt, Plpsm_pcode_module *m, char *expr, Oid targetoid, int16 typmod)
+store_exec_expr(CompileState cstate, Plpsm_pcode_module *m, char *expr, Oid targetoid, int16 typmod)
 {
 	char *cexpr;
 	Oid	*typoids;
@@ -829,13 +837,13 @@ store_exec_expr(CompilationContext ctxt, Plpsm_pcode_module *m, char *expr, Oid 
 
 	CHECK_MODULE_SIZE(m);
 
-	cexpr = compile_expr_simple_target(ctxt, expr, targetoid, typmod, &no_params);
+	cexpr = compile_expr_simple_target(cstate, expr, targetoid, typmod, &no_params);
 	if (!no_params)
 	{
 		/* copy a actual typeoid vector to private typoid vector */
-		typoids = palloc(ctxt->variables * sizeof(Oid));
-		memcpy(typoids, ctxt->typoids, ctxt->variables);
-		SET_EXPR(m, cexpr, ctxt->variables, ctxt->typoids);
+		typoids = palloc(cstate->stack.ndatums * sizeof(Oid));
+		memcpy(typoids, cstate->stack.oids.data, cstate->stack.ndatums * sizeof(Oid));
+		SET_EXPR(m, cexpr, cstate->stack.ndatums, cstate->stack.oids.data);
 	}
 	else
 	{
@@ -867,8 +875,8 @@ store_copy_parameter(Plpsm_pcode_module *m, Plpsm_object *var, int paramid)
 	CHECK_MODULE_SIZE(m);
 	m->code[m->length].copyto.src = paramid;
 	m->code[m->length].copyto.dest = var->offset;
-	m->code[m->length].copyto.typlen = var->stmt->vartype.typlen; 
-	m->code[m->length].copyto.typbyval = var->stmt->vartype.typbyval;
+	m->code[m->length].copyto.typlen = var->stmt->datum.typlen; 
+	m->code[m->length].copyto.typbyval = var->stmt->datum.typbyval;
 	SET_AND_INC_PC(m, PCODE_COPY_PARAM);
 }
 
@@ -881,13 +889,13 @@ store_return(Plpsm_pcode_module *m)
 }
 
 static void
-store_done(CompilationContext ctxt, Plpsm_pcode_module *m)
+store_done(CompileState cstate, Plpsm_pcode_module *m)
 {
-	if (ctxt->finfo.default_return_expr != NULL && ctxt->resulttyp.typoid != VOIDOID)
+	if (cstate->finfo.return_expr != NULL && cstate->finfo.result.datum.typoid != VOIDOID)
 	{
-		store_exec_expr(ctxt, m, ctxt->finfo.default_return_expr,
-						ctxt->resulttyp.typoid, -1);
-		SET_DATUM_PROP(m, ctxt->resulttyp.typlen, ctxt->resulttyp.typbyval);
+		store_exec_expr(cstate, m, cstate->finfo.return_expr,
+						cstate->finfo.result.datum.typoid, -1);
+		SET_DATUM_PROP(m, cstate->finfo.result.datum.typlen, cstate->finfo.result.datum.typbyval);
 		SET_AND_INC_PC(m, PCODE_RETURN);
 	}
 	CHECK_MODULE_SIZE(m);
@@ -908,7 +916,7 @@ release_psm_object(Plpsm_object *obj)
  * to dynamic object is necessary, then dynamic SQL must be used. ???
  */
 static void 
-compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
+compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 {
 	int	addr1;
 	int	addr2;
@@ -922,44 +930,40 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 		switch (stmt->typ)
 		{
 			case PLPSM_STMT_LOOP:
-				obj = new_psm_object_for(stmt, ctxt, PC(m));
+				obj = new_psm_object_for(stmt, cstate, PC(m));
 				addr1 = PC(m);
-				compile(ctxt, stmt->inner_left, m);
+				compile(cstate, stmt->inner_left, m);
 				store_jmp(m, addr1);
-				ctxt->current_scope = release_psm_object(obj);
+				cstate->current_scope = release_psm_object(obj);
 				break;
 
 			case PLPSM_STMT_WHILE:
-				obj = new_psm_object_for(stmt, ctxt, PC(m));
+				obj = new_psm_object_for(stmt, cstate, PC(m));
 				addr1 = PC(m);
-				store_exec_expr(ctxt, m, stmt->expr, BOOLOID, -1);
+				store_exec_expr(cstate, m, stmt->expr, BOOLOID, -1);
 				addr2 = store_jmp_not_true_unknown(m);
-				compile(ctxt, stmt->inner_left, m);
+				compile(cstate, stmt->inner_left, m);
 				store_jmp(m, addr1);
 				SET_TARGET(addr2, PC(m));
-				ctxt->current_scope = release_psm_object(obj);
+				cstate->current_scope = release_psm_object(obj);
 				break;
 
 			case PLPSM_STMT_REPEAT_UNTIL:
-				obj = new_psm_object_for(stmt, ctxt, PC(m));
+				obj = new_psm_object_for(stmt, cstate, PC(m));
 				addr1 = PC(m);
-				compile(ctxt, stmt->inner_left, m);
-				store_exec_expr(ctxt, m, stmt->expr, BOOLOID, -1);
+				compile(cstate, stmt->inner_left, m);
+				store_exec_expr(cstate, m, stmt->expr, BOOLOID, -1);
 				store_jmp_not_true(m, addr1);
-				ctxt->current_scope = release_psm_object(obj);
+				cstate->current_scope = release_psm_object(obj);
 				break;
 
 			case PLPSM_STMT_COMPOUND_STATEMENT:
 				{
-					int16	offset = ctxt->current_offset;
-					int16	variables = ctxt->variables;
+					int16	ndatums = cstate->stack.ndatums;
 
-					obj = new_psm_object_for(stmt, ctxt, PC(m));
-					compile(ctxt, stmt->inner_left, m);
-					ctxt->current_offset = offset;
-					if (ctxt->variables > ctxt->max_variables)
-						ctxt->max_variables = ctxt->variables;
-					ctxt->variables = variables;
+					obj = new_psm_object_for(stmt, cstate, PC(m));
+					compile(cstate, stmt->inner_left, m);
+					cstate->stack.ndatums = ndatums;
 
 					/* generate release block */
 					if (obj->has_release_block)
@@ -978,7 +982,7 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 						}
 					}
 					
-					ctxt->current_scope = release_psm_object(obj);
+					cstate->current_scope = release_psm_object(obj);
 					break;
 				}
 
@@ -988,12 +992,12 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 					foreach(l, stmt->compound_target)
 					{
 						char *name = strVal(lfirst(l));
-						obj = create_variable_for(stmt, ctxt, name, true);
+						obj = create_variable_for(stmt, cstate, name, PLPSM_VARIABLE);
 
 						if (stmt->expr != NULL)
 						{
-							store_exec_expr(ctxt, m, stmt->expr, stmt->vartype.typoid, stmt->vartype.typmod);
-							store_saveto(m, obj->offset, stmt->vartype.typlen, stmt->vartype.typbyval);
+							store_exec_expr(cstate, m, stmt->expr, stmt->datum.typoid, stmt->datum.typmod);
+							store_saveto(m, obj->offset, stmt->datum.typlen, stmt->datum.typbyval);
 						}
 						else
 						{
@@ -1006,14 +1010,14 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 				break;
 
 			case PLPSM_STMT_IF:
-				store_exec_expr(ctxt, m, stmt->expr, BOOLOID, -1);
+				store_exec_expr(cstate, m, stmt->expr, BOOLOID, -1);
 				addr1 = store_jmp_not_true_unknown(m);
-				compile(ctxt, stmt->inner_left, m);
+				compile(cstate, stmt->inner_left, m);
 				if (stmt->inner_right)
 				{
 					addr2 = store_jmp_unknown(m);
 					SET_TARGET(addr1, PC(m));
-					compile(ctxt, stmt->inner_right, m);
+					compile(cstate, stmt->inner_right, m);
 					SET_TARGET(addr2, PC(m));
 				}
 				else
@@ -1021,7 +1025,7 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 				break;
 
 			case PLPSM_STMT_PRINT:
-				store_exec_expr(ctxt, m, stmt->expr, TEXTOID, -1);
+				store_exec_expr(cstate, m, stmt->expr, TEXTOID, -1);
 				store_print(m);
 				break;
 
@@ -1029,31 +1033,31 @@ compile(CompilationContext ctxt, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 				{
 					const char *fieldname;
 
-					obj = resolve_target(ctxt, stmt->target,  &fieldname, stmt->location);
-					store_exec_expr(ctxt, m, stmt->expr, obj->stmt->vartype.typoid, obj->stmt->vartype.typmod);
-					store_saveto(m, obj->offset, obj->stmt->vartype.typlen, obj->stmt->vartype.typbyval);
+					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
+					store_exec_expr(cstate, m, stmt->expr, obj->stmt->datum.typoid, obj->stmt->datum.typmod);
+					store_saveto(m, obj->offset, obj->stmt->datum.typlen, obj->stmt->datum.typbyval);
 					break;
 				}
 
 			case PLPSM_STMT_RETURN:
 				{
-					if (ctxt->resulttyp.typoid != VOIDOID)
+					if (cstate->finfo.result.datum.typoid != VOIDOID)
 					{
-						if (ctxt->finfo.default_return_expr != NULL && 
+						if (cstate->finfo.return_expr != NULL && 
 							stmt->expr != NULL)
 							elog(ERROR, "using RETURN expr in function with OUT arguments");
 
 						if (stmt->expr != NULL)
-							store_exec_expr(ctxt, m, stmt->expr, ctxt->resulttyp.typoid, -1);
+							store_exec_expr(cstate, m, stmt->expr, cstate->finfo.result.datum.typoid, -1);
 						else
-							store_exec_expr(ctxt, m, ctxt->finfo.default_return_expr,
-											ctxt->resulttyp.typoid, -1);
-						SET_DATUM_PROP(m, ctxt->resulttyp.typlen, ctxt->resulttyp.typbyval);
+							store_exec_expr(cstate, m, cstate->finfo.return_expr,
+											cstate->finfo.result.datum.typoid, -1);
+						SET_DATUM_PROP(m, cstate->finfo.result.datum.typlen, cstate->finfo.result.datum.typbyval);
 						SET_AND_INC_PC(m, PCODE_RETURN);
 					}
 					else
 					{
-						Assert(ctxt->finfo.default_return_expr == NULL);
+						Assert(cstate->finfo.return_expr == NULL);
 						if (stmt->expr != NULL)
 							elog(ERROR, "returned a value in VOID function");
 						SET_AND_INC_PC(m, PCODE_RETURN_VOID);
@@ -1080,7 +1084,7 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	Datum	prosrcdatum;
 	bool		isnull;
 	Plpsm_pcode_module *module;
-	CompilationContextData ctxt;
+	CompileStateData cstate;
 	Plpsm_object outer_scope;
 	int			numargs;
 	Oid		   *argtypes;
@@ -1115,17 +1119,16 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	outer_scope.typ = PLPSM_STMT_COMPOUND_STATEMENT;
 	outer_scope.name = pstrdup(NameStr(procStruct->proname));
 
-	ctxt.top_scope = &outer_scope;
-	ctxt.top_scope->name = outer_scope.name;
-	ctxt.current_scope = ctxt.top_scope;
-	ctxt.variables = 0;
-	ctxt.max_variables = 0;
-	ctxt.current_offset = 0;
-	ctxt.ntypoids = 256;
-	ctxt.typoids = palloc(256 * sizeof(Oid));
+	cstate.top_scope = &outer_scope;
+	cstate.top_scope->name = outer_scope.name;
+	cstate.current_scope = cstate.top_scope;
+	cstate.stack.ndatums = 0;
+	cstate.stack.mdatums = 0;
+	cstate.stack.oids.size = 128;
+	cstate.stack.oids.data = (Oid *) palloc(cstate.stack.oids.size * sizeof(Oid));
 
-	ctxt.resulttyp.typoid = procStruct->prorettype;
-	get_typlenbyval(ctxt.resulttyp.typoid, &ctxt.resulttyp.typlen, &ctxt.resulttyp.typbyval);
+	cstate.finfo.result.datum.typoid = procStruct->prorettype;
+	get_typlenbyval(cstate.finfo.result.datum.typoid, &cstate.finfo.result.datum.typlen, &cstate.finfo.result.datum.typbyval);
 
 	module = init_module();
 
@@ -1135,8 +1138,8 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	 */
 	numargs = get_func_arg_info(procTup,
 						&argtypes, &argnames, &argmodes);
-	ctxt.finfo.nargs = numargs;
-	ctxt.finfo.fn_name = pstrdup(NameStr(procStruct->proname));
+	cstate.finfo.nargs = numargs;
+	cstate.finfo.name = pstrdup(NameStr(procStruct->proname));
 
 	for (i = 0; i < numargs; i++)
 	{
@@ -1155,18 +1158,18 @@ plpsm_compile(Oid funcOid, bool forValidator)
 		decl_stmt->target = list_make1(makeString(pstrdup(buf)));
 		get_typlenbyval(argtypid, &typlen, &typbyval);
 
-		decl_stmt->vartype.typoid = argtypid;
-		decl_stmt->vartype.typmod = -1;
-		decl_stmt->vartype.typename = NULL;
-		decl_stmt->vartype.typlen = typlen;
-		decl_stmt->vartype.typbyval = typbyval;
+		decl_stmt->datum.typoid = argtypid;
+		decl_stmt->datum.typmod = -1;
+		decl_stmt->datum.typname = NULL;
+		decl_stmt->datum.typlen = typlen;
+		decl_stmt->datum.typbyval = typbyval;
 
 		/* append implicit name to scope */
-		var = create_variable_for(decl_stmt, &ctxt, pstrdup(buf), true);
+		var = create_variable_for(decl_stmt, &cstate, pstrdup(buf), PLPSM_VARIABLE);
 		/* append explicit name to scope */
 		if (argnames && argnames[i][0] != '\0')
 		{
-			alias = create_variable_for(decl_stmt, &ctxt, pstrdup(argnames[i]), false);
+			alias = create_variable_for(decl_stmt, &cstate, pstrdup(argnames[i]), PLPSM_REFERENCE);
 			alias->offset = var->offset; 
 		}
 
@@ -1214,16 +1217,16 @@ plpsm_compile(Oid funcOid, bool forValidator)
 		}
 		else
 			appendStringInfo(&ds, "$%d", bms_singleton_member(outargs) + 1);
-		ctxt.finfo.default_return_expr = ds.data;
+		cstate.finfo.return_expr = ds.data;
 
 		bms_free(outargs);
 	}
 	else
-		ctxt.finfo.default_return_expr = NULL;
+		cstate.finfo.return_expr = NULL;
 
-	compile(&ctxt, plpsm_parser_tree, module);
-	module->ndatums = ctxt.max_variables;
-	store_done(&ctxt, module);
+	compile(&cstate, plpsm_parser_tree, module);
+	module->ndatums = cstate.stack.mdatums;
+	store_done(&cstate, module);
 	if (plpsm_debug_compiler)
 		list(module);
 

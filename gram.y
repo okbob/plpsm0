@@ -1256,15 +1256,20 @@ declare_prefetch(void)
 			result->typ = PLPSM_STMT_DECLARE_VARIABLE;
 			result->compound_target = varnames;
 
+			/* 
+			 * ToDo: better to use a special function than read_until,
+			 * because it raise a error to late. Datatype must not contains
+			 * a keywords, special chars etc
+			 */
 			datatype = read_until(';', DEFAULT, 0, "; or \"DEFAULT\"", false, true, &endtok, startlocation);
 			parse_datatype(datatype, &type_id, &typmod);
 			get_typlenbyval(type_id, &typlen, &typbyval);
 
-			result->vartype.typoid = type_id;
-			result->vartype.typmod = typmod;
-			result->vartype.typename = datatype;
-			result->vartype.typlen = typlen;
-			result->vartype.typbyval = typbyval;
+			result->datum.typoid = type_id;
+			result->datum.typmod = typmod;
+			result->datum.typname = datatype;
+			result->datum.typlen = typlen;
+			result->datum.typbyval = typbyval;
 
 			if (endtok == ';')
 				break;

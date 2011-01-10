@@ -35,6 +35,12 @@ typedef enum
 
 typedef enum
 {
+	PLPSM_VARIABLE = 0,
+	PLPSM_REFERENCE = 1
+} Plpsm_usage_variable_type;
+
+typedef enum
+{
 	PLPSM_STMT_COMPOUND_STATEMENT,
 	PLPSM_STMT_DECLARE_VARIABLE,
 	PLPSM_STMT_DECLARE_CONDITION,
@@ -74,10 +80,10 @@ typedef struct Plpsm_stmt
 		{
 			Oid	typoid;
 			int16	typmod;
-			char	*typename;
+			char	*typname;
 			bool	typbyval;
 			int16	typlen;
-		} vartype;
+		} datum;
 	};
 	void			*data;
 	int	option;
@@ -166,7 +172,7 @@ typedef struct
 
 typedef struct
 {
-	int max_length;
+	int mlength;
 	int	length;
 	int		ndatums;
 	Plpsm_pcode code[1];
