@@ -5,7 +5,6 @@ set search_path = regtest;
  * these tests shows only correctly writen code.
  **********************************************************
  */
-
 create or replace function test01(a int)
 returns int as $$
 begin
@@ -135,10 +134,351 @@ create or replace function test14(out a int, out b int) as $$
 set a = 1, b = 2;
 $$ language psm0;
 
-/*************************************************
- *
- */
+create or replace function test15(a int)
+returns int as $$
+begin
+x1:while $1 > 0 do
+     set $1 = $1 - 1;
+     if $1 < 10 then
+       leave x1;
+     end if;
+   end while;
+   return $1;
+end;
+$$ language psm0;
 
+create or replace function test16(inout a int)
+returns int as $$
+x1: begin
+      set a = a + 1;
+      leave x1;
+      set a = a + 1;
+    end;
+$$ language psm0;
+
+create or replace function test17(a int)
+returns int as $$
+  begin
+    declare i int default a + 10;
+x1: loop
+      set i = i - 1;
+      if i > a then
+        iterate x1;
+      end if;
+      if i < 1 then
+        leave x1;
+      end if;
+    end loop;
+    return i;
+  end;
+$$ language psm0;
+
+create or replace function test18(inout a int) as $$
+x1:while a > 0 do
+     if a = 3 then
+       leave x1;
+     end if;
+     set a = a - 1;
+   end while;
+$$ language psm0;
+
+create or replace function test19(out a int, out b int) as $$
+  begin
+    set a = 0, b = 0;
+x1: loop
+  x2: loop
+        if a = 5 then
+          leave x2;
+        end if;
+        set b = b + 1;
+        if b = 5 then
+          set a = a + 1, b = 0;
+          iterate x2;
+        end if;
+      end loop x2;
+      set a = a + 10;
+      leave x1;
+    end loop x1;
+  end;
+$$ language psm0;
+
+create or replace function test20(out a int, out b int) as $$
+  begin
+    set a = 0, b = 0;
+x1: loop
+  x2: loop
+        if a = 5 then
+          leave x1;
+        end if;
+        set b = b + 1;
+        if b = 5 then
+          set a = a + 1, b = 0;
+          iterate x2;
+        end if;
+      end loop x2;
+      set a = a + 10;
+      leave x1;
+    end loop x1;
+  end;
+$$ language psm0;
+
+create or replace function test21(a int)
+returns int as $$
+case a
+      when 1 then return 11;
+      when 2 then return 12;
+      when 3 then return 13;
+             else return 14;
+end case;
+$$ language psm0;
+
+create or replace function test22(inout a int)
+returns int as $$
+case a
+      when 1,2,3 then set a = a + 10;
+                 else set a = a - 10;
+end case;
+$$ language psm0;
+
+create or replace function test23(a int)
+returns int as $$
+case
+      when a = 1 then set a = a + 10; return a;
+      when a = 2 then set a = a + 10; return a;
+      when a = 3 then set a = a + 10; return a;
+             else return -1;
+end case;
+$$ language psm0;
+
+create table footab(a int);
+insert into footab values(1),(2),(3),(4);
+
+create or replace function test24(a int)
+returns int as $$
+begin
+  declare a int;
+  set a = (select footab.a from footab where footab.a = test24.a);
+  return a;
+end;
+$$ language psm0;
+
+create or replace function test25(a int)
+returns int as $$
+  return (select footab.a from footab where footab.a = test25.a);
+$$ language psm0;
+
+create type xx as (a integer, b integer);
+
+create or replace function _test26()
+returns int as $$
+begin
+  declare a xx;
+  declare s int default 0;
+  if a is null then set s = s + 1; end if;
+  set a = (10,20)::xx;
+  if a.a + a.b = 30 then set s = s + 1; end if;
+  --set a.a = 40;
+  if a.a = 40 then set s = s + 1; end if;
+  set a = null;
+  if a is null then set s = s + 1; end if;
+  return s;
+end;
+$$ language psm0;
+
+DROP TYPE xx;
+
+
+/*
+
+create or replace function test26(out a int) as $$
+begin
+  declare sqlstate char(5);
+  declare x int;
+  declare cx cursor for select f.a from footab f where f.a <> x;
+  open cx;
+  close cx;
+end;
+$$ language psm0;
+
+create or replace function test26(out a int) as $$
+x1:begin
+    begin
+      declare sqlstate char(5);
+      declare x int;
+      declare cx cursor for select f.a from footab f where f.a <> x;
+      open cx;
+      close cx;
+      leave x1;
+    end;
+  end;
+$$ language psm0;
+
+
+create or replace function test24(a int)
+returns int as $$
+begin
+  declare sqlstate char(5);
+  declare aux int;
+  declare s int default = 0;
+  declare cx cursor for select a from footab where foo.a <> test24.a;
+  open cx;
+  fetch cx into aux;
+  while sqlstate = '00000' do
+    set s = s + aux;
+    fetch cx into aux;
+  end while;
+  close cx;		-- explicit cursor's close is optional 
+  return s;
+end;
+$$ language psm0;
+
+create table footab2(a int)
+insert into footab2 values(1),(2),(3);
+
+create or replace function test25()
+returns int as $$
+x1:begin
+     declare a int;
+     declare s int default 0;
+     declare done boolean = false;
+     declare c1 cursor for select a from footab;
+     declare continue handler for not found set done = true;
+     open c1;
+     fetch c1 into aux;
+     while not done do
+       begin
+         declare a int;
+         declare done boolean = false;
+         declare c2 cursor for select a from footab2;
+         declare continue handler for not found set done = true;
+         open c2;
+         fetch c2 into a;
+         while not done do
+           set s = s + x1.a * a;
+           fetch c2 into a;
+         end while;
+       end;
+       fetch c1 into a;
+     end while;
+     return s;
+   end;
+end
+$$ language psm0;
+
+create or replace function test26()
+returns int as $$
+begin
+  declare a1, a2 int;
+  declare s int default = 0;
+  declare done boolean = false;
+  declare c1 cursor for select a from footab;
+  declare c2 cursor for select a from footab2;
+  declare continue handler for not found set done = true;
+  open c1;
+  fetch c1 into a1;
+  while not done do
+    open c2;
+    fetch c2 into a2;
+    while not done do
+      set s = s + a1 * a2;
+      fetch c2 into a2;
+    end while;
+    close c2;
+    set done = false;
+    fetch c1 into a1;
+  end while;
+  return s;
+end;
+$$ language psm0;
+
+create or replace function test27()
+returns int as $$
+begin
+  declare sqlstate char(5);
+  declare s int default 0;
+  declare a1, a2 int;
+  declare c1 cursor for select a from footab;
+  declare c2 cursor for select a from footab2;
+  open c1;
+  fetch c1 into a1;
+  while sqlstate = '00000' do
+    open c2;
+    fetch c2 into a2;
+    while sqlstate = '00000' do
+      s = s + a1 * a2;
+      fetch c2 into a2;
+    end while;
+    fetch c2 into a1;
+  end while;
+  return s;
+end;
+$$ language psm0;
+
+create or replace function test28()
+returns int as $$
+begin
+  declare sqlstate char(5);
+  declare s int default 0;
+  declare a1 int;
+  declare c1 cursor for select a from footab;
+  open c1;
+  fetch c1 into a1;
+  while sqlstate = '000000' do
+    begin
+      declare sqlstate char(5);
+      declare a2 int;
+      declare c2 cursor for select a from footab2;
+      open c2;
+      fetch c2 into a2;
+      while sqlstate = '00000' do
+        s = s + a1 * a2;
+        fetch c2 into a2;
+      end while;
+    end;
+    fetch c2 into a1;
+  end while;
+  return s;
+end;
+$$ language psm0;
+
+truncate footab;
+
+-- using a subselect in assign statement newer raise a handler
+create or replace function test29()
+returns int as $$ 
+begin
+  declare ret int default 100;
+  declare continue handler for not found set ret = -100;
+  set ret = (select a from footab limit 1); -- subselect just returns NULL;
+  return coalesce(ret, -1);
+end;
+$$ language psm0; --returns -1
+
+-- using a select into raise a handler
+create or replace function test30()
+returns int as $$
+begin
+  declare ret default 100;
+  declare continue handler for not found set ret = -100;
+  select a into ret from footab; -- raise error, when query returns more than one row
+  return coalesce(ret, -1);
+end;
+$$ language psm0; -- returns -100;
+
+create or replace function test31()
+returns int as $$
+begin
+  declare ret default 100;
+  select a into ret from footab;
+  return coalesce(ret, -1);
+end;
+$$ language psm0; -- returns -1
+
+*/
+
+/*************************************************
+ * Assert functions
+ */
 create or replace function assert(text, int, int)
 returns void as $$
 begin
@@ -173,7 +513,37 @@ begin
   perform assert('test11', 13, test11(10));
   perform assert('test12',  4, test12(1));
   perform assert('test13', 10, test13(0));
-  perform assert('test14', 2, (test14()).b);
+  perform assert('test14',  2, (test14()).b);
+  perform assert('test15',  7, test15(8));
+  perform assert('test15',  9, test15(12));
+  perform assert('test16',  4, test16(3));
+  perform assert('test17',  0, test17(2));
+  perform assert('test17', -5, test17(-5));
+  perform assert('test18',  0, test18(2));
+  perform assert('test18',  3, test18(10));
+  perform assert('test19', 15, (select a from test19()));
+  perform assert('test20',  5, (select a from test20()));
+  perform assert('test21', 11, test21(1));
+  perform assert('test21', 12, test21(2));
+  perform assert('test21', 13, test21(3));
+  perform assert('test21', 14, test21(4));
+  perform assert('test21', 14, test21(5));
+  perform assert('test22', 11, test22(1));
+  perform assert('test22', 12, test22(2));
+  perform assert('test22', 13, test22(3));
+  perform assert('test22', -6, test22(4));
+  perform assert('test22', -5, test22(5));
+  perform assert('test23', 11, test23(1));
+  perform assert('test23', 12, test23(2));
+  perform assert('test23', 13, test23(3));
+  perform assert('test23', -1, test23(4));
+  perform assert('test23', -1, test23(5));
+  perform assert('test24',  2, test24(2));
+  perform assert('test24', -1, coalesce(test24(10), -1));
+  perform assert('test25',  2, test25(2));
+  perform assert('test25', -1, coalesce(test25(10),-1));
+
+
 
   raise notice '******* All tests are ok *******';
 end;

@@ -62,7 +62,8 @@ typedef enum
 	PLPSM_STMT_CLOSE,
 	PLPSM_STMT_FETCH,
 	PLPSM_STMT_FOR,
-	PLPSM_STMT_IF
+	PLPSM_STMT_IF,
+	PLPSM_STMT_CASE
 } Plpsm_stmt_type;
 
 typedef struct Plpsm_stmt
@@ -101,11 +102,20 @@ typedef struct Plpsm_object
 	Plpsm_stmt_type		typ;
 	char	*name;
 	Plpsm_stmt	*stmt;
-	bool			has_release_block;
-	List		*release_address_list;
 	union
 	{
-		int		iterate_addr;
+		struct
+		{
+			int	entry_addr;
+			bool	has_release_call;
+			List	*release_calls;
+			List	*leave_jmps;
+		} calls;
+		struct
+		{
+			int	data_addr;
+			int16	offset;
+		} cursor;
 		int16		offset;
 	};
 	struct Plpsm_object *next;
@@ -121,8 +131,10 @@ typedef enum
 	PCODE_JMP,
 	PCODE_JMP_NOT_FOUND,
 	PCODE_CALL,
+	PCODE_RET_SUBR,
 	PCODE_RETURN,
 	PCODE_RETURN_VOID,
+	PCODE_RETURN_NULL,
 	PCODE_EXEC_EXPR,
 	PCODE_PRINT,
 	PCODE_DEBUG,
@@ -131,7 +143,13 @@ typedef enum
 	PCODE_EXECUTE,
 	PCODE_SET_NULL,
 	PCODE_SAVETO,
-	PCODE_COPY_PARAM
+	PCODE_UPDATE_DATUM,
+	PCODE_COPY_PARAM,
+	PCODE_SIGNAL_NODATA,
+	PCODE_DATA_QUERY,
+	PCODE_CURSOR_OPEN,
+	PCODE_CURSOR_CLOSE,
+	PCODE_CURSOR_RELEASE
 } Plpsm_pcode_type;
 
 typedef struct
@@ -166,6 +184,20 @@ typedef struct
 			int	src;
 			int	dest;
 		} copyto;
+		struct
+		{
+			int	addr;
+			int	offset;
+			char *name;
+		} cursor;
+		struct {
+			int16 typlen;
+			Oid	typoid;
+			int offset;
+			int16	attypmod;
+			int16   attyplen;
+			int16	fieldnum;
+		} update;
 		int	size;
 	};
 } Plpsm_pcode;
@@ -175,14 +207,9 @@ typedef struct
 	int mlength;
 	int	length;
 	int		ndatums;
+	char *name;
 	Plpsm_pcode code[1];
 } Plpsm_pcode_module;
-
-typedef struct
-{
-	Datum	value;
-	bool	isnull;
-} Plpsm_value;
 
 extern Plpsm_stmt *plpsm_parser_tree;
 extern Plpsm_object *plpsm_parser_objects;
@@ -206,7 +233,5 @@ extern Plpsm_pcode_module *plpsm_compile(Oid funcOid, bool forValidator);
 extern Datum plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo);
 
 extern Plpsm_stmt *plpsm_new_stmt(Plpsm_stmt_type typ, int location);
-
-
 
 #endif

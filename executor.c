@@ -153,12 +153,59 @@ next_op:
 						nulls[pcode->copyto.dest] = 'n';
 					break;
 				}
+			case PCODE_CURSOR_OPEN:
+				{
+					Portal portal;
+					Plpsm_pcode *data;
+
+					data = &module->code[pcode->cursor.addr];
+					portal = SPI_cursor_open_with_args(NULL, 
+										data->expr.expr,
+										data->expr.nparams, data->expr.typoids,
+												values, nulls,
+														true, 0);
+					values[pcode->cursor.offset] = PointerGetDatum(portal);
+					nulls[pcode->cursor.offset] = ' ';
+				}
+				break;
+
+			case PCODE_CURSOR_CLOSE:
+					if (nulls[pcode->cursor.offset] != ' ')
+						elog(ERROR, "cursor \"%s\" is closed", pcode->cursor.name);
+					SPI_cursor_close((Portal) DatumGetPointer(values[pcode->cursor.offset]));
+					nulls[pcode->cursor.offset] = 'n';
+				break;
+
+			case PCODE_CURSOR_RELEASE:
+					if (nulls[pcode->cursor.offset] != 'n')
+					{
+						SPI_cursor_close((Portal) DatumGetPointer(values[pcode->cursor.offset]));
+						nulls[pcode->cursor.offset] = 'n';
+					}
+				break;
+
+			case PCODE_SIGNAL_NODATA:
+				{
+					if (pcode->str != NULL)
+						ereport(ERROR, 
+								(errcode(ERRCODE_NO_DATA_FOUND),
+								 errmsg("%s", pcode->str)));
+					else
+						ereport(ERROR, 
+								(errcode(ERRCODE_NO_DATA_FOUND),
+								 errmsg("no data")));
+				}
+				break;
 			case PCODE_RETURN_VOID:
+			case PCODE_RETURN_NULL:
 				goto leave_process;
+			case PCODE_DATA_QUERY:
+				/* do nothing */
+				break;
 			default:
-				elog(ERROR, "unknown pcode");
+				elog(ERROR, "unknown pcode %d %d", pcode->typ, PC);
 		}
-	
+
 		PC += 1;
 	}
 

@@ -115,6 +115,8 @@ static void elog_stmt(int level, Plpsm_stmt *stmt);
 %type <stmt>	stmt_prepare param_types_opt stmt_execute stmt_execute_immediate
 %type <stmt>	stmt_open stmt_fetch stmt_close stmt_for for_prefetch
 %type <str>	cursor_def
+%type <stmt>	stmt_case case_when_list case_when opt_case_else
+%type <str>	opt_expr_until_when
 
 /*
  * Basic non-keyword token types.  These are hard-wired into the core lexer.
@@ -136,6 +138,7 @@ static void elog_stmt(int level, Plpsm_stmt *stmt);
 
 %token <keyword>	AS
 %token <keyword>	BEGIN
+%token <keyword>	CASE
 %token <keyword>	CLOSE
 %token <keyword>	CONDITION
 %token <keyword>	CONTINUE
@@ -176,6 +179,7 @@ static void elog_stmt(int level, Plpsm_stmt *stmt);
 %token <keyword>	UNTIL
 %token <keyword>	USING
 %token <keyword>	VALUE
+%token <keyword>	WHEN
 %token <keyword>	WHILE
 
 %%
@@ -248,6 +252,7 @@ stmt:
 			| stmt_close				{ $$ = $1; }
 			| stmt_for				{ $$ = $1; }
 			| stmt_if				{ $$ = $1; }
+			| stmt_case				{ $$ = $1; }
 		;
 
 /*----
@@ -521,6 +526,75 @@ stmt_else:
 					$$ = $2;
 				}
 		;
+
+/*----
+ * condition statement CASE
+ *
+ * CASE expr WHEN x [, ...] THEN ... [ ELSE ... ] END CASE
+ * CASE WHEN expr THEN .. ... [ ELSE ...] END CASE
+ */
+stmt_case: 		CASE opt_expr_until_when case_when_list opt_case_else END CASE
+					{
+						Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_CASE, @1);
+						new->expr = $2;
+						new->inner_left = $3;
+						new->inner_right = $4;
+						$$ = new;
+					}
+				;
+
+opt_expr_until_when:
+				{
+					char *expr = NULL;
+					int	tok = yylex();
+					StringInfoData	ds;
+
+					if (tok != WHEN)
+					{
+						plpsm_push_back_token(tok);
+						initStringInfo(&ds);
+						expr = read_until(WHEN, -1, -1, "WHEN", true, false, NULL, -1);
+						appendStringInfo(&ds, "SELECT (%s)", expr);
+						check_sql_expr(ds.data);
+						pfree(ds.data);
+						$$ = expr;
+					}
+					plpsm_push_back_token(WHEN);
+					$$ = expr;
+				}
+		;
+
+case_when_list:
+			case_when_list case_when
+				{
+					$1->last->next = $2;
+					$1->last = $2;
+				}
+			| case_when
+				{
+					$$ = $1;
+				}
+		;
+
+case_when:		WHEN expr_until_then statements ';'
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_CASE, @1);
+					new->expr = $2;
+					new->inner_left = $3;
+					new->last = new;
+					$$ = new;
+				}
+			;
+
+opt_case_else:
+				{
+					$$ = NULL;
+				}
+			| ELSE statements ';'
+				{
+					$$ = $2;
+				}
+			;
 
 /*----
  * (multi) assign statement 
@@ -1286,7 +1360,7 @@ declare_prefetch(void)
 			Assert(tok == CURSOR);
 
 			result->typ = PLPSM_STMT_DECLARE_CURSOR;
-			result->target = linitial(varnames);
+			result->target = varnames;
 			result->option = option;
 			plpsm_push_back_token(tok);
 			break;
@@ -1304,7 +1378,7 @@ declare_prefetch(void)
 				state = Unknown;
 				continue;
 			}
-			if (tok == CONTINUE || tok == EXIT || tok == UNDO)
+			else if (tok == CONTINUE || tok == EXIT || tok == UNDO)
 			{
 				int tok1;
 				const char *varname = yylval.keyword;		/* store pointer for possible later usage */
@@ -1340,6 +1414,12 @@ declare_prefetch(void)
 					state = Unknown;
 					continue;
 				}
+			}
+			else if (is_unreserved_keyword(tok))
+			{
+				varnames = list_make1(makeString(yylval.word.ident));
+				state = Unknown;
+				continue;
 			}
 		}
 
@@ -1433,6 +1513,7 @@ declare_prefetch(void)
 
 		if (state == EXPECTED_VARIABLE)
 		{
+		
 			if (tok != WORD && !is_unreserved_keyword(tok))
 				yyerror("missing a variable identifier");
 			varnames = lappend(varnames, makeString(yylval.word.ident));
@@ -1564,6 +1645,8 @@ parser_stmt_name(Plpsm_stmt_type typ)
 			return "for statement";
 		case PLPSM_STMT_IF:
 			return "if statement";
+		case PLPSM_STMT_CASE:
+			return "case statement";
 		default:
 			return "unknown statment typid";
 	}
