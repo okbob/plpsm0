@@ -31,7 +31,6 @@ typedef struct
 	struct
 	{
 		int16 ndatums;				/* number of datums in current scope */
-		int16 mdatums;				/* number of datums global 		*/
 		struct
 		{
 			int size;			/* size of preallocated data for datums oids vector */
@@ -164,6 +163,12 @@ lookup_object_with_label_in_scope(Plpsm_object *scope, char *name)
 
 /*
  * new variable
+ *
+ * SQL/PSM doesn't allow a sharing space between independent scopes. The reason is 
+ * a concept of continue handlers, where you can go to independent scope, working
+ * there with variables and then return back. Probably there should be some rules 
+ * like divide a frame on handler part and routine part, but the most simple solution
+ * is using a non overlaped frames. 
  */
 static Plpsm_object *
 create_variable_for(Plpsm_stmt *decl_stmt, CompileState cstate, 
@@ -212,9 +217,6 @@ create_variable_for(Plpsm_stmt *decl_stmt, CompileState cstate,
 			cstate->stack.oids.data[offset] = InvalidOid;
 			cstate->current_scope->calls.has_release_call = true;
 		}
-
-		if (cstate->stack.ndatums > cstate->stack.mdatums)
-			cstate->stack.mdatums = cstate->stack.ndatums;
 
 		if (decl_stmt->typ == PLPSM_STMT_DECLARE_VARIABLE)
 			var->offset = offset;
@@ -883,7 +885,7 @@ static void
 compile_leave_iterate(CompileState cstate, 
 						Plpsm_object *scope, Plpsm_stmt *stmt)
 {
-	Assert(stmt->typ == PLPSM_STMT_LEAVE || stmt->typ == PLPSM_STMT_ITERATE || stmt->typ == PLPSM_STMT_RETURN);
+	Assert(stmt->typ == PLPSM_STMT_LEAVE || stmt->typ == PLPSM_STMT_ITERATE);
 
 	if (scope == NULL)
 		return;
@@ -896,7 +898,7 @@ compile_leave_iterate(CompileState cstate,
 		case PLPSM_STMT_REPEAT_UNTIL:
 		case PLPSM_STMT_FOR:
 			{
-				if (scope->name && stmt->name && strcmp(scope->name, stmt->name) == 0)
+				if (scope->name && strcmp(scope->name, stmt->name) == 0)
 				{
 					if (stmt->typ == PLPSM_STMT_ITERATE)
 					{
@@ -913,12 +915,9 @@ compile_leave_iterate(CompileState cstate,
 							scope->calls.release_calls = lappend(scope->calls.release_calls, 
 														makeInteger(addr));
 						}
-						if (stmt->typ != PLPSM_STMT_RETURN)
-						{
-							addr = store_jmp_unknown(cstate->module);
-							scope->calls.leave_jmps = lappend(scope->calls.leave_jmps,
+						addr = store_jmp_unknown(cstate->module);
+						scope->calls.leave_jmps = lappend(scope->calls.leave_jmps,
 													    makeInteger(addr));
-						}
 					}
 				}
 				else
@@ -1383,14 +1382,11 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 
 			case PLPSM_STMT_COMPOUND_STATEMENT:
 				{
-					int16	ndatums = cstate->stack.ndatums;
-					
 					bool	has_sqlstate = cstate->stack.has_sqlstate;
 					bool	has_sqlcode = cstate->stack.has_sqlcode;
 
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					compile(cstate, stmt->inner_left, m);
-					cstate->stack.ndatums = ndatums;
 
 					cstate->stack.has_sqlstate = has_sqlstate;
 					cstate->stack.has_sqlcode = has_sqlcode;
@@ -1638,8 +1634,6 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 			case PLPSM_STMT_RETURN:
 				{
 					/* leave all compound statements too */
-					compile_leave_iterate(cstate, cstate->current_scope, stmt);
-				
 					if (cstate->finfo.result.datum.typoid != VOIDOID)
 					{
 						if (cstate->finfo.return_expr != NULL && 
@@ -1723,7 +1717,6 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	cstate.current_scope = cstate.top_scope;
 	cstate.stack.ndata = 0;
 	cstate.stack.ndatums = 0;
-	cstate.stack.mdatums = 0;
 	cstate.stack.oids.size = 128;
 	cstate.stack.oids.data = (Oid *) palloc(cstate.stack.oids.size * sizeof(Oid));
 	cstate.stack.has_sqlstate = false;
@@ -1832,7 +1825,7 @@ plpsm_compile(Oid funcOid, bool forValidator)
 
 	store_done(&cstate, module);
 
-	module->ndatums = cstate.stack.mdatums;
+	module->ndatums = cstate.stack.ndatums;
 	module->ndata = cstate.stack.ndata;
 
 	if (plpsm_debug_compiler)

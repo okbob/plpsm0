@@ -1,5 +1,6 @@
 #include "psm.h"
 #include "executor/spi.h"
+#include "nodes/bitmapset.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -7,9 +8,9 @@
 Datum
 plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
 {
-	Datum	*values;
-	char	*nulls;
-	void	**DataPtrs;
+	Datum	*values = NULL;
+	char	*nulls = NULL;
+	void	**DataPtrs = NULL;
 	int		PC = 0;
 	int		SP = 0;
 	bool			clean_result = false;
@@ -17,10 +18,18 @@ plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
 	bool		isnull;
 	int				CallStack[1024];
 	int	sqlstate = 0;
+	Bitmapset	*acursors = NULL;		/* active cursors */
+	int	offset;
 
-	values = palloc(module->ndatums * sizeof(Datum) + 100);
-	nulls = palloc(module->ndatums * sizeof(char) + 100);
-	DataPtrs = palloc0((module->ndata + 1) * sizeof(void*) );
+	if (module->ndatums)
+	{
+		values = palloc(module->ndatums * sizeof(Datum));
+		nulls = palloc(module->ndatums * sizeof(char));
+	}
+	if (module->ndata >= 1)
+	{
+		DataPtrs = palloc0((module->ndata + 1) * sizeof(void*) );
+	}
 	
 	while (PC < module->length)
 	{
@@ -76,10 +85,13 @@ next_op:
 						len = datumGetSize(result, false, pcode->target.typlen);
 						tmp = SPI_palloc(len);
 						memcpy(tmp, DatumGetPointer(result), len);
-						fcinfo->isnull = false;
-						return PointerGetDatum(tmp);
+						result =  PointerGetDatum(tmp);
 					}
 
+					/* release a opened cursors */
+					while ((offset = bms_first_member(acursors)) >= 0)
+						SPI_cursor_close((Portal) DatumGetPointer(values[offset]));
+					
 					fcinfo->isnull = isnull;
 					return (Datum) result;
 				}
@@ -216,6 +228,7 @@ next_op:
 														true, 0);
 					values[pcode->cursor.offset] = PointerGetDatum(portal);
 					nulls[pcode->cursor.offset] = ' ';
+					acursors = bms_add_member(acursors, pcode->cursor.offset);
 				}
 				break;
 
@@ -286,6 +299,7 @@ next_op:
 						elog(ERROR, "cursor \"%s\" is closed", pcode->cursor.name);
 					SPI_cursor_close((Portal) DatumGetPointer(values[pcode->cursor.offset]));
 					nulls[pcode->cursor.offset] = 'n';
+					acursors = bms_del_member(acursors, pcode->cursor.offset);
 				break;
 
 			case PCODE_CURSOR_RELEASE:
@@ -293,6 +307,7 @@ next_op:
 					{
 						SPI_cursor_close((Portal) DatumGetPointer(values[pcode->cursor.offset]));
 						nulls[pcode->cursor.offset] = 'n';
+						acursors = bms_del_member(acursors, pcode->cursor.offset);
 					}
 				break;
 
@@ -327,6 +342,11 @@ next_op:
 leave_process:
 
 	fcinfo->isnull = true;
-	pfree(values); pfree(nulls);
+	
+	/* release a opened cursors */
+	while ((offset = bms_first_member(acursors)) >= 0)
+		SPI_cursor_close((Portal) DatumGetPointer(values[offset]));
+	bms_free(acursors);
+	
 	return (Datum) 0;
 }

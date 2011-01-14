@@ -308,6 +308,13 @@ returns int as $$
     open cx;
 l1: loop
       fetch cx into x;
+      /*
+       * Atention: this pattern isn't possible on MySQL, where fetching no data
+       * raises a error. But it isn't compatibility problem, because every MySQL's
+       * procedure will use a continue or exit handler. Correct procedure will not
+       * stop on unhandled warning. Because we like to be near DB2, then we doesn't
+       * follow MySQL behave and we doesn't raise break here.
+       */
       if x is null then
         leave l1;
       end if;
