@@ -323,6 +323,34 @@ next_op:
 								 errmsg("no data")));
 				}
 				break;
+			case PCODE_STRBUILDER:
+				{
+					StringInfo ds;
+
+					switch (pcode->strbuilder.op)
+					{
+						case PLPSM_STRBUILDER_APPEND_CHAR:
+							ds = DataPtrs[pcode->strbuilder.data];
+							appendStringInfoChar(ds, pcode->strbuilder.chr);
+							break;
+						case PLPSM_STRBUILDER_APPEND_RESULT:
+							ds = DataPtrs[pcode->strbuilder.data];
+							if (isnull)
+								appendStringInfoString(ds,"<NULL>");
+							else
+								appendStringInfo(ds, "%s", text_to_cstring(DatumGetTextP(result)));
+							break;
+						case PLPSM_STRBUILDER_PRINT_FREE:
+							ds = DataPtrs[pcode->strbuilder.data];
+							ereport(NOTICE, (0, errmsg_internal("%s", ds->data)));
+							pfree(ds->data);
+							break;
+						case PLPSM_STRBUILDER_INIT:
+							DataPtrs[pcode->strbuilder.data] = makeStringInfo();
+						break;
+					}
+				}
+				break;
 			case PCODE_RETURN_VOID:
 			case PCODE_RETURN_NULL:
 				goto leave_process;

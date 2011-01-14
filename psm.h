@@ -153,8 +153,17 @@ typedef enum
 	PCODE_CURSOR_CLOSE,
 	PCODE_CURSOR_RELEASE,
 	PCODE_SQLSTATE_REFRESH,
-	PCODE_SQLCODE_REFRESH
+	PCODE_SQLCODE_REFRESH,
+	PCODE_STRBUILDER
 } Plpsm_pcode_type;
+
+typedef enum
+{
+	PLPSM_STRBUILDER_INIT,
+	PLPSM_STRBUILDER_APPEND_CHAR,
+	PLPSM_STRBUILDER_APPEND_RESULT,
+	PLPSM_STRBUILDER_PRINT_FREE
+} Plpsm_strbuilder_op_type;
 
 typedef struct
 {
@@ -220,6 +229,12 @@ typedef struct
 			int	nvars;
 			char *name;
 		} fetch;
+		struct
+		{
+			int	data;
+			Plpsm_strbuilder_op_type op;
+			char	chr;
+		} strbuilder;
 		int	size;
 	};
 } Plpsm_pcode;

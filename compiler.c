@@ -1101,6 +1101,10 @@ list(Plpsm_pcode_module *m)
 			case PCODE_SQLSTATE_REFRESH:
 				appendStringInfo(&ds, "RefreshSQLSTATE @%d", m->code[pc].target.offset);
 				break;
+			case PCODE_STRBUILDER:
+				appendStringInfo(&ds, "StringBuilder data[%d] op:%d", m->code[pc].strbuilder.data,
+											m->code[pc].strbuilder.op);
+				break;
 		}
 		appendStringInfoChar(&ds, '\n');
 	}
@@ -1608,8 +1612,41 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 				break;
 
 			case PLPSM_STMT_PRINT:
-				store_exec_expr(cstate, m, stmt->expr, TEXTOID, -1);
-				store_print(m);
+				if (list_length(stmt->compound_target) == 1)
+				{
+					store_exec_expr(cstate, m, strVal(linitial(stmt->compound_target)), TEXTOID, -1);
+					store_print(m);
+				}
+				else
+				{
+					ListCell *l;
+					bool	isFirst = true;
+					int dataidx = cstate->stack.ndata++;
+
+					SET_OPVAL(strbuilder.data, dataidx);
+					SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_INIT);
+					EMIT_OPCODE(PCODE_STRBUILDER);
+					foreach(l, stmt->compound_target)
+					{
+						char *expr = strVal(lfirst(l));
+						store_exec_expr(cstate, m, expr, TEXTOID, -1);
+						if (!isFirst)
+						{
+							SET_OPVAL(strbuilder.data, dataidx);
+							SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_APPEND_CHAR);
+							SET_OPVAL(strbuilder.chr, ' ');
+							EMIT_OPCODE(PCODE_STRBUILDER);
+						}
+						else
+							isFirst = false;
+						SET_OPVAL(strbuilder.data, dataidx);
+						SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_APPEND_RESULT);
+						EMIT_OPCODE(PCODE_STRBUILDER);
+					}
+					SET_OPVAL(strbuilder.data, dataidx);
+					SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_PRINT_FREE);
+					EMIT_OPCODE(PCODE_STRBUILDER);
+				}
 				break;
 
 			case PLPSM_STMT_SET:

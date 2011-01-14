@@ -686,10 +686,10 @@ qual_identif:
  *
  * note: this is only PostgreSQL feature
  */
-stmt_print:		PRINT expr_until_semi
+stmt_print:		PRINT expr_list
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_PRINT, @1);
-					new->expr = $2;
+					new->compound_target = $2;
 					$$ = new;
 				}
 		;
