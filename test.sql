@@ -59,6 +59,18 @@ returns text as $$
 return 'Hello ' || a;
 $$ language psm0;
 
+create or replace function test06_01(out a text) as $$
+set a = 'Hello World';
+$$ language psm0;
+
+create or replace function test06_02(inout a text) as $$
+set a = 'Hello ' || a;
+$$ language psm0;
+
+create or replace function test06_03(out a text, out b text) as $$
+set a = 'Hello', b = 'World';
+$$ language psm0;
+
 create or replace function test07(a int)
 returns int as $$
   x1: begin
@@ -269,7 +281,7 @@ $$ language psm0;
 
 create type xx as (a integer, b integer);
 
-create or replace function _test26()
+create or replace function test26()
 returns int as $$
 begin
   declare a xx;
@@ -286,6 +298,111 @@ end;
 $$ language psm0;
 
 DROP TYPE xx;
+
+create or replace function test27(a int)
+returns int as $$
+  begin
+    declare x int;
+    declare s int default 0;
+    declare cx cursor for select i from generate_series(1,10) g(i) where i > a;
+    open cx;
+l1: loop
+      fetch cx into x;
+      if x is null then
+        leave l1;
+      end if;
+      set s = s + x;
+    end loop;
+    return s;
+  end;
+$$ language psm0;
+
+create table footab(a int)
+insert into footab values(1),(2),(3),(4);
+
+create table footab2(a int);
+insert into footab2 values(1),(2),(3);
+
+create or replace function test28(a int)
+returns int as $$
+begin
+  declare sqlstate char(5);
+  declare aux int;
+  declare s int default 0;
+  declare cx cursor for select footab.a from footab where footab.a <> test28.a;
+  open cx;
+  fetch cx into aux;
+  while sqlstate = '00000' do
+    set s = s + aux;
+    fetch cx into aux;
+  end while;
+  close cx;
+  return s;
+end;
+$$ language psm0;
+
+create or replace function test30(out x int, out s int, out sqlcode int, out sqlstate char(5))
+as $$
+begin
+  declare cx cursor for select a from footab;
+  open cx;
+  set s = 0;
+  fetch cx into x;
+  while sqlcode = 0 do
+    set s = s + x;
+    fetch cx into x;
+    print s;
+  end while;
+end;
+$$ language psm0;
+
+create or replace function test31()
+returns int as $$
+begin
+  declare sqlstate char(5);
+  declare i int default 0;
+  declare a1, a2 int;
+  declare c1 cursor for select a from footab;
+  declare c2 cursor for select a from footab2;
+  open c1;
+  fetch c1 into a1;
+  while sqlstate = '00000' do
+    open c2;
+    fetch c2 into a2;
+    while sqlstate = '00000' do
+      set i = i + 1;
+      fetch c2 into a2;
+    end while;
+    fetch c1 into a1;
+  end while;
+  return i;
+end;
+$$ language psm0;
+
+create or replace function test32()
+returns int as $$
+begin
+  declare sqlcode int;
+  declare i int default 0;
+  declare a1, a2 int;
+  declare c1 cursor for select a from footab;
+  declare c2 cursor for select a from footab2;
+  open c1;
+  fetch c1 into a1;
+  while sqlcode = 0 do
+    open c2;
+    fetch c2 into a2;
+    while sqlcode = 0 do
+      set i = i + 1;
+      fetch c2 into a2;
+    end while;
+    fetch c1 into a1;
+  end while;
+  return i;
+end;
+$$ language psm0;
+
+
 
 
 /*
@@ -307,6 +424,7 @@ x1:begin
       declare x int;
       declare cx cursor for select f.a from footab f where f.a <> x;
       open cx;
+      fetch cx into x;
       close cx;
       leave x1;
     end;
@@ -506,6 +624,9 @@ begin
   perform assert('test04', 45, test04(10));
   perform assert('test05', 11, test05(11));
   perform assert('test06', 'Hello Hello', test06('Hello'));
+  perform assert('test06_01', 'Hello World', test06_01());
+  perform assert('test06_02', 'Hello World', test06_02('World'));
+  perform assert('test06_03', 'Hello', (test06_03()).a);
   perform assert('test07',  5, test07(3));
   perform assert('test08',  3, test08(3));
   perform assert('test09', 15, test09(3));
@@ -543,6 +664,13 @@ begin
   perform assert('test25',  2, test25(2));
   perform assert('test25', -1, coalesce(test25(10),-1));
 
+  perform assert('test27', 40, test27(5));
+  perform assert('test28',  6, test28(4));
+  perform assert('test30', 10, (select s from test30()));
+  perform assert('test30', 128,(select sqlcode from test30()));
+  perform assert('test30', '02000', (select sqlstate from test30()));
+  perform assert('test31', 12, test31());
+  perform assert('test32', 12, test32());
 
 
   raise notice '******* All tests are ok *******';

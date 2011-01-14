@@ -38,7 +38,8 @@ typedef struct
 			Oid	*data;
 		}			oids;
 		bool	has_sqlstate;			/* true, when sqlstate variable is declared */
-
+		bool	has_sqlcode;			/* true, when sqlcode variable is declared */
+		int	ndata;				/* number of data address global		*/
 	}			stack;
 	struct						/* used as data for parsing a SQL expression */
 	{
@@ -221,10 +222,31 @@ create_variable_for(Plpsm_stmt *decl_stmt, CompileState cstate,
 			var->cursor.offset = offset;
 	}
 
-	if (!cstate->stack.has_sqlstate)
+	if (strcmp(name, "sqlstate") == 0)
 	{
-		if (strcmp(name, "sqlstate") == 0)
-			cstate->stack.has_sqlstate = true;
+		if (cstate->stack.has_sqlstate)
+			elog(ERROR, "SQLSTATE variable is already defined");
+		cstate->stack.has_sqlstate = true;
+		switch (decl_stmt->datum.typoid)
+		{
+			case TEXTOID:
+			case BPCHAROID:
+			case VARCHAROID:
+				if (decl_stmt->datum.typmod < 9 && decl_stmt->datum.typmod != -1)
+					elog(ERROR, "too short datatype for SQLSTATE");
+				break;
+			default:
+				elog(ERROR, "SQLSTATE variable should be text, char or varchar");
+		}
+	}
+
+	if (strcmp(name, "sqlcode") == 0)
+	{
+		if (cstate->stack.has_sqlcode)
+			elog(ERROR, "SQLOCODE variable is already defined");
+		cstate->stack.has_sqlcode = true;
+		if (decl_stmt->datum.typoid != INT4OID)
+			elog(ERROR, "SQLCODE variable should be integer");
 	}
 
 	return var;
@@ -861,7 +883,7 @@ static void
 compile_leave_iterate(CompileState cstate, 
 						Plpsm_object *scope, Plpsm_stmt *stmt)
 {
-	Assert(stmt->typ == PLPSM_STMT_LEAVE || stmt->typ == PLPSM_STMT_ITERATE);
+	Assert(stmt->typ == PLPSM_STMT_LEAVE || stmt->typ == PLPSM_STMT_ITERATE || stmt->typ == PLPSM_STMT_RETURN);
 
 	if (scope == NULL)
 		return;
@@ -874,7 +896,7 @@ compile_leave_iterate(CompileState cstate,
 		case PLPSM_STMT_REPEAT_UNTIL:
 		case PLPSM_STMT_FOR:
 			{
-				if (scope->name && strcmp(scope->name, stmt->name) == 0)
+				if (scope->name && stmt->name && strcmp(scope->name, stmt->name) == 0)
 				{
 					if (stmt->typ == PLPSM_STMT_ITERATE)
 					{
@@ -891,9 +913,12 @@ compile_leave_iterate(CompileState cstate,
 							scope->calls.release_calls = lappend(scope->calls.release_calls, 
 														makeInteger(addr));
 						}
-						addr = store_jmp_unknown(cstate->module);
-						scope->calls.leave_jmps = lappend(scope->calls.leave_jmps,
+						if (stmt->typ != PLPSM_STMT_RETURN)
+						{
+							addr = store_jmp_unknown(cstate->module);
+							scope->calls.leave_jmps = lappend(scope->calls.leave_jmps,
 													    makeInteger(addr));
+						}
 					}
 				}
 				else
@@ -921,8 +946,8 @@ compile_leave_iterate(CompileState cstate,
 static Plpsm_pcode_module *
 init_module(void)
 {
-	Plpsm_pcode_module *m = palloc(10000 * sizeof(Plpsm_pcode) + offsetof(Plpsm_pcode_module, code));
-	m->mlength = 10000;
+	Plpsm_pcode_module *m = palloc(1024 * sizeof(Plpsm_pcode) + offsetof(Plpsm_pcode_module, code));
+	m->mlength = 1024;
 	m->length = 0;
 	return m;
 }
@@ -936,6 +961,7 @@ list(Plpsm_pcode_module *m)
 	initStringInfo(&ds);
 
 	appendStringInfo(&ds, "\n   Datums: %d variable(s) \n", m->ndatums);
+	appendStringInfo(&ds, "   Local data size: %d pointers\n", m->ndata);
 	appendStringInfo(&ds, "   Size: %d instruction(s)\n\n", m->length);
 
 	for (pc = 0; pc < m->length; pc++)
@@ -975,7 +1001,8 @@ list(Plpsm_pcode_module *m)
 						appendStringInfo(&ds2,"%d", m->code[pc].expr.typoids[i]);
 					}
 					
-					appendStringInfo(&ds, "ExecExpr \"%s\",{%s}", m->code[pc].expr.expr,ds2.data);
+					appendStringInfo(&ds, "ExecExpr \"%s\",{%s}, data[%d]", m->code[pc].expr.expr,ds2.data,
+													m->code[pc].expr.data);
 					pfree(ds2.data);
 				}
 				break;
@@ -991,7 +1018,8 @@ list(Plpsm_pcode_module *m)
 						appendStringInfo(&ds2,"%d", m->code[pc].expr.typoids[i]);
 					}
 					
-					appendStringInfo(&ds, "Data \"%s\",{%s}", m->code[pc].expr.expr,ds2.data);
+					appendStringInfo(&ds, "Data \"%s\",{%s}, data[%d]", m->code[pc].expr.expr,ds2.data,
+													m->code[pc].expr.data);
 					pfree(ds2.data);
 				}
 				break;
@@ -1021,6 +1049,14 @@ list(Plpsm_pcode_module *m)
 				appendStringInfo(&ds, "SaveTo @%d, size:%d, byval:%s", m->code[pc].target.offset, m->code[pc].target.typlen,
 										m->code[pc].target.typbyval ? "BYVAL" : "BYREF");
 				break;
+			case PCODE_SAVETO_FIELD:
+				appendStringInfo(&ds, "SaveToField #%d @%d, data[%d] size:%d, byval:%s oid:%d typmod %d", m->code[pc].saveto_field.fnumber, m->code[pc].saveto_field.offset,
+										m->code[pc].saveto_field.data,
+										m->code[pc].saveto_field.typlen,
+										m->code[pc].saveto_field.typbyval ? "BYVAL" : "BYREF",
+										m->code[pc].saveto_field.typoid, 
+										m->code[pc].saveto_field.typmod);
+				break;
 			case PCODE_COPY_PARAM:
 				appendStringInfo(&ds, "CopyParam @%d, @%d, size:%d, byval:%s", 
 										m->code[pc].copyto.src,
@@ -1029,19 +1065,24 @@ list(Plpsm_pcode_module *m)
 										m->code[pc].copyto.typbyval ? "BYVAL" : "BYREF");
 				break;
 			case PCODE_CURSOR_OPEN:
-				appendStringInfo(&ds, "OpenCursor @%d, data:%d name:%s", m->code[pc].cursor.offset,
+				appendStringInfo(&ds, "OpenCursor @%d, ^%d name:%s", m->code[pc].cursor.offset,
 											m->code[pc].cursor.addr,
 											m->code[pc].cursor.name);
 				break;
 			case PCODE_CURSOR_CLOSE:
-				appendStringInfo(&ds, "CloseCursor @%d, data:%d name:%s", m->code[pc].cursor.offset, 
+				appendStringInfo(&ds, "CloseCursor @%d, ^%d name:%s", m->code[pc].cursor.offset, 
 											m->code[pc].cursor.addr,
 											m->code[pc].cursor.name);
 				break;
 			case PCODE_CURSOR_RELEASE:
-				appendStringInfo(&ds, "ReleaseCursor @%d, data:%d name:%s", m->code[pc].cursor.offset, 
+				appendStringInfo(&ds, "ReleaseCursor @%d, ^%d name:%s", m->code[pc].cursor.offset, 
 											m->code[pc].cursor.addr,
 											m->code[pc].cursor.name);
+				break;
+			case PCODE_CURSOR_FETCH:
+				appendStringInfo(&ds, "Fetch @%d, count:%d name: %s", m->code[pc].fetch.offset, 
+												m->code[pc].fetch.count,
+												m->code[pc].fetch.name);
 				break;
 			case PCODE_RETURN_NULL:
 				appendStringInfo(&ds, "Return NULL");
@@ -1055,12 +1096,34 @@ list(Plpsm_pcode_module *m)
 			case PCODE_SIGNAL_NODATA:
 				appendStringInfo(&ds, "Signal NODATA, \"%s\"", m->code[pc].str);
 				break;
+			case PCODE_SQLCODE_REFRESH:
+				appendStringInfo(&ds, "RefreshSQLCODE @%d", m->code[pc].target.offset);
+				break;
+			case PCODE_SQLSTATE_REFRESH:
+				appendStringInfo(&ds, "RefreshSQLSTATE @%d", m->code[pc].target.offset);
+				break;
 		}
 		appendStringInfoChar(&ds, '\n');
 	}
 	elog(NOTICE, "\n%s", ds.data);
 	pfree(ds.data);
 }
+
+static Plpsm_pcode_module *
+check_module_size(Plpsm_pcode_module *m)
+{
+	if (m->length == m->mlength)
+	{
+		Plpsm_pcode_module *new;
+		int length = m->mlength + 1024;
+		
+		new = repalloc(m, length * sizeof(Plpsm_pcode) + offsetof(Plpsm_pcode_module, code));
+		new->length = length;
+		return new;
+	}
+	return m;
+}
+
 
 #define CHECK_MODULE_SIZE(m)		if (m->length == m->mlength) elog(ERROR, "module is too long")
 #define SET_AND_INC_PC(m, t)	m->code[m->length++].typ = t
@@ -1076,6 +1139,13 @@ list(Plpsm_pcode_module *m)
 #define SET_DATUM_PROP(m, tl, bv)	m->code[m->length].target.typlen = tl; m->code[m->length].target.typbyval = bv
 #define SET_CURSOR(m, a, o)		m->code[m->length].cursor.addr = a; m->code[m->length].cursor.offset = o
 #define SET_CURSOR_NAME(m, n)		m->code[m->length].cursor.name = n
+#define SET_EXPR_DATA(m, d)		m->code[m->length].expr.data = d
+
+#define SET_OPVAL(n, v)			m->code[m->length].n = v
+#define EMIT_OPCODE(t)			do { \
+						m->code[m->length++].typ = t; \
+						m = check_module_size(m); \
+					} while (0)
 
 static void
 store_debug_info(Plpsm_pcode_module *m, char *str)
@@ -1168,6 +1238,8 @@ store_exec_expr(CompileState cstate, Plpsm_pcode_module *m, char *expr, Oid targ
 		SET_EXPR(m, cexpr, 0, NULL);
 	}
 
+	SET_EXPR_DATA(m, cstate->stack.ndata++);
+
 	SET_AND_INC_PC(m, PCODE_EXEC_EXPR);
 }
 
@@ -1197,7 +1269,6 @@ store_copy_parameter(Plpsm_pcode_module *m, Plpsm_object *var, int paramid)
 	m->code[m->length].copyto.typbyval = var->stmt->datum.typbyval;
 	SET_AND_INC_PC(m, PCODE_COPY_PARAM);
 }
-
 
 static void
 store_return(Plpsm_pcode_module *m)
@@ -1313,10 +1384,16 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 			case PLPSM_STMT_COMPOUND_STATEMENT:
 				{
 					int16	ndatums = cstate->stack.ndatums;
+					
+					bool	has_sqlstate = cstate->stack.has_sqlstate;
+					bool	has_sqlcode = cstate->stack.has_sqlcode;
 
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					compile(cstate, stmt->inner_left, m);
 					cstate->stack.ndatums = ndatums;
+
+					cstate->stack.has_sqlstate = has_sqlstate;
+					cstate->stack.has_sqlcode = has_sqlcode;
 
 					/* generate release block */
 					if (obj->calls.has_release_call)
@@ -1392,6 +1469,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 							SET_EXPR(m, cquery, 0, NULL);
 						}
 						obj->cursor.data_addr = PC(m);
+						SET_EXPR_DATA(m, cstate->stack.ndata++);
 						SET_AND_INC_PC(m, PCODE_DATA_QUERY);
 					}
 				}
@@ -1407,6 +1485,58 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 					SET_CURSOR(m, obj->cursor.data_addr, obj->cursor.offset);
 					SET_CURSOR_NAME(m, obj->name);
 					SET_AND_INC_PC(m, PCODE_CURSOR_OPEN);
+				}
+				break;
+
+			case PLPSM_STMT_FETCH:
+				{
+					const char *fieldname;
+					ListCell *l;
+					int	i = 1;
+
+					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
+					if (obj->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
+						elog(ERROR, "variable \"%s\" isn't cursor", obj->name);
+					SET_OPVAL(fetch.offset, obj->cursor.offset);
+					SET_OPVAL(fetch.name, obj->name);
+					SET_OPVAL(fetch.nvars, list_length(stmt->compound_target));
+					SET_OPVAL(fetch.count, 1);
+					EMIT_OPCODE(PCODE_CURSOR_FETCH);
+
+					if (cstate->stack.has_sqlstate)
+					{
+						Plpsm_object *var = lookup_var(cstate->current_scope, "sqlstate");
+						Assert(var != NULL);
+						SET_OPVAL(target.offset, var->offset);
+						SET_OPVAL(target.typlen, var->stmt->datum.typlen);
+						SET_OPVAL(target.typbyval, var->stmt->datum.typbyval);
+						EMIT_OPCODE(PCODE_SQLSTATE_REFRESH);
+					}
+
+					if (cstate->stack.has_sqlcode)
+					{
+						Plpsm_object *var = lookup_var(cstate->current_scope, "sqlcode");
+						Assert(var != NULL);
+						SET_OPVAL(target.offset, var->offset);
+						SET_OPVAL(target.typlen, var->stmt->datum.typlen);
+						SET_OPVAL(target.typbyval, var->stmt->datum.typbyval);
+						EMIT_OPCODE(PCODE_SQLCODE_REFRESH);
+					}
+
+					foreach (l, stmt->compound_target)
+					{
+						Plpsm_object	*var = resolve_target(cstate, (List *) lfirst(l),
+													    &fieldname,
+														stmt->location);
+						SET_OPVAL(saveto_field.offset, var->offset);
+						SET_OPVAL(saveto_field.typlen, var->stmt->datum.typlen);
+						SET_OPVAL(saveto_field.typbyval, var->stmt->datum.typbyval);
+						SET_OPVAL(saveto_field.typoid, var->stmt->datum.typoid);
+						SET_OPVAL(saveto_field.typmod, var->stmt->datum.typmod);
+						SET_OPVAL(saveto_field.data, cstate->stack.ndata++);
+						SET_OPVAL(saveto_field.fnumber, i++);
+						EMIT_OPCODE(PCODE_SAVETO_FIELD);
+					}
 				}
 				break;
 
@@ -1507,6 +1637,9 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 
 			case PLPSM_STMT_RETURN:
 				{
+					/* leave all compound statements too */
+					compile_leave_iterate(cstate, cstate->current_scope, stmt);
+				
 					if (cstate->finfo.result.datum.typoid != VOIDOID)
 					{
 						if (cstate->finfo.return_expr != NULL && 
@@ -1588,10 +1721,13 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	cstate.top_scope = &outer_scope;
 	cstate.top_scope->name = outer_scope.name;
 	cstate.current_scope = cstate.top_scope;
+	cstate.stack.ndata = 0;
 	cstate.stack.ndatums = 0;
 	cstate.stack.mdatums = 0;
 	cstate.stack.oids.size = 128;
 	cstate.stack.oids.data = (Oid *) palloc(cstate.stack.oids.size * sizeof(Oid));
+	cstate.stack.has_sqlstate = false;
+	cstate.stack.has_sqlcode = false;
 
 	cstate.finfo.result.datum.typoid = procStruct->prorettype;
 	get_typlenbyval(cstate.finfo.result.datum.typoid, &cstate.finfo.result.datum.typlen, &cstate.finfo.result.datum.typbyval);
@@ -1693,8 +1829,12 @@ plpsm_compile(Oid funcOid, bool forValidator)
 		cstate.finfo.return_expr = NULL;
 
 	compile(&cstate, plpsm_parser_tree, module);
-	module->ndatums = cstate.stack.mdatums;
+
 	store_done(&cstate, module);
+
+	module->ndatums = cstate.stack.mdatums;
+	module->ndata = cstate.stack.ndata;
+
 	if (plpsm_debug_compiler)
 		list(module);
 

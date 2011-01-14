@@ -2,20 +2,26 @@
 #include "executor/spi.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/lsyscache.h"
 
 Datum
 plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
 {
 	Datum	*values;
 	char	*nulls;
+	void	**DataPtrs;
 	int		PC = 0;
+	int		SP = 0;
 	bool			clean_result = false;
 	Datum		result = (Datum) 0;
 	bool		isnull;
+	int				CallStack[1024];
+	int	sqlstate = 0;
 
-	values = palloc(module->ndatums * sizeof(Datum));
-	nulls = palloc(module->ndatums * sizeof(char));
-
+	values = palloc(module->ndatums * sizeof(Datum) + 100);
+	nulls = palloc(module->ndatums * sizeof(char) + 100);
+	DataPtrs = palloc0((module->ndata + 1) * sizeof(void*) );
+	
 	while (PC < module->length)
 	{
 		Plpsm_pcode *pcode;
@@ -39,8 +45,22 @@ next_op:
 				goto next_op;
 
 			case PCODE_JMP_NOT_FOUND:
-			case PCODE_CALL:
 				break;
+			case PCODE_CALL:
+				if (SP == 1024)
+					elog(ERROR, "runtime error, stack is full");
+				CallStack[SP++] = PC + 1;
+				PC = pcode->addr;
+				goto next_op;
+				
+			case PCODE_RET_SUBR:
+				if (SP < 1)
+					elog(ERROR, "broken stack");
+				PC = CallStack[--SP];
+				if (PC == 0)
+					elog(ERROR, "broken stack");
+				goto next_op;
+				
 			case PCODE_RETURN:
 				{
 					/*
@@ -66,14 +86,21 @@ next_op:
 			case PCODE_EXEC_EXPR:
 				{
 					int rc;
+					SPIPlanPtr plan = DataPtrs[pcode->expr.data];
 
 					if (clean_result)
 						SPI_freetuptable(SPI_tuptable);
 
-					rc = SPI_execute_with_args(pcode->expr.expr, 
-								    pcode->expr.nparams, pcode->expr.typoids,
-									    values, nulls,
-											    false, 2);
+					if (plan == NULL)
+					{
+						plan =  SPI_prepare(pcode->expr.expr, pcode->expr.nparams, pcode->expr.typoids);
+						DataPtrs[pcode->expr.data] = plan;
+						if (plan == NULL)
+							elog(ERROR, "query \"%s\" cannot be prepared", pcode->expr.expr);
+					}
+
+					rc = SPI_execute_plan(plan, values, nulls, false, 2);
+
 					if (rc != SPI_OK_SELECT)
 						elog(ERROR, "SPI_execute failed executing query \"%s\" : %s",
 									pcode->expr.expr, SPI_result_code_string(rc));
@@ -153,6 +180,29 @@ next_op:
 						nulls[pcode->copyto.dest] = 'n';
 					break;
 				}
+			case PCODE_SQLSTATE_REFRESH:
+				{
+					char *unpacked_sqlstate;
+
+					/* release a memory */
+					if (nulls[pcode->target.offset] != 'n')
+						pfree(DatumGetPointer(values[pcode->target.offset]));
+
+					if (sqlstate != 0)
+						unpacked_sqlstate = unpack_sql_state(sqlstate);
+					else
+						unpacked_sqlstate = "00000";
+
+					values[pcode->target.offset] = CStringGetTextDatum(unpacked_sqlstate);
+					nulls[pcode->target.offset] = ' ';
+				}
+				break;
+			case PCODE_SQLCODE_REFRESH:
+				{
+					values[pcode->target.offset] = Int32GetDatum(sqlstate);
+					nulls[pcode->target.offset] = ' ';
+				}
+				break;
 			case PCODE_CURSOR_OPEN:
 				{
 					Portal portal;
@@ -166,6 +216,68 @@ next_op:
 														true, 0);
 					values[pcode->cursor.offset] = PointerGetDatum(portal);
 					nulls[pcode->cursor.offset] = ' ';
+				}
+				break;
+
+			case PCODE_CURSOR_FETCH:
+				{
+					if (nulls[pcode->fetch.offset] != ' ')
+						elog(ERROR, "cursor \"%s\" isn't open", pcode->fetch.name);
+					SPI_cursor_fetch((Portal) DatumGetPointer(values[pcode->fetch.offset]), true, pcode->fetch.count);
+					if (SPI_tuptable->tupdesc->natts != pcode->fetch.nvars)
+						elog(ERROR, "too few or too much variables");
+					if (SPI_processed > 0)
+						clean_result = true;
+
+					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
+				}
+				break;
+
+			case PCODE_SAVETO_FIELD:
+				{
+					/* release a memory */
+					if (nulls[pcode->saveto_field.offset] != 'n' && !pcode->saveto_field.typbyval)
+					{
+						pfree(DatumGetPointer(values[pcode->saveto_field.offset]));
+					}
+
+					if (SPI_processed > 0)
+					{
+						/* ensure a correct casting */
+						HeapTuple tuple = SPI_tuptable->vals[0];
+						bool	isnull;
+						Datum	val;
+
+						val = SPI_getbinval(tuple, SPI_tuptable->tupdesc, pcode->saveto_field.fnumber, &isnull);
+						if (!isnull)
+						{
+							Form_pg_attribute attr = SPI_tuptable->tupdesc->attrs[pcode->saveto_field.fnumber - 1];
+
+							if (pcode->saveto_field.typoid != attr->atttypid || pcode->saveto_field.typmod != attr->atttypmod)
+							{
+								Oid			typoutput;
+								bool		typIsVarlena;
+								char *str;
+
+								Oid			typinput;
+								Oid			typioparam;
+								FmgrInfo	finfo_input;
+
+								getTypeOutputInfo(attr->atttypid, &typoutput, &typIsVarlena);
+								str =  OidOutputFunctionCall(typoutput, val);
+								getTypeInputInfo(pcode->saveto_field.typoid, &typinput, &typioparam);
+								fmgr_info(typinput, &finfo_input);
+								val = InputFunctionCall(&finfo_input, str, typioparam, pcode->saveto_field.typmod);
+								pfree(str);
+							}
+							values[pcode->saveto_field.offset] = datumCopy(val, pcode->saveto_field.typbyval, pcode->saveto_field.typlen);
+							nulls[pcode->saveto_field.offset] = ' ';
+						}
+						else
+							nulls[pcode->saveto_field.offset] = 'n';
+					}
+					else
+						nulls[pcode->saveto_field.offset] = 'n';
 				}
 				break;
 

@@ -173,6 +173,7 @@ static void elog_stmt(int level, Plpsm_stmt *stmt);
 %token <keyword>	SET
 %token <keyword>	SQLEXCEPTION
 %token <keyword>	SQLSTATE
+%token <keyword>	SQLCODE
 %token <keyword>	SQLWARNING
 %token <keyword>	THEN
 %token <keyword>	UNDO
@@ -956,6 +957,7 @@ stmt_open:
 stmt_fetch:		FETCH qual_identif INTO qual_identif_list
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_FETCH, @1);
+					new->target = $2;
 					new->compound_target = $4;
 					new->data = $2;
 					$$ = new;
@@ -1559,6 +1561,7 @@ is_unreserved_keyword(int tok)
 		case SQLEXCEPTION:
 		case SQLSTATE:
 		case SQLWARNING:
+		case SQLCODE:
 		case UNDO:
 			return true;
 		default:

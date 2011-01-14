@@ -143,13 +143,17 @@ typedef enum
 	PCODE_EXECUTE,
 	PCODE_SET_NULL,
 	PCODE_SAVETO,
+	PCODE_SAVETO_FIELD,
+	PCODE_CURSOR_FETCH,
 	PCODE_UPDATE_DATUM,
 	PCODE_COPY_PARAM,
 	PCODE_SIGNAL_NODATA,
 	PCODE_DATA_QUERY,
 	PCODE_CURSOR_OPEN,
 	PCODE_CURSOR_CLOSE,
-	PCODE_CURSOR_RELEASE
+	PCODE_CURSOR_RELEASE,
+	PCODE_SQLSTATE_REFRESH,
+	PCODE_SQLCODE_REFRESH
 } Plpsm_pcode_type;
 
 typedef struct
@@ -164,7 +168,7 @@ typedef struct
 			char *expr;
 			int	nparams;
 			Oid	*typoids;
-			void	*data;
+			int	data;
 		} expr;
 		struct
 		{
@@ -190,7 +194,8 @@ typedef struct
 			int	offset;
 			char *name;
 		} cursor;
-		struct {
+		struct 
+		{
 			int16 typlen;
 			Oid	typoid;
 			int offset;
@@ -198,6 +203,23 @@ typedef struct
 			int16   attyplen;
 			int16	fieldnum;
 		} update;
+		struct
+		{
+			int16	typlen;
+			bool	typbyval;
+			Oid	typoid;
+			int16	typmod;
+			int	offset;
+			int	fnumber;
+			int	data;
+		} saveto_field;
+		struct
+		{
+			int	offset;
+			int	count;
+			int	nvars;
+			char *name;
+		} fetch;
 		int	size;
 	};
 } Plpsm_pcode;
@@ -206,7 +228,8 @@ typedef struct
 {
 	int mlength;
 	int	length;
-	int		ndatums;
+	int		ndatums;		/* max number of used Datums */
+	int		ndata;			/* number of data address used for module's instance */
 	char *name;
 	Plpsm_pcode code[1];
 } Plpsm_pcode_module;
