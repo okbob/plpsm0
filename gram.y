@@ -116,7 +116,7 @@ static void elog_stmt(int level, Plpsm_stmt *stmt);
 %type <stmt>	stmt_open stmt_fetch stmt_close stmt_for for_prefetch
 %type <str>	cursor_def
 %type <stmt>	stmt_case case_when_list case_when opt_case_else
-%type <str>	opt_expr_until_when
+%type <str>	opt_expr_until_when expr_until_semi_or_coma_or_parent
 
 /*
  * Basic non-keyword token types.  These are hard-wired into the core lexer.
@@ -611,6 +611,13 @@ stmt_set:		SET assign_list
 				{
 					$$ = $2;
 				}
+			| SET '(' qual_identif_list ')' '=' '(' expr_list ')'
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SET, @1);
+					new->compound_target = $3;
+					new->expr_list = $7;
+					$$ = new;
+				}
 		;
 
 assign_list:
@@ -640,12 +647,6 @@ target:
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_UNKNOWN, @1);
 					new->target = $1;
-					$$ = new;
-				}
-			| '(' qual_identif_list ')'
-				{
-					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_UNKNOWN, @1);
-					new->compound_target = $2;
 					$$ = new;
 				}
 		;
@@ -1073,11 +1074,11 @@ expr_until_semi:
 		;
 
 expr_list:
-			expr_until_semi_or_coma
+			expr_until_semi_or_coma_or_parent
 				{
 					$$ = list_make1(makeString($1));
 				}
-			| expr_list ',' expr_until_semi_or_coma
+			| expr_list ',' expr_until_semi_or_coma_or_parent
 				{
 					$$ = lappend($1, makeString($3));
 				}
@@ -1157,6 +1158,23 @@ expr_until_semi_into_using:
 				}
 		;
 
+expr_until_semi_or_coma_or_parent:
+				{
+					StringInfoData		ds;
+					char *expr;
+					int	endtok;
+
+					expr = read_until(';',',', ')', "; or , or )", true, false, &endtok, -1);
+					initStringInfo(&ds);
+					appendStringInfo(&ds, "SELECT (%s)", expr);
+					check_sql_expr(ds.data);
+					pfree(ds.data);
+					if (endtok != ';' && endtok != ',')
+						plpsm_push_back_token(endtok);
+					$$ = expr;
+				}
+		;
+
 cursor_def:
 				{
 					$$ = read_until(';', 0, 0, ";", false, false, NULL, -1);
@@ -1204,6 +1222,7 @@ read_until(int until1,
 	{
 		/* read a current location before you read a next tag */
 		tok = yylex();
+
 		if (startlocation < 0)
 			startlocation = yylloc;
 
@@ -1216,7 +1235,9 @@ read_until(int until1,
 		if (tok == until1 || tok == until2 || tok == until3 || (until1 == ';' && tok == 0))
 		{
 			/* don't want to leave early - etc SET a = (10,20), b = .. */
-			if (tok == ';' || tok == 0 || parenlevel == 0)
+			if (tok == ';' || tok == 0 || parenlevel == 0 || 
+					(tok == ')' && parenlevel == 0) ||
+					(tok == ',' && parenlevel == 0))
 				break;
 		}
 		if (tok == '(' || tok == '[')
@@ -1677,6 +1698,7 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 	appendStringInfo(ds, "%s| Option: %d\n", ident, stmt->option);
 	appendStringInfo(ds, "%s| Query: %s\n", ident, stmt->query);
 	appendStringInfo(ds, "%s| Expr: %s\n", ident, stmt->expr);
+	appendStringInfo(ds, "%s| ExprList: %s\n", ident, nodeToString(stmt->expr_list));
 	appendStringInfo(ds, "%s| Debug: \"%s\"\n", ident, stmt->debug ? stmt->debug : "");
 	appendStringInfo(ds, "%s| Inner left:\n", ident);
 	stmt_out(ds, stmt->inner_left, nested_level + 1);

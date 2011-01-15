@@ -14,6 +14,7 @@
 #include "parser/parse_node.h"
 
 Plpsm_stmt *plpsm_parser_tree;
+bool	plpsm_debug_compiler = false;
 
 typedef struct
 {							/* it's used for storing data from SQL parser */
@@ -44,6 +45,7 @@ typedef struct
 	{
 		SQLHostVar   *vars;				/* list of found host variables */
 		int	nvars;				/* number of variables */
+		int	maxvars;			/* size of declared array */
 		bool	has_external_params;			/* true, when expr need a external parameters - detected host var. or param */
 		bool	is_expression;				/* show a message about missing variables instead missing columns */
 	} pdata;
@@ -67,22 +69,11 @@ typedef struct
 
 typedef CompileStateData *CompileState;
 
-static void compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m);
-
+static void compile(CompileState cstate, Plpsm_stmt *stmt);
 static Node *resolve_column_ref(CompileState cstate, ColumnRef *cref);
-
 void plpsm_parser_setup(struct ParseState *pstate, CompileState cstate);
-
 static Plpsm_object *lookup_var(Plpsm_object *scope, const char *name);
-
-static void store_debug_info(Plpsm_pcode_module *m, char *str);
-
-bool	plpsm_debug_compiler = false;
-
-static void store_jmp(Plpsm_pcode_module *m, int addr);
-static int store_jmp_unknown(Plpsm_pcode_module *m);
-static int store_call_unknown(Plpsm_pcode_module *m);
-
+static void compile_expr(CompileState cstate, char *expr, Oid targetoid, int16 typmod);
 
 /*
  * It registers a psm object to nested objects. 
@@ -347,7 +338,7 @@ plpsm_paramref_hook(ParseState *pstate, ParamRef *pref)
 }
 
 /*
- * generate a fake node
+ * generate a fake node for analyser
  */
 static Node *
 make_param(Plpsm_object *var, ColumnRef *cref)
@@ -364,7 +355,7 @@ make_param(Plpsm_object *var, ColumnRef *cref)
 }
 
 /*
- * generate fake node
+ * generate fake node for analyser
  */
 static Node *
 make_fieldSelect(Plpsm_object *var, ColumnRef *cref, const char *fieldname)
@@ -434,6 +425,9 @@ lookup_qualified_var(Plpsm_object *scope, const char *label, const char *name)
 	return lookup_qualified_var(scope->outer, label, name);
 }
 
+/*
+ * lookup variable
+ */
 static Plpsm_object *
 lookup_var(Plpsm_object *scope, const char *name)
 {
@@ -462,6 +456,12 @@ lookup_var(Plpsm_object *scope, const char *name)
 static void
 appendHostVar(CompileState cstate, int location, const char *name1, const char *name2, int offset)
 {
+	if (cstate->pdata.nvars == cstate->pdata.maxvars)
+	{
+		cstate->pdata.maxvars += 128;
+		cstate->pdata.vars = repalloc(cstate->pdata.vars, cstate->pdata.maxvars * sizeof(SQLHostVar));
+	}
+
 	SQLHostVar *var = &cstate->pdata.vars[cstate->pdata.nvars++];
 	var->location = location;
 	var->name1 = name1;
@@ -559,247 +559,6 @@ resolve_column_ref(CompileState cstate, ColumnRef *cref)
 	return NULL;
 }
 
-void
-plpsm_parser_setup(struct ParseState *pstate, CompileState cstate)
-{
-	pstate->p_post_columnref_hook = plpsm_post_column_ref;
-	pstate->p_paramref_hook = plpsm_paramref_hook;
-	pstate->p_ref_hook_state = (void *) cstate;
-}
-
-/*
- * Compile a expression - replace a variables by placeholders,
- *
- * This is really hack. Better way is using a possible query deparsing,
- * but necessary methods are not accesable now.
- */
-static char *
-compile_expr_simple_target(CompileState cstate, char *expr, Oid typoid, int16 typmod, bool *no_params)
-{
-
-	List       *raw_parsetree_list;
-	StringInfoData ds;
-	StringInfoData		cds;
-	int i = 0;
-	int				loc = 0;
-	int		j;
-	SQLHostVar	*vars;
-	int	nvars;
-	bool	not_sorted;
-	char *ptr;
-	ListCell *li;
-
-	initStringInfo(&ds);
-	appendStringInfo(&ds, "SELECT (%s)::%s", expr, format_type_with_typemod(typoid, typmod));
-
-	cstate->pdata.vars = (SQLHostVar *) palloc(cstate->stack.ndatums * sizeof(SQLHostVar));
-	cstate->pdata.nvars = 0;
-	cstate->pdata.has_external_params = false;
-	cstate->pdata.is_expression = true;
-
-	raw_parsetree_list = pg_parse_query(ds.data);
-
-	foreach(li, raw_parsetree_list)
-	{
-		 Node       *parsetree = (Node *) lfirst(li);
-
-		pg_analyze_and_rewrite_params((Node *) parsetree, ds.data, (ParserSetupHook) plpsm_parser_setup, (void *) cstate);
-	}
-
-	/* fast path, there are no params */
-	if (cstate->pdata.nvars == 0)
-	{
-		*no_params = !cstate->pdata.has_external_params;
-		return ds.data;
-	}
-
-	*no_params = false;
-
-	/* now, pdata.params and pdata.cref_list contains a info about placeholders */
-	vars = cstate->pdata.vars;
-	nvars = cstate->pdata.nvars;
-
-	/* simple bublesort */
-	not_sorted = true;
-	while (not_sorted)
-	{
-		not_sorted = false;
-		for (i = 0; i < nvars - 1; i++)
-		{
-			SQLHostVar	var;
-
-			if (vars[i].location > vars[i+1].location)
-			{
-				not_sorted = true;
-				var = vars[i];
-				vars[i] = vars[i+1]; vars[i+1] = var;
-			}
-		}
-	}
-
-	initStringInfo(&cds);
-	ptr = ds.data; j = 0;
-
-	while (*ptr)
-	{
-		char *str;
-
-		/* copy content to position of replaced object reference */
-		while (loc < vars[j].location)
-		{
-			appendStringInfoChar(&cds, *ptr++);
-			loc++;
-		}
-
-		/* replace ref. object by placeholder */
-		appendStringInfo(&cds,"$%d", (int) vars[j].offset);
-
-		/* find and skip a referenced object */
-		str = strstr(ptr, vars[j].name1);
-		Assert(str != NULL);
-		str += strlen(vars[j].name1);
-		loc += str - ptr; ptr = str;
-
-		/* when object was referenced with qualified name, then skip second identif */
-		if (vars[j].name2 != NULL)
-		{
-			str = strstr(ptr, vars[j].name2);
-			Assert(str != NULL);
-			str += strlen(vars[j].name2);
-			loc += str - ptr; ptr = str;
-		}
-
-		if (++j >= nvars)
-		{
-			/* copy to end and leave */
-			while (*ptr)
-				appendStringInfoChar(&cds, *ptr++);
-			break;
-		}
-	}
-
-	pfree(ds.data);
-	pfree(vars);
-
-	cstate->pdata.vars = NULL;
-
-	return cds.data;
-}
-
-/*
- * compile a declared cursor
- */
-static char *
-compile_query(CompileState cstate, char *query, bool *no_params, TupleDesc *tupdesc)
-{
-	List       *raw_parsetree_list;
-	StringInfoData		cds;
-	int i = 0;
-	int				loc = 0;
-	int		j;
-	SQLHostVar	*vars;
-	int	nvars;
-	bool	not_sorted;
-	char *ptr;
-	ListCell *li;
-
-	cstate->pdata.vars = (SQLHostVar *) palloc(cstate->stack.ndatums * sizeof(SQLHostVar));
-	cstate->pdata.nvars = 0;
-	cstate->pdata.has_external_params = false;
-	cstate->pdata.is_expression = true;
-
-	raw_parsetree_list = pg_parse_query(query);
-
-	foreach(li, raw_parsetree_list)
-	{
-		 Node       *parsetree = (Node *) lfirst(li);
-
-		pg_analyze_and_rewrite_params((Node *) parsetree, query, (ParserSetupHook) plpsm_parser_setup, (void *) cstate);
-	}
-	
-
-	/* fast path, there are no params */
-	if (cstate->pdata.nvars == 0)
-	{
-		*no_params = !cstate->pdata.has_external_params;
-		return query;
-	}
-
-	*no_params = false;
-
-	/* now, pdata.params and pdata.cref_list contains a info about placeholders */
-	vars = cstate->pdata.vars;
-	nvars = cstate->pdata.nvars;
-
-	/* simple bublesort */
-	not_sorted = true;
-	while (not_sorted)
-	{
-		not_sorted = false;
-		for (i = 0; i < nvars - 1; i++)
-		{
-			SQLHostVar	var;
-
-			if (vars[i].location > vars[i+1].location)
-			{
-				not_sorted = true;
-				var = vars[i];
-				vars[i] = vars[i+1]; vars[i+1] = var;
-			}
-		}
-	}
-
-	initStringInfo(&cds);
-	ptr = query; j = 0;
-
-	while (*ptr)
-	{
-		char *str;
-
-		/* copy content to position of replaced object reference */
-		while (loc < vars[j].location)
-		{
-			appendStringInfoChar(&cds, *ptr++);
-			loc++;
-		}
-
-		/* replace ref. object by placeholder */
-		appendStringInfo(&cds,"$%d", (int) vars[j].offset);
-
-		/* find and skip a referenced object */
-		str = strstr(ptr, vars[j].name1);
-		Assert(str != NULL);
-		str += strlen(vars[j].name1);
-		loc += str - ptr; ptr = str;
-
-		/* when object was referenced with qualified name, then skip second identif */
-		if (vars[j].name2 != NULL)
-		{
-			str = strstr(ptr, vars[j].name2);
-			Assert(str != NULL);
-			str += strlen(vars[j].name2);
-			loc += str - ptr; ptr = str;
-		}
-
-		if (++j >= nvars)
-		{
-			/* copy to end and leave */
-			while (*ptr)
-				appendStringInfoChar(&cds, *ptr++);
-			break;
-		}
-	}
-
-	pfree(vars);
-
-	cstate->pdata.vars = NULL;
-
-	return cds.data;
-
-
-}
-
-
 /*
  * returns a target objects for assign statement. When target is composite type with 
  * specified field, then fieldname is filled.
@@ -878,78 +637,18 @@ resolve_target(CompileState cstate, List *target, const char **fieldname, int lo
 }
 
 /*
- * helps with LEAVE, ITERATE statement compilation
- *
- */
-static void
-compile_leave_iterate(CompileState cstate, 
-						Plpsm_object *scope, Plpsm_stmt *stmt)
-{
-	Assert(stmt->typ == PLPSM_STMT_LEAVE || stmt->typ == PLPSM_STMT_ITERATE);
-
-	if (scope == NULL)
-		return;
-
-	switch (scope->typ)
-	{
-		case PLPSM_STMT_COMPOUND_STATEMENT:
-		case PLPSM_STMT_LOOP:
-		case PLPSM_STMT_WHILE:
-		case PLPSM_STMT_REPEAT_UNTIL:
-		case PLPSM_STMT_FOR:
-			{
-				if (scope->name && strcmp(scope->name, stmt->name) == 0)
-				{
-					if (stmt->typ == PLPSM_STMT_ITERATE)
-					{
-						if (scope->typ == PLPSM_STMT_COMPOUND_STATEMENT)
-							elog(ERROR, "label of iterate statement is related to compound statement");
-						store_jmp(cstate->module, scope->calls.entry_addr);
-					}
-					else
-					{
-						int	addr;
-						if (scope->calls.has_release_call)
-						{
-							addr = store_call_unknown(cstate->module);
-							scope->calls.release_calls = lappend(scope->calls.release_calls, 
-														makeInteger(addr));
-						}
-						addr = store_jmp_unknown(cstate->module);
-						scope->calls.leave_jmps = lappend(scope->calls.leave_jmps,
-													    makeInteger(addr));
-					}
-				}
-				else
-				{
-					if (scope->calls.has_release_call)
-					{
-						int addr = store_call_unknown(cstate->module);
-						scope->calls.release_calls = lappend(scope->calls.release_calls,
-													    makeInteger(addr));
-					}
-				}
-				compile_leave_iterate(cstate, scope->outer, stmt);
-			}
-			break;
-		default:
-			/* do nothing */;
-	}
-}
-
-
-
-/*
  * Create a extensible module
  */
 static Plpsm_pcode_module *
 init_module(void)
 {
-	Plpsm_pcode_module *m = palloc(1024 * sizeof(Plpsm_pcode) + offsetof(Plpsm_pcode_module, code));
+	Plpsm_pcode_module *m = palloc0(1024 * sizeof(Plpsm_pcode) + offsetof(Plpsm_pcode_module, code));
 	m->mlength = 1024;
 	m->length = 0;
 	return m;
 }
+
+#define VALUE(x)	m->code[pc].x
 
 static void 
 list(Plpsm_pcode_module *m)
@@ -967,41 +666,41 @@ list(Plpsm_pcode_module *m)
 	{
 		appendStringInfo(&ds, "%5d", pc);
 		appendStringInfoChar(&ds, '\t');
-		if (m->code[pc].typ != PCODE_DEBUG)
+		if (VALUE(typ) != PCODE_DEBUG)
 			appendStringInfoChar(&ds, '\t');
 
-		switch (m->code[pc].typ)
+		switch (VALUE(typ))
 		{
 			case PCODE_JMP_FALSE_UNKNOWN:
-				appendStringInfo(&ds, "Jmp_false_unknown %d", m->code[pc].addr);
+				appendStringInfo(&ds, "Jmp_false_unknown %d", VALUE(addr));
 				break;
 			case PCODE_JMP:
-				appendStringInfo(&ds, "Jmp %d", m->code[pc].addr);
+				appendStringInfo(&ds, "Jmp %d", VALUE(addr));
 				break;
 			case PCODE_JMP_NOT_FOUND:
-				appendStringInfo(&ds, "Jmp_not_found %d", m->code[pc].addr);
+				appendStringInfo(&ds, "Jmp_not_found %d", VALUE(addr));
 				break;
 			case PCODE_CALL:
-				appendStringInfo(&ds, "call %d", m->code[pc].addr);
+				appendStringInfo(&ds, "call %d", VALUE(addr));
 				break;
 			case PCODE_RETURN:
-				appendStringInfo(&ds, "Return size:%d, byval:%s", m->code[pc].target.typlen,
-										m->code[pc].target.typbyval ? "BYVAL" : "BYREF");
+				appendStringInfo(&ds, "Return size:%d, byval:%s", VALUE(target.typlen),
+											VALUE(target.typbyval) ? "BYVAL" : "BYREF");
 				break;
 			case PCODE_EXEC_EXPR:
 				{
 					StringInfoData ds2;
 					int	i;
 					initStringInfo(&ds2);
-					for (i = 0; i < m->code[pc].expr.nparams; i++)
+					for (i = 0; i < VALUE(expr.nparams); i++)
 					{
 						if (i > 0)
 							appendStringInfoChar(&ds2, ',');
-						appendStringInfo(&ds2,"%d", m->code[pc].expr.typoids[i]);
+						appendStringInfo(&ds2,"%d", VALUE(expr.typoids[i]));
 					}
 					
-					appendStringInfo(&ds, "ExecExpr \"%s\",{%s}, data[%d]", m->code[pc].expr.expr,ds2.data,
-													m->code[pc].expr.data);
+					appendStringInfo(&ds, "ExecExpr \"%s\",{%s}, data[%d]", VALUE(expr.expr),ds2.data,
+											VALUE(expr.data));
 					pfree(ds2.data);
 				}
 				break;
@@ -1010,24 +709,23 @@ list(Plpsm_pcode_module *m)
 					StringInfoData ds2;
 					int	i;
 					initStringInfo(&ds2);
-					for (i = 0; i < m->code[pc].expr.nparams; i++)
+					for (i = 0; i < VALUE(expr.nparams); i++)
 					{
 						if (i > 0)
 							appendStringInfoChar(&ds2, ',');
-						appendStringInfo(&ds2,"%d", m->code[pc].expr.typoids[i]);
+						appendStringInfo(&ds2,"%d", VALUE(expr.typoids[i]));
 					}
 					
-					appendStringInfo(&ds, "Data \"%s\",{%s}, data[%d]", m->code[pc].expr.expr,ds2.data,
-													m->code[pc].expr.data);
+					appendStringInfo(&ds, "Data \"%s\",{%s}, data[%d]", VALUE(expr.expr),ds2.data,
+											VALUE(expr.data));
 					pfree(ds2.data);
 				}
 				break;
-
 			case PCODE_PRINT:
 				appendStringInfo(&ds, "Print");
 				break;
 			case PCODE_DEBUG:
-				appendStringInfo(&ds, "/* %s */", m->code[pc].str);
+				appendStringInfo(&ds, "/* %s */", VALUE(str));
 				break;
 			case PCODE_NOOP:
 				appendStringInfo(&ds, "Noop");
@@ -1036,52 +734,52 @@ list(Plpsm_pcode_module *m)
 				appendStringInfoString(&ds, "Done.");
 				break;
 			case PCODE_EXECUTE:
-				appendStringInfo(&ds, "execute %s()", m->code[pc].str);
+				appendStringInfo(&ds, "execute %s()", VALUE(str));
 				break;
 			case PCODE_IF_NOTEXIST_PREPARE:
-				appendStringInfo(&ds, "prepere_ifnexist %s as %s", m->code[pc].prep.name, m->code[pc].prep.expr);
+				appendStringInfo(&ds, "prepere_ifnexist %s as %s", VALUE(prep.name), VALUE(prep.expr));
 				break;
 			case PCODE_SET_NULL:
-				appendStringInfo(&ds, "SetNull @%d", m->code[pc].target.offset);
+				appendStringInfo(&ds, "SetNull @%d", VALUE(target.offset));
 				break;
 			case PCODE_SAVETO:
-				appendStringInfo(&ds, "SaveTo @%d, size:%d, byval:%s", m->code[pc].target.offset, m->code[pc].target.typlen,
-										m->code[pc].target.typbyval ? "BYVAL" : "BYREF");
+				appendStringInfo(&ds, "SaveTo @%d, size:%d, byval:%s", VALUE(target.offset), VALUE(target.typlen),
+											VALUE(target.typbyval) ? "BYVAL" : "BYREF");
 				break;
 			case PCODE_SAVETO_FIELD:
-				appendStringInfo(&ds, "SaveToField #%d @%d, data[%d] size:%d, byval:%s oid:%d typmod %d", m->code[pc].saveto_field.fnumber, m->code[pc].saveto_field.offset,
-										m->code[pc].saveto_field.data,
-										m->code[pc].saveto_field.typlen,
-										m->code[pc].saveto_field.typbyval ? "BYVAL" : "BYREF",
-										m->code[pc].saveto_field.typoid, 
-										m->code[pc].saveto_field.typmod);
+				appendStringInfo(&ds, "SaveToField #%d @%d, data[%d] size:%d, byval:%s oid:%d typmod %d", VALUE(saveto_field.fnumber), VALUE(saveto_field.offset),
+											VALUE(saveto_field.data),
+											VALUE(saveto_field.typlen),
+											VALUE(saveto_field.typbyval) ? "BYVAL" : "BYREF",
+											VALUE(saveto_field.typoid), 
+											VALUE(saveto_field.typmod));
 				break;
 			case PCODE_COPY_PARAM:
-				appendStringInfo(&ds, "CopyParam @%d, @%d, size:%d, byval:%s", 
-										m->code[pc].copyto.src,
-										m->code[pc].copyto.dest,
-										m->code[pc].copyto.typlen,
-										m->code[pc].copyto.typbyval ? "BYVAL" : "BYREF");
+				appendStringInfo(&ds, "CopyParam %d, @%d, size:%d, byval:%s", 
+											VALUE(copyto.src),
+											VALUE(copyto.dest),
+											VALUE(copyto.typlen),
+											VALUE(copyto.typbyval) ? "BYVAL" : "BYREF");
 				break;
 			case PCODE_CURSOR_OPEN:
-				appendStringInfo(&ds, "OpenCursor @%d, ^%d name:%s", m->code[pc].cursor.offset,
-											m->code[pc].cursor.addr,
-											m->code[pc].cursor.name);
+				appendStringInfo(&ds, "OpenCursor @%d, ^%d name:%s", VALUE(cursor.offset),
+											VALUE(cursor.addr),
+											VALUE(cursor.name));
 				break;
 			case PCODE_CURSOR_CLOSE:
-				appendStringInfo(&ds, "CloseCursor @%d, ^%d name:%s", m->code[pc].cursor.offset, 
-											m->code[pc].cursor.addr,
-											m->code[pc].cursor.name);
+				appendStringInfo(&ds, "CloseCursor @%d, ^%d name:%s", VALUE(cursor.offset), 
+											VALUE(cursor.addr),
+											VALUE(cursor.name));
 				break;
 			case PCODE_CURSOR_RELEASE:
-				appendStringInfo(&ds, "ReleaseCursor @%d, ^%d name:%s", m->code[pc].cursor.offset, 
-											m->code[pc].cursor.addr,
-											m->code[pc].cursor.name);
+				appendStringInfo(&ds, "ReleaseCursor @%d, ^%d name:%s", VALUE(cursor.offset), 
+											VALUE(cursor.addr),
+											VALUE(cursor.name));
 				break;
 			case PCODE_CURSOR_FETCH:
-				appendStringInfo(&ds, "Fetch @%d, count:%d name: %s", m->code[pc].fetch.offset, 
-												m->code[pc].fetch.count,
-												m->code[pc].fetch.name);
+				appendStringInfo(&ds, "Fetch @%d, count:%d name: %s", VALUE(fetch.offset), 
+												VALUE(fetch.count),
+												VALUE(fetch.name));
 				break;
 			case PCODE_RETURN_NULL:
 				appendStringInfo(&ds, "Return NULL");
@@ -1093,17 +791,17 @@ list(Plpsm_pcode_module *m)
 				appendStringInfo(&ds, "Return 0");
 				break;
 			case PCODE_SIGNAL_NODATA:
-				appendStringInfo(&ds, "Signal NODATA, \"%s\"", m->code[pc].str);
+				appendStringInfo(&ds, "Signal NODATA, \"%s\"", VALUE(str));
 				break;
 			case PCODE_SQLCODE_REFRESH:
-				appendStringInfo(&ds, "RefreshSQLCODE @%d", m->code[pc].target.offset);
+				appendStringInfo(&ds, "RefreshSQLCODE @%d", VALUE(target.offset));
 				break;
 			case PCODE_SQLSTATE_REFRESH:
-				appendStringInfo(&ds, "RefreshSQLSTATE @%d", m->code[pc].target.offset);
+				appendStringInfo(&ds, "RefreshSQLSTATE @%d", VALUE(target.offset));
 				break;
 			case PCODE_STRBUILDER:
-				appendStringInfo(&ds, "StringBuilder data[%d] op:%d", m->code[pc].strbuilder.data,
-											m->code[pc].strbuilder.op);
+				appendStringInfo(&ds, "StringBuilder data[%d] op:%d", VALUE(strbuilder.data),
+											VALUE(strbuilder.op));
 				break;
 		}
 		appendStringInfoChar(&ds, '\n');
@@ -1127,179 +825,146 @@ check_module_size(Plpsm_pcode_module *m)
 	return m;
 }
 
-
-#define CHECK_MODULE_SIZE(m)		if (m->length == m->mlength) elog(ERROR, "module is too long")
-#define SET_AND_INC_PC(m, t)	m->code[m->length++].typ = t
-#define SET_ADDR(m, a)			m->code[m->length].addr = a
-#define SET_STR(m, s)			m->code[m->length].str = s
-#define SET_RETURN_ADDR_INC_PC(m,t)	m->code[m->length].typ = t; return m->length++
-#define SET_EXPR(m, e, n, o)		m->code[m->length].expr.expr = e; m->code[m->length].expr.nparams = n; m->code[m->length].expr.typoids = o
-#define SET_TARGET(a, ta)		m->code[a].addr = ta
 #define PC(m)				m->length
-#define SET_PREP(m, n, q)		m->code[m->length].prep.name = n; m->code[m->length].prep.expr = q
-#define SET_SIZE(m, a, s)		m->code[a].size = s
-#define SET_OFFSET(m, o)		m->code[m->length].target.offset = o
-#define SET_DATUM_PROP(m, tl, bv)	m->code[m->length].target.typlen = tl; m->code[m->length].target.typbyval = bv
-#define SET_CURSOR(m, a, o)		m->code[m->length].cursor.addr = a; m->code[m->length].cursor.offset = o
-#define SET_CURSOR_NAME(m, n)		m->code[m->length].cursor.name = n
-#define SET_EXPR_DATA(m, d)		m->code[m->length].expr.data = d
 
 #define SET_OPVAL(n, v)			m->code[m->length].n = v
 #define EMIT_OPCODE(t)			do { \
 						m->code[m->length++].typ = t; \
 						m = check_module_size(m); \
 					} while (0)
-
-static void
-store_debug_info(Plpsm_pcode_module *m, char *str)
-{
-	CHECK_MODULE_SIZE(m);
-	SET_STR(m, str);
-	SET_AND_INC_PC(m, PCODE_DEBUG);
-}
-
-static int
-store_jmp_not_true_unknown(Plpsm_pcode_module *m)
-{
-	CHECK_MODULE_SIZE(m);
-	SET_RETURN_ADDR_INC_PC(m, PCODE_JMP_FALSE_UNKNOWN);
-}
-
-static void
-store_jmp_not_true(Plpsm_pcode_module *m, int addr)
-{
-	CHECK_MODULE_SIZE(m);
-	SET_ADDR(m, addr);
-	SET_AND_INC_PC(m, PCODE_JMP_FALSE_UNKNOWN);
-}
+#define SET_OPVAL_ADDR(a,n,v)		m->code[a].n = v
+#define SET_OPVALS_DATUM_INFO(mi,var)	do { \
+						SET_OPVAL(mi.offset, var->offset); \
+						SET_OPVAL(mi.typlen, var->stmt->datum.typlen); \
+						SET_OPVAL(mi.typbyval, var->stmt->datum.typbyval); \
+						SET_OPVAL(mi.typoid, var->stmt->datum.typoid); \
+						SET_OPVAL(mi.typmod, var->stmt->datum.typmod); \
+					} while (0)
+#define SET_OPVALS_DATUM_COPY(mi,var)	do { \
+						SET_OPVAL(mi.offset, var->offset); \
+						SET_OPVAL(mi.typlen, var->stmt->datum.typlen); \
+						SET_OPVAL(mi.typbyval, var->stmt->datum.typbyval); \
+					} while (0)
+#define EMIT_JMP(a)			do { \
+						SET_OPVAL(addr, a); \
+						EMIT_OPCODE(PCODE_JMP); \
+					} while (0)
+#define EMIT_CALL(a)			do { \
+						SET_OPVAL(addr, a); \
+						EMIT_OPCODE(PCODE_CALL); \
+					} while (0)
 
 
 static void
-store_jmp(Plpsm_pcode_module *m, int addr)
+compile_release_cursors(CompileState cstate)
 {
-	CHECK_MODULE_SIZE(m);
-	SET_ADDR(m, addr);
-	SET_AND_INC_PC(m, PCODE_JMP);
-}
-
-static int
-store_jmp_unknown(Plpsm_pcode_module *m)
-{
-	CHECK_MODULE_SIZE(m);
-	SET_RETURN_ADDR_INC_PC(m, PCODE_JMP);
-}
-
-static int
-store_call_unknown(Plpsm_pcode_module *m)
-{
-	CHECK_MODULE_SIZE(m);
-	SET_RETURN_ADDR_INC_PC(m, PCODE_CALL);
-}
-
-static void
-store_release_cursors(CompileState cstate, Plpsm_pcode_module *m)
-{
+	Plpsm_pcode_module *m = cstate->module;
 	Plpsm_object *scope = cstate->current_scope;
 	Plpsm_object *iterator;
+
 	/* search all cursors from current compound statement */
-	
 	Assert(scope->typ == PLPSM_STMT_COMPOUND_STATEMENT);
+
 	iterator = scope->inner;
 	while (iterator != NULL)
 	{
 		if (iterator->typ == PLPSM_STMT_DECLARE_CURSOR)
 		{
-			CHECK_MODULE_SIZE(m);
-			SET_CURSOR_NAME(m, iterator->name);
-			SET_CURSOR(m, iterator->cursor.data_addr, iterator->cursor.offset);
-			/* close only opened cursor */
-			SET_AND_INC_PC(m, PCODE_CURSOR_RELEASE);
+			SET_OPVAL(cursor.name, iterator->name);
+			SET_OPVAL(cursor.addr, iterator->cursor.data_addr);
+			SET_OPVAL(cursor.offset, iterator->cursor.offset);
+			EMIT_OPCODE(PCODE_CURSOR_RELEASE);
 		}
 		iterator = iterator->next;
 	}
 }
 
+/*
+ * helps with LEAVE, ITERATE statement compilation
+ *
+ */
 static void
-store_exec_expr(CompileState cstate, Plpsm_pcode_module *m, char *expr, Oid targetoid, int16 typmod)
+compile_leave_iterate(CompileState cstate, 
+						Plpsm_object *scope, Plpsm_stmt *stmt)
 {
-	char *cexpr;
-	Oid	*typoids;
-	bool	no_params;
+	Plpsm_pcode_module *m = cstate->module;
 
-	CHECK_MODULE_SIZE(m);
+	Assert(stmt->typ == PLPSM_STMT_LEAVE || stmt->typ == PLPSM_STMT_ITERATE);
 
-	cexpr = compile_expr_simple_target(cstate, expr, targetoid, typmod, &no_params);
-	if (!no_params)
+	if (scope == NULL)
+		return;
+
+	switch (scope->typ)
 	{
-		/* copy a actual typeoid vector to private typoid vector */
-		typoids = palloc(cstate->stack.ndatums * sizeof(Oid));
-		memcpy(typoids, cstate->stack.oids.data, cstate->stack.ndatums * sizeof(Oid));
-		SET_EXPR(m, cexpr, cstate->stack.ndatums, cstate->stack.oids.data);
+		case PLPSM_STMT_COMPOUND_STATEMENT:
+		case PLPSM_STMT_LOOP:
+		case PLPSM_STMT_WHILE:
+		case PLPSM_STMT_REPEAT_UNTIL:
+		case PLPSM_STMT_FOR:
+			{
+				if (scope->name && strcmp(scope->name, stmt->name) == 0)
+				{
+					if (stmt->typ == PLPSM_STMT_ITERATE)
+					{
+						if (scope->typ == PLPSM_STMT_COMPOUND_STATEMENT)
+							elog(ERROR, "label of iterate statement is related to compound statement");
+						EMIT_JMP(scope->calls.entry_addr);
+					}
+					else
+					{
+						if (scope->calls.has_release_call)
+						{
+							scope->calls.release_calls = lappend(scope->calls.release_calls, 
+														makeInteger(PC(m)));
+							EMIT_OPCODE(PCODE_CALL);
+						}
+						
+						scope->calls.leave_jmps = lappend(scope->calls.leave_jmps,
+													    makeInteger(PC(m)));
+						EMIT_OPCODE(PCODE_JMP);
+					}
+				}
+				else
+				{
+					if (scope->calls.has_release_call)
+					{
+						scope->calls.release_calls = lappend(scope->calls.release_calls,
+													    makeInteger(PC(m)));
+						EMIT_OPCODE(PCODE_CALL);
+					}
+				}
+				compile_leave_iterate(cstate, scope->outer, stmt);
+			}
+			break;
+		default:
+			/* do nothing */;
 	}
-	else
-	{
-		SET_EXPR(m, cexpr, 0, NULL);
-	}
-
-	SET_EXPR_DATA(m, cstate->stack.ndata++);
-
-	SET_AND_INC_PC(m, PCODE_EXEC_EXPR);
 }
 
+/*
+ * finalize a compilation
+ */
 static void
-store_print(Plpsm_pcode_module *m)
+compile_done(CompileState cstate)
 {
-	CHECK_MODULE_SIZE(m);
-	SET_AND_INC_PC(m, PCODE_PRINT);
-}
+	 Plpsm_pcode_module *m = cstate->module;
 
-static void
-store_saveto(Plpsm_pcode_module *m, int16 offset, int16 typlen, bool typbyval)
-{
-	CHECK_MODULE_SIZE(m);
-	SET_OFFSET(m, offset);
-	SET_DATUM_PROP(m, typlen, typbyval);
-	SET_AND_INC_PC(m, PCODE_SAVETO);
-}
-
-static void
-store_copy_parameter(Plpsm_pcode_module *m, Plpsm_object *var, int paramid)
-{
-	CHECK_MODULE_SIZE(m);
-	m->code[m->length].copyto.src = paramid;
-	m->code[m->length].copyto.dest = var->offset;
-	m->code[m->length].copyto.typlen = var->stmt->datum.typlen; 
-	m->code[m->length].copyto.typbyval = var->stmt->datum.typbyval;
-	SET_AND_INC_PC(m, PCODE_COPY_PARAM);
-}
-
-static void
-store_return(Plpsm_pcode_module *m)
-{
-	CHECK_MODULE_SIZE(m);
-	SET_AND_INC_PC(m, PCODE_RETURN);
-}
-
-static void
-store_done(CompileState cstate, Plpsm_pcode_module *m)
-{
 	if (cstate->finfo.return_expr != NULL && cstate->finfo.result.datum.typoid != VOIDOID)
 	{
-		store_exec_expr(cstate, m, cstate->finfo.return_expr,
+		compile_expr(cstate,cstate->finfo.return_expr,
 						cstate->finfo.result.datum.typoid, -1);
-		SET_DATUM_PROP(m, cstate->finfo.result.datum.typlen, cstate->finfo.result.datum.typbyval);
-		SET_AND_INC_PC(m, PCODE_RETURN);
+		SET_OPVAL(target.typlen, cstate->finfo.result.datum.typlen);
+		SET_OPVAL(target.typbyval, cstate->finfo.result.datum.typbyval);
+		EMIT_OPCODE(PCODE_RETURN);
 	}
 	else if (cstate->finfo.result.datum.typoid != VOIDOID)
 	{
-		CHECK_MODULE_SIZE(m);
-		SET_STR(m,"function doesn't return data");
-		SET_AND_INC_PC(m, PCODE_SIGNAL_NODATA);
+		SET_OPVAL(str,"function doesn't return data");
+		EMIT_OPCODE(PCODE_SIGNAL_NODATA);
 	}
 	else
 	{
-		CHECK_MODULE_SIZE(m);
-		SET_AND_INC_PC(m, PCODE_RETURN_VOID);
+		EMIT_OPCODE(PCODE_RETURN_VOID);
 	}
 }
 
@@ -1315,8 +980,7 @@ release_psm_object(CompileState cstate, Plpsm_object *obj, int release_entry, in
 		Assert(release_entry != 0);
 		foreach(l, obj->calls.release_calls)
 		{
-			int	addr = intVal(lfirst(l));
-			SET_TARGET(addr, release_entry);
+			SET_OPVAL_ADDR(intVal(lfirst(l)), addr, release_entry);
 		}
 	}
 
@@ -1326,13 +990,217 @@ release_psm_object(CompileState cstate, Plpsm_object *obj, int release_entry, in
 
 		foreach(l, obj->calls.leave_jmps)
 		{
-
-			int	addr = intVal(lfirst(l));
-			SET_TARGET(addr, leave_entry);
+			SET_OPVAL_ADDR(intVal(lfirst(l)), addr, leave_entry);
 		}
 	}
 
 	return obj->outer;
+}
+
+void
+plpsm_parser_setup(struct ParseState *pstate, CompileState cstate)
+{
+	pstate->p_post_columnref_hook = plpsm_post_column_ref;
+	pstate->p_paramref_hook = plpsm_paramref_hook;
+	pstate->p_ref_hook_state = (void *) cstate;
+}
+
+static char *
+replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs)
+{
+	Oid	*newargtypes;
+	ListCell *l;
+
+	List       *raw_parsetree_list;
+
+	cstate->pdata.maxvars = 128;
+	cstate->pdata.vars = (SQLHostVar *) palloc(cstate->pdata.maxvars * sizeof(SQLHostVar));
+	cstate->pdata.nvars = 0;
+	cstate->pdata.has_external_params = false;
+	cstate->pdata.is_expression = true;
+
+	raw_parsetree_list = pg_parse_query(sqlstr);
+
+	foreach(l, raw_parsetree_list)
+	{
+		 Node       *parsetree = (Node *) lfirst(l);
+
+		pg_analyze_and_rewrite_params((Node *) parsetree, sqlstr, 
+								(ParserSetupHook) plpsm_parser_setup, 
+												(void *) cstate);
+	}
+
+	if (!cstate->pdata.has_external_params)
+	{
+		*argtypes = NULL;
+		*nargs = 0;
+		return sqlstr;
+	}
+	else
+	{
+		newargtypes = palloc(cstate->stack.ndatums * sizeof(Oid));
+		memcpy(newargtypes, cstate->stack.oids.data, cstate->stack.ndatums * sizeof(Oid));
+
+		*argtypes = newargtypes;
+		*nargs = cstate->stack.ndatums;
+	}
+
+	if (cstate->pdata.nvars > 0)
+	{
+		int		i;
+		SQLHostVar	*vars;
+		int	nvars;
+		bool	not_sorted;
+		char *ptr;
+		StringInfoData		cds;
+		int	loc = 0;
+
+		initStringInfo(&cds);
+
+		/* now, pdata.params and pdata.cref_list contains a info about placeholders */
+		vars = cstate->pdata.vars;
+		nvars = cstate->pdata.nvars;
+
+		/* simple bublesort */
+		not_sorted = true;
+		while (not_sorted)
+		{
+			not_sorted = false;
+			for (i = 0; i < nvars - 1; i++)
+			{
+				SQLHostVar	var;
+
+				if (vars[i].location > vars[i+1].location)
+				{
+					not_sorted = true;
+					var = vars[i];
+					vars[i] = vars[i+1]; vars[i+1] = var;
+				}
+			}
+		}
+
+		ptr = sqlstr; i = 0;
+
+		while (*ptr)
+		{
+			char *str;
+
+			/* copy content to position of replaced object reference */
+			while (loc < vars[i].location)
+			{
+				appendStringInfoChar(&cds, *ptr++);
+				loc++;
+			}
+
+			/* replace ref. object by placeholder */
+			appendStringInfo(&cds,"$%d", (int) vars[i].offset);
+
+			/* find and skip a referenced object */
+			str = strstr(ptr, vars[i].name1);
+			Assert(str != NULL);
+			str += strlen(vars[i].name1);
+			loc += str - ptr; ptr = str;
+
+			/* when object was referenced with qualified name, then skip second identif */
+			if (vars[i].name2 != NULL)
+			{
+				str = strstr(ptr, vars[i].name2);
+				Assert(str != NULL);
+				str += strlen(vars[i].name2);
+				loc += str - ptr; ptr = str;
+			}
+
+			if (++i >= nvars)
+			{
+				/* copy to end and leave */
+				while (*ptr)
+					appendStringInfoChar(&cds, *ptr++);
+				break;
+			}
+		}
+
+		pfree(sqlstr);
+
+		return cds.data;
+	}
+	else
+		return sqlstr;
+}
+
+/*
+ * Compile a SET statement in (var,var,..) = (expr, expr, ..) form
+ */
+static void
+compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt)
+{
+	Plpsm_pcode_module *m = cstate->module;
+	int	addr;
+	StringInfoData	ds;
+	ListCell	*l1, *l2;
+	int	i = 1;
+	Oid	*locargtypes;
+	int	nargs;
+	bool		isfirst = true;
+
+	initStringInfo(&ds);
+
+	if (list_length(stmt->compound_target) != list_length(stmt->expr_list))
+		elog(ERROR, "there are different number of target variables and expressions in list");
+
+	/* 
+	 * now we doesn't a know a properties of generated query, so only emit
+	 * opcode now. The property will be reasigned later.
+	 */
+	addr = PC(m);
+	SET_OPVAL(expr.data, cstate->stack.ndata++);
+	SET_OPVAL(expr.is_multicol, true);
+	EMIT_OPCODE(PCODE_EXEC_EXPR);
+	appendStringInfoString(&ds, "SELECT ");
+
+	forboth (l1, stmt->compound_target, l2, stmt->expr_list)
+	{
+		const char *fieldname;
+		Plpsm_object *var;
+		char	*expr;
+
+		var = resolve_target(cstate, (List *) lfirst(l1), &fieldname, stmt->location);
+		expr = strVal(lfirst(l2));
+
+		if (!isfirst)
+			appendStringInfoChar(&ds, ',');
+		else
+			isfirst = false;
+
+		appendStringInfo(&ds, "(%s)::%s", expr, format_type_with_typemod(var->stmt->datum.typoid, var->stmt->datum.typmod));
+		SET_OPVALS_DATUM_INFO(saveto_field, var);
+		SET_OPVAL(saveto_field.fnumber, i++);
+		EMIT_OPCODE(PCODE_SAVETO_FIELD);
+	}
+
+	SET_OPVAL_ADDR(addr, expr.expr, replace_vars(cstate, ds.data, &locargtypes, &nargs));
+	SET_OPVAL_ADDR(addr, expr.nparams, nargs);
+	SET_OPVAL_ADDR(addr, expr.typoids, locargtypes);
+}
+
+/*
+ * emit instruction to execute a expression with specified targetoid and typmod
+ */
+static void 
+compile_expr(CompileState cstate, char *expr, Oid targetoid, int16 typmod)
+{
+	StringInfoData	ds;
+	Plpsm_pcode_module *m = cstate->module;
+	int	nargs;
+	Oid	*argtypes;
+
+	initStringInfo(&ds);
+	appendStringInfo(&ds, "SELECT (%s)::%s", expr, format_type_with_typemod(targetoid, typmod));
+	SET_OPVAL(expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs));
+	SET_OPVAL(expr.nparams, nargs);
+	SET_OPVAL(expr.typoids, argtypes);
+	SET_OPVAL(expr.data, cstate->stack.ndata++);
+	SET_OPVAL(expr.is_multicol, false);
+	EMIT_OPCODE(PCODE_EXEC_EXPR);
 }
 
 /*
@@ -1343,45 +1211,51 @@ release_psm_object(CompileState cstate, Plpsm_object *obj, int release_entry, in
  * to dynamic object is necessary, then dynamic SQL must be used. ???
  */
 static void 
-compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
+compile(CompileState cstate, Plpsm_stmt *stmt)
 {
 	int	addr1;
 	int	addr2;
-	Plpsm_object *obj;
+	Plpsm_object *obj, *var;
+	Plpsm_pcode_module *m = cstate->module;
 
 	while (stmt != NULL)
 	{
-		if (stmt->debug != NULL && 0)
-			store_debug_info(m, stmt->debug);
-
 		switch (stmt->typ)
 		{
 			case PLPSM_STMT_LOOP:
-				obj = new_psm_object_for(stmt, cstate, PC(m));
-				addr1 = PC(m);
-				compile(cstate, stmt->inner_left, m);
-				store_jmp(m, addr1);
-				cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+				{
+					obj = new_psm_object_for(stmt, cstate, PC(m));
+					addr1 = PC(m);
+					compile(cstate, stmt->inner_left);
+					EMIT_JMP(addr1);
+					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));\
+				}
 				break;
 
 			case PLPSM_STMT_WHILE:
-				obj = new_psm_object_for(stmt, cstate, PC(m));
-				addr1 = PC(m);
-				store_exec_expr(cstate, m, stmt->expr, BOOLOID, -1);
-				addr2 = store_jmp_not_true_unknown(m);
-				compile(cstate, stmt->inner_left, m);
-				store_jmp(m, addr1);
-				SET_TARGET(addr2, PC(m));
-				cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+				{
+					obj = new_psm_object_for(stmt, cstate, PC(m));
+					addr1 = PC(m);
+					compile_expr(cstate, stmt->expr, BOOLOID, -1);
+					addr2 = PC(m);
+					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
+					compile(cstate, stmt->inner_left);
+					EMIT_JMP(addr1);
+					SET_OPVAL_ADDR(addr2, addr, PC(m));
+					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+				}
 				break;
 
 			case PLPSM_STMT_REPEAT_UNTIL:
-				obj = new_psm_object_for(stmt, cstate, PC(m));
-				addr1 = PC(m);
-				compile(cstate, stmt->inner_left, m);
-				store_exec_expr(cstate, m, stmt->expr, BOOLOID, -1);
-				store_jmp_not_true(m, addr1);
-				cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+				{
+					obj = new_psm_object_for(stmt, cstate, PC(m));
+					addr1 = PC(m);
+					compile(cstate, stmt->inner_left);
+					compile_expr(cstate, stmt->expr, BOOLOID, -1);
+					SET_OPVAL(addr, addr1);
+					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
+					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+				}
 				break;
 
 			case PLPSM_STMT_COMPOUND_STATEMENT:
@@ -1390,7 +1264,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 					bool	has_sqlcode = cstate->stack.has_sqlcode;
 
 					obj = new_psm_object_for(stmt, cstate, PC(m));
-					compile(cstate, stmt->inner_left, m);
+					compile(cstate, stmt->inner_left);
 
 					cstate->stack.has_sqlstate = has_sqlstate;
 					cstate->stack.has_sqlcode = has_sqlcode;
@@ -1402,44 +1276,47 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 						{
 							int release_addr;
 							/* generate a release block as subrotine */
-							addr1 = store_call_unknown(m);
-							addr2 = store_jmp_unknown(m);
-							SET_TARGET(addr1, PC(m));
+							EMIT_CALL(PC(m) + 2);
+							addr1 = PC(m);
+							EMIT_OPCODE(PCODE_JMP);
 							release_addr = PC(m);
-							store_release_cursors(cstate, m);
-							SET_AND_INC_PC(m, PCODE_RET_SUBR);
-							SET_TARGET(addr2, PC(m));
+							compile_release_cursors(cstate);
+							EMIT_OPCODE(PCODE_RET_SUBR);
+							SET_OPVAL_ADDR(addr1, addr, PC(m));
 							cstate->current_scope = release_psm_object(cstate, obj, release_addr, PC(m));
 						}
 						else
 						{
-							store_release_cursors(cstate, m);
+							compile_release_cursors(cstate);
 							cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
 						}
 					}
 					else
 						cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
-					break;
 				}
+				break;
 
 			case PLPSM_STMT_DECLARE_VARIABLE:
 				{
 					ListCell *l;
+
+					if (stmt->expr != NULL)
+						compile_expr(cstate, stmt->expr, stmt->datum.typoid, stmt->datum.typmod);
+
 					foreach(l, stmt->compound_target)
 					{
 						char *name = strVal(lfirst(l));
-						obj = create_variable_for(stmt, cstate, name, PLPSM_VARIABLE);
+						var = create_variable_for(stmt, cstate, name, PLPSM_VARIABLE);
 
 						if (stmt->expr != NULL)
 						{
-							store_exec_expr(cstate, m, stmt->expr, stmt->datum.typoid, stmt->datum.typmod);
-							store_saveto(m, obj->offset, stmt->datum.typlen, stmt->datum.typbyval);
+							SET_OPVALS_DATUM_COPY(target, var);
+							EMIT_OPCODE(PCODE_SAVETO);
 						}
 						else
 						{
-							CHECK_MODULE_SIZE(m);
-							SET_OFFSET(m, obj->offset);
-							SET_AND_INC_PC(m, PCODE_SET_NULL);
+							SET_OPVAL(target.offset, var->offset);
+							EMIT_OPCODE(PCODE_SET_NULL);
 						}
 					}
 				}
@@ -1448,29 +1325,22 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 			case PLPSM_STMT_DECLARE_CURSOR:
 				{
 					char *name = strVal(linitial(stmt->target)) ;
-					obj = create_variable_for(stmt, cstate, name, PLPSM_VARIABLE);
+
+					var = create_variable_for(stmt, cstate, name, PLPSM_VARIABLE);
 					if (stmt->query != NULL)
 					{
-						bool	noparams;
-					
-						char *cquery = compile_query(cstate, stmt->query, &noparams, NULL);
-						CHECK_MODULE_SIZE(m);
-						if (!noparams)
-						{
-							Oid *typoids;
+						Oid	*argtypes;
+						int	nargs;
 
-							/* copy a current typeoid vector to private typeoid vector */
-							typoids = palloc(cstate->stack.ndatums * sizeof(Oid));
-							memcpy(typoids, cstate->stack.oids.data, cstate->stack.ndatums * sizeof(Oid));
-							SET_EXPR(m, cquery, cstate->stack.ndatums, cstate->stack.oids.data);
-						}
-						else
-						{
-							SET_EXPR(m, cquery, 0, NULL);
-						}
-						obj->cursor.data_addr = PC(m);
-						SET_EXPR_DATA(m, cstate->stack.ndata++);
-						SET_AND_INC_PC(m, PCODE_DATA_QUERY);
+						var->cursor.data_addr = PC(m);
+
+						SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->query), &argtypes, &nargs));
+						SET_OPVAL(expr.nparams, nargs);
+						SET_OPVAL(expr.typoids, argtypes);
+						SET_OPVAL(expr.data, cstate->stack.ndata++);
+						SET_OPVAL(expr.is_multicol, true);
+
+						EMIT_OPCODE(PCODE_DATA_QUERY);
 					}
 				}
 				break;
@@ -1482,9 +1352,10 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
 					if (obj->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
 						elog(ERROR, "variable \"%s\" isn't cursor", obj->name);
-					SET_CURSOR(m, obj->cursor.data_addr, obj->cursor.offset);
-					SET_CURSOR_NAME(m, obj->name);
-					SET_AND_INC_PC(m, PCODE_CURSOR_OPEN);
+					SET_OPVAL(cursor.addr, obj->cursor.data_addr);
+					SET_OPVAL(cursor.offset, obj->cursor.offset);
+					SET_OPVAL(cursor.name, obj->name);
+					EMIT_OPCODE(PCODE_CURSOR_OPEN);
 				}
 				break;
 
@@ -1507,9 +1378,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 					{
 						Plpsm_object *var = lookup_var(cstate->current_scope, "sqlstate");
 						Assert(var != NULL);
-						SET_OPVAL(target.offset, var->offset);
-						SET_OPVAL(target.typlen, var->stmt->datum.typlen);
-						SET_OPVAL(target.typbyval, var->stmt->datum.typbyval);
+						SET_OPVALS_DATUM_COPY(target, var);
 						EMIT_OPCODE(PCODE_SQLSTATE_REFRESH);
 					}
 
@@ -1517,9 +1386,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 					{
 						Plpsm_object *var = lookup_var(cstate->current_scope, "sqlcode");
 						Assert(var != NULL);
-						SET_OPVAL(target.offset, var->offset);
-						SET_OPVAL(target.typlen, var->stmt->datum.typlen);
-						SET_OPVAL(target.typbyval, var->stmt->datum.typbyval);
+						SET_OPVALS_DATUM_COPY(target, var);
 						EMIT_OPCODE(PCODE_SQLCODE_REFRESH);
 					}
 
@@ -1528,11 +1395,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 						Plpsm_object	*var = resolve_target(cstate, (List *) lfirst(l),
 													    &fieldname,
 														stmt->location);
-						SET_OPVAL(saveto_field.offset, var->offset);
-						SET_OPVAL(saveto_field.typlen, var->stmt->datum.typlen);
-						SET_OPVAL(saveto_field.typbyval, var->stmt->datum.typbyval);
-						SET_OPVAL(saveto_field.typoid, var->stmt->datum.typoid);
-						SET_OPVAL(saveto_field.typmod, var->stmt->datum.typmod);
+						SET_OPVALS_DATUM_INFO(saveto_field, var);
 						SET_OPVAL(saveto_field.data, cstate->stack.ndata++);
 						SET_OPVAL(saveto_field.fnumber, i++);
 						EMIT_OPCODE(PCODE_SAVETO_FIELD);
@@ -1547,105 +1410,140 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
 					if (obj->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
 						elog(ERROR, "variable \"%s\" isn't cursor", obj->name);
-					SET_CURSOR(m, obj->cursor.data_addr, obj->cursor.offset);
-					SET_CURSOR_NAME(m, obj->name);
-					SET_AND_INC_PC(m, PCODE_CURSOR_CLOSE);
+					SET_OPVAL(cursor.addr, obj->cursor.data_addr);
+					SET_OPVAL(cursor.offset, obj->cursor.offset);
+					SET_OPVAL(cursor.name, obj->name);
+					EMIT_OPCODE(PCODE_CURSOR_CLOSE);
 				}
 				break;
 
 			case PLPSM_STMT_IF:
-				store_exec_expr(cstate, m, stmt->expr, BOOLOID, -1);
-				addr1 = store_jmp_not_true_unknown(m);
-				compile(cstate, stmt->inner_left, m);
-				if (stmt->inner_right)
 				{
-					addr2 = store_jmp_unknown(m);
-					SET_TARGET(addr1, PC(m));
-					compile(cstate, stmt->inner_right, m);
-					SET_TARGET(addr2, PC(m));
+					compile_expr(cstate, stmt->expr, BOOLOID, -1);
+					addr1 = PC(m);
+					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
+					compile(cstate, stmt->inner_left);
+					if (stmt->inner_right)
+					{
+						addr2 = PC(m);
+						EMIT_OPCODE(PCODE_JMP);
+						SET_OPVAL_ADDR(addr1, addr, PC(m));
+						compile(cstate, stmt->inner_right);
+						SET_OPVAL_ADDR(addr2, addr, PC(m));
+					}
+					else
+						SET_OPVAL_ADDR(addr1, addr, PC(m));
 				}
-				else
-					SET_TARGET(addr1, PC(m));
 				break;
 
 			case PLPSM_STMT_CASE:
 				{
 					Plpsm_stmt *outer_case = stmt;
-					Plpsm_stmt *condition = stmt->inner_left;
+					Plpsm_stmt *cond = stmt->inner_left;
 					List	*final_jmps = NIL;
 					ListCell	*l;
-					while (condition != NULL)
+
+					while (cond != NULL)
 					{
 						char *expr;
+
 						if (outer_case->expr != NULL)
 						{
 							StringInfoData	ds;
+
 							initStringInfo(&ds);
-							appendStringInfo(&ds, "%s IN (%s)", outer_case->expr,
-												condition->expr);
+							appendStringInfo(&ds, "%s IN (%s)", outer_case->expr, cond->expr);
 							expr = ds.data;
 						}
 						else
-							expr = pstrdup(condition->expr);
-						store_exec_expr(cstate, m, expr, BOOLOID, -1);
-						addr1 = store_jmp_not_true_unknown(m);
-						compile(cstate, condition->inner_left, m);
-						addr2 = store_jmp_unknown(m);
-						SET_TARGET(addr1, PC(m));
-						final_jmps = lappend(final_jmps, makeInteger(addr2));
-						condition = condition->next;
+							expr = pstrdup(cond->expr);
+
+						compile_expr(cstate, expr, BOOLOID, -1);
+						addr1 = PC(m);
+						EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
+						compile(cstate, cond->inner_left);
+						final_jmps = lappend(final_jmps, makeInteger(PC(m)));
+						EMIT_OPCODE(PCODE_JMP);
+						SET_OPVAL_ADDR(addr1, addr, PC(m));
+						cond = cond->next;
 					}
+
+					/* when there are not ELSE path */
 					if (outer_case->inner_right == NULL)
 					{
-						CHECK_MODULE_SIZE(m);
-						SET_STR(m,"case doesn't match any value");
-						SET_AND_INC_PC(m, PCODE_SIGNAL_NODATA);
+						SET_OPVAL(str, "case doesn't match any value");
+						EMIT_OPCODE(PCODE_SIGNAL_NODATA);
 					}
 					else
-						compile(cstate, outer_case->inner_right, m);
+						compile(cstate, outer_case->inner_right);
+
+					/* complete leave jumps */
 					foreach (l, final_jmps)
 					{
 						addr1 = intVal(lfirst(l));
-						SET_TARGET(addr1, PC(m));
+						SET_OPVAL_ADDR(addr1, addr, PC(m));
 					}
 				}
 				break;
 
 			case PLPSM_STMT_PRINT:
-				if (list_length(stmt->compound_target) == 1)
 				{
-					store_exec_expr(cstate, m, strVal(linitial(stmt->compound_target)), TEXTOID, -1);
-					store_print(m);
-				}
-				else
-				{
-					ListCell *l;
-					bool	isFirst = true;
-					int dataidx = cstate->stack.ndata++;
-
-					SET_OPVAL(strbuilder.data, dataidx);
-					SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_INIT);
-					EMIT_OPCODE(PCODE_STRBUILDER);
-					foreach(l, stmt->compound_target)
+					if (list_length(stmt->compound_target) > 1)
 					{
-						char *expr = strVal(lfirst(l));
-						store_exec_expr(cstate, m, expr, TEXTOID, -1);
-						if (!isFirst)
-						{
-							SET_OPVAL(strbuilder.data, dataidx);
-							SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_APPEND_CHAR);
-							SET_OPVAL(strbuilder.chr, ' ');
-							EMIT_OPCODE(PCODE_STRBUILDER);
-						}
-						else
-							isFirst = false;
+						ListCell *l;
+						bool	isfirst = true;
+						StringInfoData ds;
+						int dataidx = cstate->stack.ndata++;
+						int i = 1;
+						Oid	*argtypes;
+						int	nargs;
+
+						initStringInfo(&ds);
+
 						SET_OPVAL(strbuilder.data, dataidx);
-						SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_APPEND_RESULT);
+						SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_INIT);
+						EMIT_OPCODE(PCODE_STRBUILDER);
+
+						addr1 = PC(m);
+						SET_OPVAL(expr.data, cstate->stack.ndata++);
+						SET_OPVAL(expr.is_multicol, true);
+						EMIT_OPCODE(PCODE_EXEC_EXPR);
+						appendStringInfoString(&ds, "SELECT ");
+
+						foreach (l, stmt->compound_target)
+						{
+							if (!isfirst)
+							{
+								appendStringInfoChar(&ds, ',');
+								SET_OPVAL(strbuilder.data, dataidx);
+								SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_APPEND_CHAR);
+								SET_OPVAL(strbuilder.chr, ' ');
+								EMIT_OPCODE(PCODE_STRBUILDER);
+							}
+							else
+								isfirst = false;
+
+							SET_OPVAL(strbuilder.data, dataidx);
+							SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_APPEND_FIELD);
+							SET_OPVAL(strbuilder.fnumber, i++);
+							EMIT_OPCODE(PCODE_STRBUILDER);
+
+							appendStringInfo(&ds, "(%s)::text", strVal(lfirst(l)));
+						}
+
+						SET_OPVAL_ADDR(addr1, expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs));
+						SET_OPVAL_ADDR(addr1, expr.nparams, nargs);
+						SET_OPVAL_ADDR(addr1, expr.typoids, argtypes);
+					
+						SET_OPVAL(strbuilder.data, dataidx);
+						SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_PRINT_FREE);
 						EMIT_OPCODE(PCODE_STRBUILDER);
 					}
-					SET_OPVAL(strbuilder.data, dataidx);
-					SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_PRINT_FREE);
-					EMIT_OPCODE(PCODE_STRBUILDER);
+					else
+					{
+						compile_expr(cstate, strVal(linitial(stmt->compound_target)), TEXTOID, -1);
+						EMIT_OPCODE(PCODE_PRINT);
+					}
 				}
 				break;
 
@@ -1653,11 +1551,20 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 				{
 					const char *fieldname;
 
-					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
-					store_exec_expr(cstate, m, stmt->expr, obj->stmt->datum.typoid, obj->stmt->datum.typmod);
-					store_saveto(m, obj->offset, obj->stmt->datum.typlen, obj->stmt->datum.typbyval);
-					break;
+					if (stmt->target != NIL)
+					{
+						obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
+						compile_expr(cstate, stmt->expr, obj->stmt->datum.typoid, obj->stmt->datum.typmod);
+						SET_OPVALS_DATUM_COPY(target, obj);
+						EMIT_OPCODE(PCODE_SAVETO);
+					}
+					else
+					{
+						Assert(stmt->compound_target != NIL && stmt->expr_list != NIL);
+						compile_multiset_stmt(cstate, stmt);
+					}
 				}
+				break;
 
 			case PLPSM_STMT_ITERATE:
 			case PLPSM_STMT_LEAVE:
@@ -1678,23 +1585,24 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 							elog(ERROR, "using RETURN expr in function with OUT arguments");
 
 						if (stmt->expr != NULL)
-							store_exec_expr(cstate, m, stmt->expr, cstate->finfo.result.datum.typoid, -1);
+							compile_expr(cstate, stmt->expr, cstate->finfo.result.datum.typoid, -1);
 						else
-							store_exec_expr(cstate, m, cstate->finfo.return_expr,
+							compile_expr(cstate, cstate->finfo.return_expr,
 											cstate->finfo.result.datum.typoid, -1);
-						SET_DATUM_PROP(m, cstate->finfo.result.datum.typlen, cstate->finfo.result.datum.typbyval);
-						SET_AND_INC_PC(m, PCODE_RETURN);
+
+						SET_OPVAL(target.typlen, cstate->finfo.result.datum.typlen);
+						SET_OPVAL(target.typbyval, cstate->finfo.result.datum.typbyval);
+						EMIT_OPCODE(PCODE_RETURN);
 					}
 					else
 					{
 						Assert(cstate->finfo.return_expr == NULL);
 						if (stmt->expr != NULL)
 							elog(ERROR, "returned a value in VOID function");
-						SET_AND_INC_PC(m, PCODE_RETURN_VOID);
+						EMIT_OPCODE(PCODE_RETURN_VOID);
 					}
-					break;
 				}
-				
+				break;
 
 			default:
 				elog(ERROR, "unknown command typeid");
@@ -1702,7 +1610,6 @@ compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_pcode_module *m)
 		stmt = stmt->next;
 	}
 }
-
 
 Plpsm_pcode_module *
 plpsm_compile(Oid funcOid, bool forValidator)
@@ -1713,7 +1620,7 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	char	*proc_source;
 	Datum	prosrcdatum;
 	bool		isnull;
-	Plpsm_pcode_module *module;
+	Plpsm_pcode_module *m;
 	CompileStateData cstate;
 	Plpsm_object outer_scope;
 	int			numargs;
@@ -1762,8 +1669,8 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	cstate.finfo.result.datum.typoid = procStruct->prorettype;
 	get_typlenbyval(cstate.finfo.result.datum.typoid, &cstate.finfo.result.datum.typlen, &cstate.finfo.result.datum.typbyval);
 
-	module = init_module();
-	cstate.module = module;
+	m = init_module();
+	cstate.module = m;
 
 	/* 
 	 * append to scope a variables for parameters, and store 
@@ -1773,7 +1680,7 @@ plpsm_compile(Oid funcOid, bool forValidator)
 						&argtypes, &argnames, &argmodes);
 	cstate.finfo.nargs = numargs;
 	cstate.finfo.name = pstrdup(NameStr(procStruct->proname));
-	module->name = cstate.finfo.name;
+	m->name = cstate.finfo.name;
 
 	for (i = 0; i < numargs; i++)
 	{
@@ -1816,14 +1723,17 @@ plpsm_compile(Oid funcOid, bool forValidator)
 			argmode == PROARGMODE_INOUT ||
 			argmode == PROARGMODE_VARIADIC)
 		{
-			store_copy_parameter(module, var, i);
+			SET_OPVAL(copyto.src, i);
+			SET_OPVAL(copyto.dest, var->offset);
+			SET_OPVAL(copyto.typlen, var->stmt->datum.typlen);
+			SET_OPVAL(copyto.typbyval, var->stmt->datum.typbyval);
+			EMIT_OPCODE(PCODE_COPY_PARAM);
 		}
 		else
 		{
 			/* initialize OUT variables to NULL */
-			CHECK_MODULE_SIZE(module);
-			SET_OFFSET(module, var->offset);
-			SET_AND_INC_PC(module, PCODE_SET_NULL);
+			SET_OPVAL(target.offset, var->offset);
+			EMIT_OPCODE(PCODE_SET_NULL);
 		}
 	}
 
@@ -1858,18 +1768,16 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	else
 		cstate.finfo.return_expr = NULL;
 
-	compile(&cstate, plpsm_parser_tree, module);
+	compile(&cstate, plpsm_parser_tree);
+	compile_done(&cstate);
 
-	store_done(&cstate, module);
-
-	module->ndatums = cstate.stack.ndatums;
-	module->ndata = cstate.stack.ndata;
+	m->ndatums = cstate.stack.ndatums;
+	m->ndata = cstate.stack.ndata;
 
 	if (plpsm_debug_compiler)
-		list(module);
+		list(m);
 
 	ReleaseSysCache(procTup);
 
-	return module;
+	return m;
 }
-

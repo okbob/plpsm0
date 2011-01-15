@@ -90,6 +90,7 @@ typedef struct Plpsm_stmt
 	int	option;
 	char	*query;
 	char	*expr;
+	List		*expr_list;
 	char			*debug;
 	struct Plpsm_stmt *next;
 	struct Plpsm_stmt *last;
@@ -162,6 +163,7 @@ typedef enum
 	PLPSM_STRBUILDER_INIT,
 	PLPSM_STRBUILDER_APPEND_CHAR,
 	PLPSM_STRBUILDER_APPEND_RESULT,
+	PLPSM_STRBUILDER_APPEND_FIELD,
 	PLPSM_STRBUILDER_PRINT_FREE
 } Plpsm_strbuilder_op_type;
 
@@ -178,6 +180,7 @@ typedef struct
 			int	nparams;
 			Oid	*typoids;
 			int	data;
+			bool	is_multicol;
 		} expr;
 		struct
 		{
@@ -233,7 +236,11 @@ typedef struct
 		{
 			int	data;
 			Plpsm_strbuilder_op_type op;
-			char	chr;
+			union
+			{
+				char	chr;
+				int16	fnumber;
+			};
 		} strbuilder;
 		int	size;
 	};

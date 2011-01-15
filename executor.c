@@ -119,7 +119,7 @@ next_op:
 					clean_result = true;
 
 					/* check if returned expression is only one value */
-					if (SPI_tuptable->tupdesc->natts != 1)
+					if (SPI_tuptable->tupdesc->natts != 1 && !pcode->expr.is_multicol)
 						elog(ERROR, "query returned %d column", 
 										SPI_tuptable->tupdesc->natts);
 
@@ -339,6 +339,24 @@ next_op:
 								appendStringInfoString(ds,"<NULL>");
 							else
 								appendStringInfo(ds, "%s", text_to_cstring(DatumGetTextP(result)));
+							break;
+						case PLPSM_STRBUILDER_APPEND_FIELD:
+							ds = DataPtrs[pcode->strbuilder.data];
+							if (SPI_processed > 0)
+							{
+								/* ensure a correct casting */
+								HeapTuple tuple = SPI_tuptable->vals[0];
+								bool	isnull;
+								Datum	val;
+
+								val = SPI_getbinval(tuple, SPI_tuptable->tupdesc, pcode->strbuilder.fnumber, &isnull);
+								if (!isnull)
+									appendStringInfo(ds, "%s", text_to_cstring(DatumGetTextP(val)));
+								else
+									appendStringInfo(ds, "<NULL>");
+							}
+							else
+								appendStringInfo(ds, "<NULL>");
 							break;
 						case PLPSM_STRBUILDER_PRINT_FREE:
 							ds = DataPtrs[pcode->strbuilder.data];
