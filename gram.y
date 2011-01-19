@@ -112,9 +112,8 @@ static void elog_stmt(int level, Plpsm_stmt *stmt);
 %type <str>	opt_label opt_end_label
 %type <node>	condition sqlstate opt_sqlstate
 %type <list>	condition_list expr_list
-%type <stmt>	stmt_prepare param_types_opt stmt_execute stmt_execute_immediate
+%type <stmt>	stmt_prepare stmt_execute stmt_execute_immediate
 %type <stmt>	stmt_open stmt_fetch stmt_close stmt_for for_prefetch
-%type <str>	cursor_def
 %type <stmt>	stmt_case case_when_list case_when opt_case_else
 %type <str>	opt_expr_until_when expr_until_semi_or_coma_or_parent
 
@@ -170,6 +169,7 @@ static void elog_stmt(int level, Plpsm_stmt *stmt);
 %token <keyword>	REPEAT
 %token <keyword>	RETURN
 %token <keyword>	SCROLL
+%token <keyword>	SELECT
 %token <keyword>	SET
 %token <keyword>	SQLEXCEPTION
 %token <keyword>	SQLSTATE
@@ -386,12 +386,19 @@ declaration:
 					$$ = $2;
 					DEBUG_SET($2, @1);
 				}
-			| DECLARE declare_prefetch CURSOR FOR cursor_def
+			| DECLARE declare_prefetch CURSOR FOR 
 				{
+					int	tok;
 					DEBUG_INIT;
 					if ($2->typ != PLPSM_STMT_DECLARE_CURSOR)
 						yyerror("syntax error");
-					$2->query = $5;
+					if ((tok = yylex()) != WORD)
+					{
+						plpsm_push_back_token(tok);
+						$2->query = read_until(';', 0, 0, ";", false, false, NULL, -1);
+					}
+					else
+						$2->name = yylval.word.ident;
 					$$ = $2;
 					DEBUG_SET($2, @1);
 				}
@@ -802,47 +809,14 @@ stmt_leave:		LEAVE WORD
 /*----
  * create a prepare statement
  *
- * PREPARE name [ '(' type [, type [..]] ')' ] FROM expr
+ * PREPARE name FROM expr
  *
  */
-stmt_prepare:		PREPARE WORD param_types_opt FROM expr_until_semi
+stmt_prepare:		PREPARE WORD FROM expr_until_semi
 				{
-					Plpsm_stmt *new = $3;
-					new->location = @1;
-					new->target = list_make1(makeString($2.ident));
-					new->expr = $5;
-					$$ = new;
-				}
-		;
-
-param_types_opt:
-				{
-					int tok = yylex();
-					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_PREPARE, -1);
-
-					if (tok == '(')
-					{
-						int endtok = '(';
-						List	*types = NIL;
-						char *expr;
-
-						/* read a list of data types */
-						while (endtok != ')')
-						{
-							expr = read_until(',', ')', 0, ", or )", false, true, &endtok, -1);
-							types = lappend(types, makeString(expr));
-							if (endtok == ')')
-								break;
-							if (endtok == ',')
-								/* consume coma */
-								yylex();
-							else
-								yyerror("syntax error, expected \",\"");
-						}
-						new->data = types;
-					}
-					else
-						plpsm_push_back_token(tok);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_PREPARE, @1);
+					new->name = $2.ident;
+					new->expr = $4;
 					$$ = new;
 				}
 		;
@@ -850,7 +824,7 @@ param_types_opt:
 /*----
  * execute a prepared statement
  *
- * EXECUTE name [ INTO variable [, variable [..]] ] [ USING expr [, expr [..]] ]
+ * EXECUTE name [ INTO variable [, variable [..]] ] [ USING var [, var [..]] ]
  *
  * note: a clausule using is a PostgreSQL feature
  */
@@ -861,36 +835,34 @@ stmt_execute:
 					new->name = $2.ident;
 					$$ = new;
 				}
-			| EXECUTE WORD INTO target 
-				{
-					Plpsm_stmt *new = $4;
-					new->typ = PLPSM_STMT_EXECUTE;
-					new->location = @1;
-					new->name = $2.ident;
-					$$ = new;
-				}
-			| EXECUTE WORD INTO target USING expr_list
-				{
-					Plpsm_stmt *new = $4;
-					new->typ = PLPSM_STMT_EXECUTE;
-					new->location = @1;
-					new->name = $2.ident;
-					new->data = $6;
-					$$ = new;
-				}
-			| EXECUTE WORD USING expr_list
+			| EXECUTE WORD INTO qual_identif_list
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE, @1);
 					new->name = $2.ident;
-					new->data = $4;
+					new->compound_target = $4;
+					$$ = new;
+				}
+			| EXECUTE WORD INTO qual_identif_list USING qual_identif_list
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE, @1);
+					new->name = $2.ident;
+					new->compound_target = $4;
+					new->var_list = $6;
+					$$ = new;
+				}
+			| EXECUTE WORD USING qual_identif_list
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE, @1);
+					new->name = $2.ident;
+					new->var_list = $4;
 					$$ = new;
 				}
 		;
 
 /*----
- * execute a prepared statement
+ * execute a dynamic query
  *
- * EXECUTE IMMEDIATE expr [ INTO variable [, variable [..]] ] [ USING expr [, expr [..]] ]
+ * EXECUTE IMMEDIATE expr
  *
  */
 stmt_execute_immediate:
@@ -900,36 +872,12 @@ stmt_execute_immediate:
 					new->expr = $3;
 					$$ = new;
 				}
-			| EXECUTE IMMEDIATE expr_until_semi_into_using INTO target
-				{
-					Plpsm_stmt *new = $5;
-					new->typ = PLPSM_STMT_EXECUTE_IMMEDIATE;
-					new->location = @1;
-					new->expr = $3;
-					$$ = new;
-				}
-			| EXECUTE IMMEDIATE expr_until_semi_into_using USING expr_list
-				{
-					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE_IMMEDIATE, @1);
-					new->expr = $3;
-					new->data = $5;
-					$$ = new;
-				}
-			| EXECUTE IMMEDIATE expr_until_semi_into_using INTO target USING expr_list
-				{
-					Plpsm_stmt *new = $5;
-					new->typ = PLPSM_STMT_EXECUTE_IMMEDIATE;
-					new->location = @1;
-					new->expr = $3;
-					new->data = $7;
-					$$ = new;
-				}
 		;
 
 /*----
  * open a cursor, possible open a cursor based on prepared statement
  *
- * OPEN cursor_name [ USING expr [, expr [..] ]
+ * OPEN cursor_name [ USING var [, var [..] ]
  *
  * note: a using of USING clause is a DB2 feature - dynamic cursor support
  */
@@ -940,11 +888,11 @@ stmt_open:
 					new->target = $2;
 					$$ = new;
 				}
-			| OPEN qual_identif USING expr_list
+			| OPEN qual_identif USING qual_identif_list
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_OPEN, @1);
 					new->target = $2;
-					new->data = $4;
+					new->var_list = $4;
 					$$ = new;
 				}
 		;
@@ -1175,11 +1123,6 @@ expr_until_semi_or_coma_or_parent:
 				}
 		;
 
-cursor_def:
-				{
-					$$ = read_until(';', 0, 0, ";", false, false, NULL, -1);
-				}
-
 %%
 
 static char 
@@ -1385,6 +1328,7 @@ declare_prefetch(void)
 			result->typ = PLPSM_STMT_DECLARE_CURSOR;
 			result->target = varnames;
 			result->option = option;
+
 			plpsm_push_back_token(tok);
 			break;
 		}

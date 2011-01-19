@@ -24,6 +24,13 @@ typedef struct
 	int16 offset;
 } SQLHostVar;
 
+typedef struct PreparedStatement
+{
+	const char *name;
+	int	data;
+	struct PreparedStatement *next;
+} PreparedStatement;
+
 typedef struct
 {
 	Plpsm_object *top_scope;
@@ -65,6 +72,7 @@ typedef struct
 		} result;
 		char		*return_expr;		/* generated result expression for function with OUT params */
 	} finfo;
+	PreparedStatement *prepared;
 } CompileStateData;
 
 typedef CompileStateData *CompileState;
@@ -74,6 +82,36 @@ static Node *resolve_column_ref(CompileState cstate, ColumnRef *cref);
 void plpsm_parser_setup(struct ParseState *pstate, CompileState cstate);
 static Plpsm_object *lookup_var(Plpsm_object *scope, const char *name);
 static void compile_expr(CompileState cstate, char *expr, Oid targetoid, int16 typmod);
+
+static int
+fetchPrepared(CompileState cstate, const char *name)
+{
+	PreparedStatement *iter = cstate->prepared;
+	PreparedStatement *new;
+
+	while (iter != NULL)
+	{
+		if (strcmp(iter->name, name) == 0)
+			return iter->data;
+
+		if (iter->next == NULL)
+		{
+			new = palloc0(sizeof(PreparedStatement));
+			new->name = name;
+			new->data = cstate->stack.ndata++;
+			iter->next = new;
+			return new->data;
+		}
+		else
+			iter = iter->next;
+	};
+
+	new = palloc0(sizeof(PreparedStatement));
+	new->name = name;
+	new->data = cstate->stack.ndata++;
+	cstate->prepared = new;
+	return new->data;
+}
 
 /*
  * It registers a psm object to nested objects. 
@@ -108,12 +146,17 @@ static Plpsm_object *
 new_object_for(Plpsm_stmt *stmt, Plpsm_object *outer)
 {
 	Plpsm_object *new = palloc0(sizeof(Plpsm_object));
-	new->typ = stmt->typ;
-	new->stmt = stmt;
+
 	if (outer != NULL)
 		append_object(outer, new);
+
 	if (stmt)
+	{
 		new->name = stmt->name;
+		new->typ = stmt->typ;
+		new->stmt = stmt;
+	}
+
 	return new;
 }
 
@@ -456,13 +499,15 @@ lookup_var(Plpsm_object *scope, const char *name)
 static void
 appendHostVar(CompileState cstate, int location, const char *name1, const char *name2, int offset)
 {
+	SQLHostVar *var;
+
 	if (cstate->pdata.nvars == cstate->pdata.maxvars)
 	{
 		cstate->pdata.maxvars += 128;
 		cstate->pdata.vars = repalloc(cstate->pdata.vars, cstate->pdata.maxvars * sizeof(SQLHostVar));
 	}
 
-	SQLHostVar *var = &cstate->pdata.vars[cstate->pdata.nvars++];
+	var = &cstate->pdata.vars[cstate->pdata.nvars++];
 	var->location = location;
 	var->name1 = name1;
 	var->name2 = name2;
@@ -569,6 +614,8 @@ resolve_target(CompileState cstate, List *target, const char **fieldname, int lo
 	const char *name1;
 	const char *name2 = NULL;
 	Plpsm_object *var;
+
+	*fieldname = NULL;
 
 	switch (list_length(target))
 	{
@@ -733,12 +780,6 @@ list(Plpsm_pcode_module *m)
 			case PCODE_DONE:
 				appendStringInfoString(&ds, "Done.");
 				break;
-			case PCODE_EXECUTE:
-				appendStringInfo(&ds, "execute %s()", VALUE(str));
-				break;
-			case PCODE_IF_NOTEXIST_PREPARE:
-				appendStringInfo(&ds, "prepere_ifnexist %s as %s", VALUE(prep.name), VALUE(prep.expr));
-				break;
 			case PCODE_SET_NULL:
 				appendStringInfo(&ds, "SetNull @%d", VALUE(target.offset));
 				break;
@@ -803,6 +844,23 @@ list(Plpsm_pcode_module *m)
 				appendStringInfo(&ds, "StringBuilder data[%d] op:%d", VALUE(strbuilder.data),
 											VALUE(strbuilder.op));
 				break;
+			case PCODE_CHECK_DATA:
+				appendStringInfo(&ds, "CheckData ncolums:%d", VALUE(ncolumns));
+				break;
+			case PCODE_EXECUTE_IMMEDIATE:
+				appendStringInfo(&ds, "ExecImmediate");
+				break;
+			case PCODE_PREPARE:
+				appendStringInfo(&ds, "Prepare name:%s data[%d]", VALUE(prepare.name), VALUE(prepare.data));
+				break;
+			case PCODE_PARAMBUILDER:
+				appendStringInfo(&ds, "Parambuilder data[%d] op:%d", VALUE(parambuilder.data), 
+											VALUE(parambuilder.op));
+				break;
+			case PCODE_EXECUTE:
+				appendStringInfo(&ds, "Execute sqlstr[%d] params[%d]", VALUE(execute.sqlstr), 
+											VALUE(execute.params));
+				break;
 		}
 		appendStringInfoChar(&ds, '\n');
 	}
@@ -852,6 +910,17 @@ check_module_size(Plpsm_pcode_module *m)
 #define EMIT_CALL(a)			do { \
 						SET_OPVAL(addr, a); \
 						EMIT_OPCODE(PCODE_CALL); \
+					} while (0)
+#define PARAMBUILDER(o,d)		do { \
+						SET_OPVAL(parambuilder.data, d); \
+						SET_OPVAL(parambuilder.op, o); \
+						EMIT_OPCODE(PCODE_PARAMBUILDER); \
+					} while (0)
+#define PARAMBUILDER1(o,d, p,v)		do { \
+						SET_OPVAL(parambuilder.data, d); \
+						SET_OPVAL(parambuilder.op, o); \
+						SET_OPVAL(parambuilder.p, v); \
+						EMIT_OPCODE(PCODE_PARAMBUILDER); \
 					} while (0)
 
 
@@ -1604,6 +1673,104 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				}
 				break;
 
+			case PLPSM_STMT_EXECUTE_IMMEDIATE:
+				{
+					compile_expr(cstate, stmt->expr, TEXTOID, -1);
+					EMIT_OPCODE(PCODE_EXECUTE_IMMEDIATE);
+				}
+				break;
+
+			case PLPSM_STMT_EXECUTE:
+				{
+					if (stmt->var_list != NIL)
+					{
+						Oid	*argtypes;
+						int	nargs;
+						StringInfoData ds;
+						ListCell *l;
+						int		i = 1;
+						bool	isFirst = true;
+						int dataidx = cstate->stack.ndata++;
+
+						initStringInfo(&ds);
+
+						PARAMBUILDER1(PLPSM_PARAMBUILDER_INIT, dataidx, nargs, list_length(stmt->var_list));
+
+						addr1 = PC(m);
+						SET_OPVAL(expr.data, cstate->stack.ndata++);
+						SET_OPVAL(expr.is_multicol, true);
+						EMIT_OPCODE(PCODE_EXEC_EXPR);
+						appendStringInfoString(&ds, "SELECT ");
+
+						foreach (l, stmt->var_list)
+						{
+							Plpsm_object *var;
+							const char *fieldname;
+						
+							if (!isFirst)
+								appendStringInfoChar(&ds, ',');
+							else
+								isFirst = false;
+
+							var = resolve_target(cstate, (List *) lfirst(l), &fieldname, stmt->location);
+							if (fieldname == NULL)
+								appendStringInfo(&ds, "$%d", var->offset + 1);
+							else
+								appendStringInfo(&ds, "$%d.%s", var->offset + 1, fieldname);
+
+							PARAMBUILDER1(PLPSM_PARAMBUILDER_APPEND, dataidx, fnumber, i++);
+						}
+
+						SET_OPVAL_ADDR(addr1, expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs));
+						SET_OPVAL_ADDR(addr1, expr.nparams, nargs);
+						SET_OPVAL_ADDR(addr1, expr.typoids, argtypes);
+
+						SET_OPVAL(execute.name, stmt->name);
+						SET_OPVAL(execute.params, dataidx);
+						SET_OPVAL(execute.sqlstr, fetchPrepared(cstate, stmt->name));
+						EMIT_OPCODE(PCODE_EXECUTE);
+
+						PARAMBUILDER(PLPSM_PARAMBUILDER_FREE, dataidx);
+					}
+					else
+					{
+						SET_OPVAL(execute.name, stmt->name);
+						SET_OPVAL(execute.params, -1);
+						SET_OPVAL(execute.sqlstr, fetchPrepared(cstate,stmt->name));
+						EMIT_OPCODE(PCODE_EXECUTE);
+					}
+
+					if (stmt->compound_target != NIL)
+					{
+						const char *fieldname;
+						int	i = 1;
+						ListCell *l;
+
+						EMIT_OPCODE(PCODE_CHECK_DATA);
+						foreach (l, stmt->compound_target)
+						{
+							Plpsm_object	*var = resolve_target(cstate, (List *) lfirst(l),
+														    &fieldname,
+																stmt->location);
+							SET_OPVALS_DATUM_INFO(saveto_field, var);
+							SET_OPVAL(saveto_field.data, cstate->stack.ndata++);
+							SET_OPVAL(saveto_field.fnumber, i++);
+							EMIT_OPCODE(PCODE_SAVETO_FIELD);
+						}
+					}
+				}
+				break;
+
+			case PLPSM_STMT_PREPARE:
+				{
+					int	prepnum = fetchPrepared(cstate, stmt->name);
+					compile_expr(cstate, stmt->expr, TEXTOID, -1);
+					SET_OPVAL(prepare.name, stmt->name);
+					SET_OPVAL(prepare.data, prepnum);
+					EMIT_OPCODE(PCODE_PREPARE);
+				}
+				break;
+
 			default:
 				elog(ERROR, "unknown command typeid");
 		}
@@ -1665,6 +1832,7 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	cstate.stack.oids.data = (Oid *) palloc(cstate.stack.oids.size * sizeof(Oid));
 	cstate.stack.has_sqlstate = false;
 	cstate.stack.has_sqlcode = false;
+	cstate.prepared = NULL;
 
 	cstate.finfo.result.datum.typoid = procStruct->prorettype;
 	get_typlenbyval(cstate.finfo.result.datum.typoid, &cstate.finfo.result.datum.typlen, &cstate.finfo.result.datum.typbyval);

@@ -347,9 +347,6 @@ l1: loop
   end;
 $$ language psm0;
 
-create table footab(a int)
-insert into footab values(1),(2),(3),(4);
-
 create table footab2(a int);
 insert into footab2 values(1),(2),(3);
 
@@ -455,7 +452,72 @@ begin
 end;
 $$ language psm0;
 
+create or replace function test33()
+returns int as $$
+begin
+  execute immediate 'create table foo(a int)';
+  execute immediate 'insert into foo values(10)';
+  execute immediate 'drop table foo';
+  return 0;
+end;
+$$ language psm0;
 
+create or replace function test34()
+returns int as $$
+begin
+  prepare xx from 'select 10 + $1';
+  prepare xx from 'select 20 + $1';
+  return 0;
+end;
+$$ language psm0;
+
+/*
+ * Change to DB2:
+ * only reference to variable can used in prepare statement in DB2,
+ */
+create or replace function test35(a float, b float)
+returns int as $$
+begin
+  declare x int;
+  prepare xx from 'select 10 + $1';
+  execute xx into x using b;
+  return x;
+end;
+$$ language psm0;
+
+create type footype as (a int, b int);
+
+create or replace function test35(a int, b footype)
+returns int as $$
+begin
+  declare x int;
+  prepare xx from 'select 10 + $1';
+  execute xx into x using b.b;
+  return x;
+end;
+$$ language psm0;
+
+/*
+create or replace function test36(t text)
+returns int as $$
+begin
+  declare s int default 0;
+  declare par int default 3;
+  declare sqlcode int;
+  declare aux int;
+  declare c cursor for xx;
+  prepare xx from 'select * from ' || quote_ident(t) || ' where a = $1';
+  open c using par;
+  fetch c into aux;
+  while sqlcode = 0 do
+    set s = s + aux;
+    fetch c into aux;
+  end while;
+  return s;
+end;
+$$ language psm0;
+
+*/
 /*
 
 
@@ -631,6 +693,10 @@ begin
   perform assert('test31', 12, test31());
   perform assert('test32', 12, test32());
   perform assert('test32_01', 60, test32_01());
+  perform assert('test33',  0, test33());
+  perform assert('test34',  0, test34());
+  perform assert('test35', 30, test35(10,20));
+  perform assert('test35', 40, test35(0, (20,30)));
 
   raise notice '******* All tests are ok *******';
 end;

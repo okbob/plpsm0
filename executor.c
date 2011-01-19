@@ -1,9 +1,21 @@
 #include "psm.h"
+#include "commands/prepare.h"
 #include "executor/spi.h"
 #include "nodes/bitmapset.h"
+#include "parser/parse_coerce.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
+
+typedef struct
+{
+	int nargs;
+	Oid	*argtypes;
+	Datum	*values;
+	char	*nulls;
+	bool	*typbyval;
+	int16	*typlen;
+} Params;
 
 Datum
 plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
@@ -20,6 +32,7 @@ plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
 	int	sqlstate = 0;
 	Bitmapset	*acursors = NULL;		/* active cursors */
 	int	offset;
+	int	rc;
 
 	if (module->ndatums)
 	{
@@ -140,7 +153,45 @@ next_op:
 					}
 				}
 				break;
-			
+			case PCODE_EXECUTE_IMMEDIATE:
+				{
+					char *sqlstr;
+					int		rc;
+
+					sqlstr = text_to_cstring(DatumGetTextP(result));
+					rc = SPI_execute(sqlstr, false, 0);
+
+					if (rc < 0)
+						elog(ERROR, "SPI_execute failed executing query \"%s\" : %s",
+									sqlstr, SPI_result_code_string(rc));
+					switch (rc)
+					{
+						case SPI_OK_SELECT:
+						case SPI_OK_INSERT_RETURNING:
+						case SPI_OK_DELETE_RETURNING:
+						case SPI_OK_UPDATE_RETURNING:
+							elog(ERROR, "query \"%s\" returns data",
+												sqlstr);
+					}
+					pfree(sqlstr);
+				}
+				break;
+			case PCODE_PREPARE:
+				{
+					/*
+					 * There is different concept between ANSI SQL PREPARE statement and
+					 * PostgreSQL PREPARE statement. More, there are not way to prepare
+					 * query with params without known paramtypes via SPI. And there are
+					 * not possible to execute prepared plan by PREPARE statement via
+					 * parametrized SPI statements. Then PSM prepare statement, doesn't
+					 * store a plan, just store a query string. All wark will be done
+					 * in EXECUTE statement.
+					 */
+					if (DataPtrs[pcode->prepare.data] != NULL)
+						pfree(DataPtrs[pcode->prepare.data]);
+					DataPtrs[pcode->prepare.data] = text_to_cstring(DatumGetTextP(result));
+				}
+				break;
 			case PCODE_PRINT:
 				if (isnull)
 					elog(NOTICE, "NULL");
@@ -151,7 +202,6 @@ next_op:
 			case PCODE_NOOP:
 			case PCODE_DONE:
 				goto leave_process;
-			case PCODE_EXECUTE:
 			case PCODE_IF_NOTEXIST_PREPARE:
 			case PCODE_SET_NULL:
 				{
@@ -363,10 +413,105 @@ next_op:
 							ereport(NOTICE, (0, errmsg_internal("%s", ds->data)));
 							pfree(ds->data);
 							break;
+						case PLPSM_STRBUILDER_FREE:
+							ds = DataPtrs[pcode->strbuilder.data];
+							pfree(ds->data);
+							pfree(ds);
+							break;
 						case PLPSM_STRBUILDER_INIT:
 							DataPtrs[pcode->strbuilder.data] = makeStringInfo();
 						break;
 					}
+				}
+				break;
+			case PCODE_PARAMBUILDER:
+				{
+					Params *params;
+
+					switch (pcode->parambuilder.op)
+					{
+						case PLPSM_PARAMBUILDER_INIT:
+							params = palloc(sizeof(Params));
+							params->nargs = pcode->parambuilder.nargs;
+							params->argtypes = palloc(params->nargs * sizeof(Oid));
+							params->values = palloc(params->nargs * sizeof(Datum));
+							params->nulls = palloc(params->nargs * sizeof(char));
+							params->typbyval = palloc(params->nargs * sizeof(bool));
+							params->typlen = palloc(params->nargs * sizeof(int16));
+							DataPtrs[pcode->parambuilder.data] = params;
+							break;
+						case PLPSM_PARAMBUILDER_FREE:
+							{
+								int i;
+								params = DataPtrs[pcode->parambuilder.data];
+								for (i = 0; i < params->nargs; i++)
+								{
+									if (params->nulls[i] != 'n' && !params->typbyval[i])
+										pfree(DatumGetPointer(params->values[i]));
+								}
+								pfree(params->argtypes);
+								pfree(params->values);
+								pfree(params->nulls);
+								pfree(params->typbyval);
+								pfree(params->typlen);
+								pfree(params);
+							}
+							break;
+						case PLPSM_PARAMBUILDER_APPEND:
+							{
+								Datum	val;
+								bool	isnull;
+								HeapTuple tuple = SPI_tuptable->vals[0];
+								int16		fnumber = pcode->parambuilder.fnumber - 1;
+								Form_pg_attribute attr = SPI_tuptable->tupdesc->attrs[fnumber];
+
+								params = DataPtrs[pcode->parambuilder.data];
+
+								params->argtypes[fnumber] = attr->atttypid;
+								val = SPI_getbinval(tuple, SPI_tuptable->tupdesc, fnumber + 1, &isnull);
+								if (!isnull)
+								{
+									int16	typlen;
+									bool	typbyval;
+
+									get_typlenbyval(attr->atttypid, &typlen, &typbyval);
+									params->typlen[fnumber] = typlen;
+									params->typbyval[fnumber] = typbyval;
+									params->values[fnumber] = datumCopy(val, typbyval, typlen);
+									params->nulls[fnumber] = ' ';
+								}
+								else
+									params->nulls[fnumber] = 'n';
+							}
+							break;
+					}
+				}
+				break;
+			case PCODE_EXECUTE:
+				{
+					char *sqlstr = DataPtrs[pcode->execute.sqlstr];
+					
+					if (sqlstr == NULL)
+						elog(ERROR, "missing a prepared statement \"%s\"", pcode->execute.name);
+
+					if (pcode->execute.params != -1)
+					{
+						Params *params = DataPtrs[pcode->execute.params];
+						rc = SPI_execute_with_args(sqlstr, params->nargs, params->argtypes,
+														    params->values, 
+														    params->nulls,
+														    false, 0);
+					}
+					else
+						rc = SPI_execute(sqlstr, false, 0);
+
+					clean_result = true;
+				}
+				break;
+			case PCODE_CHECK_DATA:
+				{
+					if (SPI_processed == 0)
+						elog(ERROR, "Query doesn't return data");
 				}
 				break;
 			case PCODE_RETURN_VOID:
