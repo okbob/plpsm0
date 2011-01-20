@@ -67,6 +67,11 @@ next_op:
 				goto next_op;
 
 			case PCODE_JMP_NOT_FOUND:
+				if (SPI_processed == 0)
+				{
+					PC = pcode->addr;
+					goto next_op;
+				}
 				break;
 			case PCODE_CALL:
 				if (SP == 1024)
@@ -311,8 +316,6 @@ next_op:
 					values[pcode->cursor.offset] = PointerGetDatum(portal);
 					nulls[pcode->cursor.offset] = ' ';
 					acursors = bms_add_member(acursors, pcode->cursor.offset);
-
-					clean_result = true;
 				}
 				break;
 

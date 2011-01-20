@@ -951,19 +951,19 @@ stmt_for:
  */
 for_prefetch:
 				{
-					char *namespace = NULL;
+					char *loopvar_name = NULL;
 					char *cursor_name = NULL;
 					int tok;
 					int	startloc = -1;
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_FOR, -1);
 
-					/* read a possible namespace */
+					/* read a possible loopvar_name */
 					tok = yylex(); startloc = yylloc;
 					if (tok  == WORD)
 					{
 						int tok1;
 
-						namespace = yylval.word.ident;
+						loopvar_name = yylval.word.ident;
 						tok1 = yylex();
 						if (tok1 == AS)
 						{
@@ -992,8 +992,8 @@ for_prefetch:
 						}
 						else if (tok1 == CURSOR)
 						{
-							cursor_name = namespace;
-							namespace = NULL;
+							cursor_name = loopvar_name;
+							loopvar_name = NULL;
 							if (yylex() != FOR)
 								yyerror("expected for");
 							startloc = -1;
@@ -1007,9 +1007,11 @@ for_prefetch:
 					else
 						plpsm_push_back_token(tok);
 
-					if (namespace != NULL || cursor_name != NULL)
-						new->data = list_make2(makeString(namespace),
-									    makeString(cursor_name));
+					if (loopvar_name != NULL || cursor_name != NULL)
+					{
+						new->stmtfor.cursor_name = cursor_name;
+						new->stmtfor.loopvar_name = loopvar_name;
+					}
 					new->query = read_until(DO, -1, -1, "DO", false, false, NULL, startloc);
 					$$ = new;
 				}
@@ -1643,6 +1645,20 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 	appendStringInfo(ds, "%s| Query: %s\n", ident, stmt->query);
 	appendStringInfo(ds, "%s| Expr: %s\n", ident, stmt->expr);
 	appendStringInfo(ds, "%s| ExprList: %s\n", ident, nodeToString(stmt->expr_list));
+	
+	switch (stmt->typ)
+	{
+		case PLPSM_STMT_FOR:
+			{
+				appendStringInfo(ds, "%s| Data: loopvar:%s, cursor:%s\n", ident,
+										stmt->stmtfor.loopvar_name,
+										stmt->stmtfor.cursor_name);
+			}
+			break;
+		default:
+			/* do nothing */ ;
+	}
+	
 	appendStringInfo(ds, "%s| Debug: \"%s\"\n", ident, stmt->debug ? stmt->debug : "");
 	appendStringInfo(ds, "%s| Inner left:\n", ident);
 	stmt_out(ds, stmt->inner_left, nested_level + 1);

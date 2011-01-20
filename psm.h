@@ -42,6 +42,7 @@ typedef enum
 typedef enum
 {
 	PLPSM_STMT_COMPOUND_STATEMENT,
+	PLPSM_STMT_SCHEMA,				/* it's used as explicit schema for implicit variables of FOR statement */
 	PLPSM_STMT_DECLARE_VARIABLE,
 	PLPSM_STMT_DECLARE_CONDITION,
 	PLPSM_STMT_DECLARE_CURSOR,
@@ -85,6 +86,11 @@ typedef struct Plpsm_stmt
 			bool	typbyval;
 			int16	typlen;
 		} datum;
+		struct
+		{
+			char *loopvar_name;
+			char *cursor_name;
+		} stmtfor;
 	};
 	void			*data;
 	int	option;
@@ -121,6 +127,7 @@ typedef struct Plpsm_object
 			int	data_addr;
 			int16	offset;
 			bool	is_dynamic;
+			bool	is_for_stmt_cursor;
 			char *prepname;
 		} cursor;
 		int16		offset;

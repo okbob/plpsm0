@@ -536,7 +536,81 @@ end;
 $$ language psm0;
 
 /*
+ * NOT_FOUND event of FOR stmt isn't possible handled by custom
+ * condition handlers!
+ */
+create or replace function test37()
+returns int as $$
+begin
+  declare s int default 0;
+  for ft as c1 cursor for select * from footab do
+    set s = s + ft.a;
+  end for;
+  return s;
+end;
+$$ language psm0;
 
+create or replace function test37_01()
+returns int as $$
+begin
+  declare s int default 0;
+  for ft as c1 cursor for select * from footab do
+    set s = s + a;
+  end for;
+  return s;
+end;
+$$ language psm0;
+
+create or replace function test37_02()
+returns int as $$
+begin
+  declare s int default 0;
+  for select * from footab do
+    set s = s + a;
+  end for;
+  return s;
+end;
+$$ language psm0;
+
+create or replace function test37_03()
+returns int as $$
+begin
+   declare s int default 0;
+x1:for select * from footab do
+     set s = s + a;
+     if s > 5 then
+       leave x1;
+     end if;
+   end for;
+   return s;
+end;
+$$ language psm0;
+
+create or replace function test37_04()
+returns int as $$
+begin
+   declare s int default 0;
+x1:for select * from footab do
+     set s = s + a;
+     if s > 5 then
+       leave x1;
+     end if;
+   end for x1;
+   return s;
+end;
+$$ language psm0;
+
+create or replace function test37_05()
+returns int as $$
+begin
+   declare s int default 0;
+x1:for select * from footab do
+     set s = s + a;
+     iterate x1; -- actually must not change a result
+   end for x1;
+   return s;
+end;
+$$ language psm0;
 
 create table footab2(a int)
 insert into footab2 values(1),(2),(3);
@@ -628,7 +702,6 @@ begin
 end;
 $$ language psm0; -- returns -1
 
-*/
 
 /*************************************************
  * Assert functions
@@ -719,7 +792,12 @@ begin
   perform assert('test35', 40, test35(0, (20,30)));
   perform assert('test36',  3, test36('footab'));
   perform assert('test36_01', 7, test36_01('footab'));
-
+  perform assert('test37', 10, test37());
+  perform assert('test37_01', 10, test37_01());
+  perform assert('test37_02', 10, test37_02());
+  perform assert('test37_03',  6, test37_03());
+  perform assert('test37_04',  6, test37_04());
+  perform assert('test37_05', 10, test37_05());
 
   raise notice '******* All tests are ok *******';
 end;

@@ -1,14 +1,17 @@
 #include "psm.h"
 
 #include "funcapi.h"
+#include "access/tupdesc.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "nodes/bitmapset.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/plancache.h"
 #include "utils/syscache.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/typcache.h"
 
 #include "parser/parse_node.h"
@@ -211,7 +214,8 @@ create_variable_for(Plpsm_stmt *decl_stmt, CompileState cstate,
 	Plpsm_object *iterator = cstate->current_scope->inner;
 	Plpsm_object *var;
 
-	Assert(cstate->current_scope->typ == PLPSM_STMT_COMPOUND_STATEMENT);
+	Assert(cstate->current_scope->typ == PLPSM_STMT_COMPOUND_STATEMENT ||
+	       cstate->current_scope->typ == PLPSM_STMT_SCHEMA);
 	Assert(decl_stmt->typ == PLPSM_STMT_DECLARE_VARIABLE || 
 		decl_stmt->typ == PLPSM_STMT_DECLARE_CURSOR);
 
@@ -299,6 +303,7 @@ new_psm_object_for(Plpsm_stmt *stmt, CompileState cstate, int entry_addr)
 	switch (stmt->typ)
 	{
 		case PLPSM_STMT_COMPOUND_STATEMENT:
+		case PLPSM_STMT_SCHEMA:
 		case PLPSM_STMT_LOOP:
 		case PLPSM_STMT_WHILE:
 		case PLPSM_STMT_REPEAT_UNTIL:
@@ -448,12 +453,11 @@ lookup_qualified_var(Plpsm_object *scope, const char *label, const char *name)
 		return NULL;
 
 	/* fast path, we are in current scope */
-	if (scope->typ == PLPSM_STMT_COMPOUND_STATEMENT && scope->name && 
+	if ((scope->typ == PLPSM_STMT_COMPOUND_STATEMENT || scope->typ == PLPSM_STMT_SCHEMA) && scope->name && 
 				    strcmp(scope->name, label) == 0)
 	{
 		/* search a variable in this scope */
 		iterator = scope->inner;
-
 		while (iterator != NULL)
 		{
 			if ((iterator->typ == PLPSM_STMT_DECLARE_VARIABLE ||
@@ -949,7 +953,8 @@ compile_release_cursors(CompileState cstate)
 	Plpsm_object *iterator;
 
 	/* search all cursors from current compound statement */
-	Assert(scope->typ == PLPSM_STMT_COMPOUND_STATEMENT);
+	Assert(scope->typ == PLPSM_STMT_COMPOUND_STATEMENT ||
+	       scope->typ == PLPSM_STMT_SCHEMA);
 
 	iterator = scope->inner;
 	while (iterator != NULL)
@@ -1092,12 +1097,12 @@ plpsm_parser_setup(struct ParseState *pstate, CompileState cstate)
 }
 
 static char *
-replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs)
+replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs, TupleDesc *tupdesc)
 {
 	Oid	*newargtypes;
 	ListCell *l;
-
 	List       *raw_parsetree_list;
+	MemoryContext oldctx, tmpctx;
 
 	cstate->pdata.maxvars = 128;
 	cstate->pdata.vars = (SQLHostVar *) palloc(cstate->pdata.maxvars * sizeof(SQLHostVar));
@@ -1105,16 +1110,37 @@ replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs)
 	cstate->pdata.has_external_params = false;
 	cstate->pdata.is_expression = true;
 
+	/*
+	 * The temp context is a child of current context
+	 */
+	tmpctx = AllocSetContextCreate(CurrentMemoryContext,
+										   "compilation context",
+										   ALLOCSET_DEFAULT_MINSIZE,
+										   ALLOCSET_DEFAULT_INITSIZE,
+										   ALLOCSET_DEFAULT_MAXSIZE);
+
+	oldctx = MemoryContextSwitchTo(tmpctx);
+
 	raw_parsetree_list = pg_parse_query(sqlstr);
 
 	foreach(l, raw_parsetree_list)
 	{
-		 Node       *parsetree = (Node *) lfirst(l);
+		Node       *parsetree = (Node *) lfirst(l);
+		List   *stmt_list;
 
-		pg_analyze_and_rewrite_params((Node *) parsetree, sqlstr, 
+		stmt_list = pg_analyze_and_rewrite_params((Node *) parsetree, sqlstr, 
 								(ParserSetupHook) plpsm_parser_setup, 
 												(void *) cstate);
+		if (tupdesc)
+		{
+			stmt_list = pg_plan_queries(stmt_list, 0, NULL);
+			MemoryContextSwitchTo(oldctx);
+			*tupdesc = CreateTupleDescCopy(PlanCacheComputeResultDesc(stmt_list));
+			break;
+		}
 	}
+
+	MemoryContextSwitchTo(oldctx);
 
 	if (!cstate->pdata.has_external_params)
 	{
@@ -1206,11 +1232,14 @@ replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs)
 		}
 
 		pfree(sqlstr);
-
+		MemoryContextDelete(tmpctx);
 		return cds.data;
 	}
 	else
+	{
+		MemoryContextDelete(tmpctx);
 		return sqlstr;
+	}
 }
 
 /*
@@ -1263,7 +1292,7 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt)
 		EMIT_OPCODE(PCODE_SAVETO_FIELD);
 	}
 
-	SET_OPVAL_ADDR(addr, expr.expr, replace_vars(cstate, ds.data, &locargtypes, &nargs));
+	SET_OPVAL_ADDR(addr, expr.expr, replace_vars(cstate, ds.data, &locargtypes, &nargs, NULL));
 	SET_OPVAL_ADDR(addr, expr.nparams, nargs);
 	SET_OPVAL_ADDR(addr, expr.typoids, locargtypes);
 }
@@ -1281,7 +1310,7 @@ compile_expr(CompileState cstate, char *expr, Oid targetoid, int16 typmod)
 
 	initStringInfo(&ds);
 	appendStringInfo(&ds, "SELECT (%s)::%s", expr, format_type_with_typemod(targetoid, typmod));
-	SET_OPVAL(expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs));
+	SET_OPVAL(expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs, NULL));
 	SET_OPVAL(expr.nparams, nargs);
 	SET_OPVAL(expr.typoids, argtypes);
 	SET_OPVAL(expr.data, cstate->stack.ndata++);
@@ -1345,6 +1374,40 @@ compile_usage_clause(CompileState cstate, Plpsm_stmt *stmt, int *params)
 }
 
 /*
+ * ensure a emmiting a source's releasing
+ */
+static void
+finalize_block(CompileState cstate, Plpsm_object *obj)
+{
+	int	addr1;
+	Plpsm_pcode_module *m = cstate->module;
+
+	if (obj->calls.has_release_call)
+	{
+		if (obj->calls.release_calls != NULL)
+		{
+			int release_addr;
+			/* generate a release block as subrotine */
+			EMIT_CALL(PC(m) + 2);
+			addr1 = PC(m);
+			EMIT_OPCODE(PCODE_JMP);
+			release_addr = PC(m);
+			compile_release_cursors(cstate);
+			EMIT_OPCODE(PCODE_RET_SUBR);
+			SET_OPVAL_ADDR(addr1, addr, PC(m));
+			cstate->current_scope = release_psm_object(cstate, obj, release_addr, PC(m));
+		}
+		else
+		{
+			compile_release_cursors(cstate);
+			cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+		}
+	}
+		else
+			cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+}
+
+/*
  * diff from plpgsql 
  *
  * SQL/PSM is compilable language - so it checking a all SQL and expression
@@ -1399,6 +1462,121 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				}
 				break;
 
+			case PLPSM_STMT_FOR:
+				{
+					bool	has_sqlstate = cstate->stack.has_sqlstate;
+					bool	has_sqlcode = cstate->stack.has_sqlcode;
+					Plpsm_stmt *loopvar_stmt = palloc0(sizeof(Plpsm_stmt));
+					Plpsm_stmt *decl_cur = palloc0(sizeof(Plpsm_stmt));
+					Plpsm_object *loopvar_obj;
+					Plpsm_object *for_obj;
+					Plpsm_object	*cursor;
+					Plpsm_object		**vars;
+					char *cursor_name;
+					Oid				*argtypes;
+					int				nargs;
+					TupleDesc	tupdesc;
+					int i;
+
+					/* generate outer loopvar */
+					loopvar_stmt->typ = PLPSM_STMT_SCHEMA;
+					loopvar_stmt->location = stmt->location;
+					loopvar_stmt->name = stmt->stmtfor.loopvar_name;
+					loopvar_obj = new_psm_object_for(loopvar_stmt, cstate, PC(m));
+
+					decl_cur->typ = PLPSM_STMT_DECLARE_CURSOR;
+					cursor_name = stmt->stmtfor.cursor_name ? stmt->stmtfor.cursor_name : "";
+					cursor = create_variable_for(decl_cur, cstate, cursor_name, PLPSM_VARIABLE);
+
+					cursor->cursor.data_addr = PC(m);
+					cursor->cursor.is_dynamic = false;
+
+					SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->query), &argtypes, &nargs, &tupdesc));
+					SET_OPVAL(expr.nparams, nargs);
+					SET_OPVAL(expr.typoids, argtypes);
+					SET_OPVAL(expr.data, cstate->stack.ndata++);
+					SET_OPVAL(expr.is_multicol, true);
+
+					EMIT_OPCODE(PCODE_DATA_QUERY);
+
+					vars = (Plpsm_object **) palloc(tupdesc->natts * sizeof(Plpsm_object *));
+
+					for (i = 0; i < tupdesc->natts; i++)
+					{
+						Form_pg_attribute att = tupdesc->attrs[i];
+						Plpsm_stmt *decl_stmt = palloc0(sizeof(Plpsm_stmt));
+						int16 typlen;
+						Oid	typoid;
+						bool	typbyval;
+						Plpsm_object *var;
+
+						decl_stmt->typ = PLPSM_STMT_DECLARE_VARIABLE;
+						decl_stmt->target = list_make1(pstrdup(NameStr(att->attname)));
+						typoid = att->atttypid;
+						get_typlenbyval(typoid, &typlen, &typbyval);
+
+						decl_stmt->datum.typoid = typoid;
+						decl_stmt->datum.typmod = att->atttypmod;
+						decl_stmt->datum.typname = NULL;
+						decl_stmt->datum.typlen = typlen;
+						decl_stmt->datum.typbyval = typbyval;
+
+						/* append implicit name to scope */
+						var = create_variable_for(decl_stmt, cstate, pstrdup(NameStr(att->attname)), PLPSM_VARIABLE);
+						vars[i] = var;
+					}
+
+					SET_OPVAL(cursor.addr, cursor->cursor.data_addr);
+					SET_OPVAL(cursor.offset, cursor->cursor.offset);
+					SET_OPVAL(cursor.name, cursor->name);
+					EMIT_OPCODE(PCODE_CURSOR_OPEN);
+
+					/* generate innerate loop */
+					for_obj = new_psm_object_for(stmt, cstate, PC(m));
+
+					addr2 = PC(m);
+
+					/* fill implicit variables */
+					SET_OPVAL(fetch.offset, cursor->cursor.offset);
+					SET_OPVAL(fetch.name, cursor->name);
+					SET_OPVAL(fetch.nvars, 1);
+					SET_OPVAL(fetch.count, 1);
+					EMIT_OPCODE(PCODE_CURSOR_FETCH);
+
+					addr1 = PC(m);
+					EMIT_OPCODE(PCODE_JMP_NOT_FOUND);
+
+					for (i = 0; i < tupdesc->natts; i++)
+					{
+						/* we are sure so datum doesn't need a cast */
+						SET_OPVALS_DATUM_INFO(saveto_field, vars[i]);
+						SET_OPVAL(saveto_field.fnumber, i + 1);
+						EMIT_OPCODE(PCODE_SAVETO_FIELD);
+					}
+					pfree(vars);
+
+					compile(cstate, stmt->inner_left);
+					EMIT_JMP(addr2);
+					SET_OPVAL_ADDR(addr1, addr, PC(m));
+
+					/* release inner compose loop stmt */
+					finalize_block(cstate, for_obj);
+
+					/* 
+					 * cursor is closed inside release block,
+					 * not necessary to explicit close cursor.
+					 */
+
+					/* generate release block */
+					finalize_block(cstate, loopvar_obj);
+
+					cstate->stack.has_sqlstate = has_sqlstate;
+					cstate->stack.has_sqlcode = has_sqlcode;
+
+					FreeTupleDesc(tupdesc);
+				}
+				break;
+
 			case PLPSM_STMT_COMPOUND_STATEMENT:
 				{
 					bool	has_sqlstate = cstate->stack.has_sqlstate;
@@ -1411,29 +1589,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					cstate->stack.has_sqlcode = has_sqlcode;
 
 					/* generate release block */
-					if (obj->calls.has_release_call)
-					{
-						if (obj->calls.release_calls != NULL)
-						{
-							int release_addr;
-							/* generate a release block as subrotine */
-							EMIT_CALL(PC(m) + 2);
-							addr1 = PC(m);
-							EMIT_OPCODE(PCODE_JMP);
-							release_addr = PC(m);
-							compile_release_cursors(cstate);
-							EMIT_OPCODE(PCODE_RET_SUBR);
-							SET_OPVAL_ADDR(addr1, addr, PC(m));
-							cstate->current_scope = release_psm_object(cstate, obj, release_addr, PC(m));
-						}
-						else
-						{
-							compile_release_cursors(cstate);
-							cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
-						}
-					}
-					else
-						cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+					finalize_block(cstate, obj);
 				}
 				break;
 
@@ -1476,7 +1632,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						var->cursor.data_addr = PC(m);
 						var->cursor.is_dynamic = false;
 
-						SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->query), &argtypes, &nargs));
+						SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->query), &argtypes, &nargs, NULL));
 						SET_OPVAL(expr.nparams, nargs);
 						SET_OPVAL(expr.typoids, argtypes);
 						SET_OPVAL(expr.data, cstate->stack.ndata++);
@@ -1503,6 +1659,8 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					var = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
 					if (var->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
 						elog(ERROR, "variable \"%s\" isn't cursor", var->name);
+					if (var->cursor.is_for_stmt_cursor)
+						elog(ERROR, "cannot to open a cursor used in FOR statement");
 
 					if (stmt->var_list != NIL)
 					{
@@ -1542,6 +1700,9 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
 					if (obj->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
 						elog(ERROR, "variable \"%s\" isn't cursor", obj->name);
+					if (obj->cursor.is_for_stmt_cursor)
+						elog(ERROR, "cannot to open a cursor used in FOR statement");
+
 					SET_OPVAL(fetch.offset, obj->cursor.offset);
 					SET_OPVAL(fetch.name, obj->name);
 					SET_OPVAL(fetch.nvars, list_length(stmt->compound_target));
@@ -1584,6 +1745,9 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
 					if (obj->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
 						elog(ERROR, "variable \"%s\" isn't cursor", obj->name);
+					if (obj->cursor.is_for_stmt_cursor)
+						elog(ERROR, "cannot to open a cursor used in FOR statement");
+
 					SET_OPVAL(cursor.addr, obj->cursor.data_addr);
 					SET_OPVAL(cursor.offset, obj->cursor.offset);
 					SET_OPVAL(cursor.name, obj->name);
@@ -1697,7 +1861,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 							appendStringInfo(&ds, "(%s)::text", strVal(lfirst(l)));
 						}
 
-						SET_OPVAL_ADDR(addr1, expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs));
+						SET_OPVAL_ADDR(addr1, expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs, NULL));
 						SET_OPVAL_ADDR(addr1, expr.nparams, nargs);
 						SET_OPVAL_ADDR(addr1, expr.typoids, argtypes);
 
