@@ -275,10 +275,44 @@ next_op:
 										data->expr.expr,
 										data->expr.nparams, data->expr.typoids,
 												values, nulls,
-														true, 0);
+														false, 0);
 					values[pcode->cursor.offset] = PointerGetDatum(portal);
 					nulls[pcode->cursor.offset] = ' ';
 					acursors = bms_add_member(acursors, pcode->cursor.offset);
+				}
+				break;
+
+			case PCODE_CURSOR_OPEN_DYNAMIC:
+				{
+					Portal portal;
+
+					char *sqlstr = DataPtrs[pcode->cursor.addr];
+
+					if (sqlstr == NULL)
+						elog(ERROR, "missing a prepared statement \"%s\"", pcode->execute.name);
+
+					if (pcode->cursor.params != -1)
+					{
+						Params *params = DataPtrs[pcode->cursor.params];
+
+						portal = SPI_cursor_open_with_args(NULL,
+											sqlstr,
+												 params->nargs, params->argtypes,
+															    params->values, 
+															    params->nulls,
+															    false, 0);
+					}
+					else
+						portal = SPI_cursor_open_with_args(NULL,
+											sqlstr,
+												 0, NULL,
+															    NULL, NULL,
+															    false, 0);
+					values[pcode->cursor.offset] = PointerGetDatum(portal);
+					nulls[pcode->cursor.offset] = ' ';
+					acursors = bms_add_member(acursors, pcode->cursor.offset);
+
+					clean_result = true;
 				}
 				break;
 
@@ -431,6 +465,7 @@ next_op:
 					switch (pcode->parambuilder.op)
 					{
 						case PLPSM_PARAMBUILDER_INIT:
+						
 							params = palloc(sizeof(Params));
 							params->nargs = pcode->parambuilder.nargs;
 							params->argtypes = palloc(params->nargs * sizeof(Oid));
@@ -466,7 +501,6 @@ next_op:
 								Form_pg_attribute attr = SPI_tuptable->tupdesc->attrs[fnumber];
 
 								params = DataPtrs[pcode->parambuilder.data];
-
 								params->argtypes[fnumber] = attr->atttypid;
 								val = SPI_getbinval(tuple, SPI_tuptable->tupdesc, fnumber + 1, &isnull);
 								if (!isnull)

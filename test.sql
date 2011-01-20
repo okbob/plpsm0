@@ -497,7 +497,6 @@ begin
 end;
 $$ language psm0;
 
-/*
 create or replace function test36(t text)
 returns int as $$
 begin
@@ -517,7 +516,25 @@ begin
 end;
 $$ language psm0;
 
-*/
+create or replace function test36_01(t text)
+returns int as $$
+begin
+  declare s int default 0;
+  declare par int default 3;
+  declare sqlcode int;
+  declare aux int;
+  declare c cursor for xx;
+  prepare xx from 'select * from ' || quote_ident(t) || ' where a <> $1';
+  open c using par;
+  fetch c into aux;
+  while sqlcode = 0 do
+    set s = s + aux;
+    fetch c into aux;
+  end while;
+  return s;
+end;
+$$ language psm0;
+
 /*
 
 
@@ -634,6 +651,9 @@ begin
 end;
 $$ language plpgsql;
 
+select * from footab;
+select * from footab2;
+
 create or replace function test()
 returns void as $$
 begin
@@ -697,6 +717,9 @@ begin
   perform assert('test34',  0, test34());
   perform assert('test35', 30, test35(10,20));
   perform assert('test35', 40, test35(0, (20,30)));
+  perform assert('test36',  3, test36('footab'));
+  perform assert('test36_01', 7, test36_01('footab'));
+
 
   raise notice '******* All tests are ok *******';
 end;

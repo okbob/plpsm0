@@ -807,6 +807,11 @@ list(Plpsm_pcode_module *m)
 											VALUE(cursor.addr),
 											VALUE(cursor.name));
 				break;
+			case PCODE_CURSOR_OPEN_DYNAMIC:
+				appendStringInfo(&ds, "OpenCursor @%d, ^%d name:%s", VALUE(cursor.offset),
+											VALUE(cursor.addr),
+											VALUE(cursor.name));
+				break;
 			case PCODE_CURSOR_CLOSE:
 				appendStringInfo(&ds, "CloseCursor @%d, ^%d name:%s", VALUE(cursor.offset), 
 											VALUE(cursor.addr),
@@ -913,15 +918,27 @@ check_module_size(Plpsm_pcode_module *m)
 					} while (0)
 #define PARAMBUILDER(o,d)		do { \
 						SET_OPVAL(parambuilder.data, d); \
-						SET_OPVAL(parambuilder.op, o); \
+						SET_OPVAL(parambuilder.op, PLPSM_PARAMBUILDER_ ## o); \
 						EMIT_OPCODE(PCODE_PARAMBUILDER); \
 					} while (0)
 #define PARAMBUILDER1(o,d, p,v)		do { \
 						SET_OPVAL(parambuilder.data, d); \
-						SET_OPVAL(parambuilder.op, o); \
+						SET_OPVAL(parambuilder.op, PLPSM_PARAMBUILDER_ ## o); \
 						SET_OPVAL(parambuilder.p, v); \
 						EMIT_OPCODE(PCODE_PARAMBUILDER); \
 					} while (0)
+#define STRBUILDER(o,d)		do { \
+						SET_OPVAL(strbuilder.data, d); \
+						SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_ ## o); \
+						EMIT_OPCODE(PCODE_STRBUILDER); \
+					} while (0)
+#define STRBUILDER1(o,d, p,v)		do { \
+						SET_OPVAL(strbuilder.data, d); \
+						SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_ ## o); \
+						SET_OPVAL(strbuilder.p, v); \
+						EMIT_OPCODE(PCODE_STRBUILDER); \
+					} while (0)
+
 
 
 static void
@@ -1273,6 +1290,61 @@ compile_expr(CompileState cstate, char *expr, Oid targetoid, int16 typmod)
 }
 
 /*
+ * emit code necessary for USAGE clause
+ */
+static void
+compile_usage_clause(CompileState cstate, Plpsm_stmt *stmt, int *params)
+{
+	StringInfoData ds;
+	Plpsm_pcode_module *m = cstate->module;
+	int dataidx = cstate->stack.ndata++;
+	int	addr1;
+	ListCell	*l;
+	int	i = 1;
+	Oid	*argtypes;
+	int	nargs;
+	bool		isFirst = true;
+
+	initStringInfo(&ds);
+
+	PARAMBUILDER1(INIT, dataidx, nargs, list_length(stmt->var_list));
+
+	addr1 = PC(m);
+	SET_OPVAL(expr.data, cstate->stack.ndata++);
+	SET_OPVAL(expr.is_multicol, true);
+	EMIT_OPCODE(PCODE_EXEC_EXPR);
+	appendStringInfoString(&ds, "SELECT ");
+
+	foreach (l, stmt->var_list)
+	{
+		Plpsm_object *var;
+		const char *fieldname;
+
+		if (!isFirst)
+			appendStringInfoChar(&ds, ',');
+		else
+			isFirst = false;
+
+		var = resolve_target(cstate, (List *) lfirst(l), &fieldname, stmt->location);
+		if (fieldname == NULL)
+			appendStringInfo(&ds, "$%d", var->offset + 1);
+		else
+			appendStringInfo(&ds, "$%d.%s", var->offset + 1, fieldname);
+
+		PARAMBUILDER1(APPEND, dataidx, fnumber, i++);
+	}
+
+	nargs = cstate->stack.ndatums;
+	argtypes = palloc(nargs * sizeof(Oid));
+	memcpy(argtypes, cstate->stack.oids.data, nargs * sizeof(Oid));
+
+	SET_OPVAL_ADDR(addr1, expr.expr, ds.data);
+	SET_OPVAL_ADDR(addr1, expr.nparams, nargs);
+	SET_OPVAL_ADDR(addr1, expr.typoids, argtypes);
+	*params = dataidx;
+}
+
+/*
  * diff from plpgsql 
  *
  * SQL/PSM is compilable language - so it checking a all SQL and expression
@@ -1402,6 +1474,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						int	nargs;
 
 						var->cursor.data_addr = PC(m);
+						var->cursor.is_dynamic = false;
 
 						SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->query), &argtypes, &nargs));
 						SET_OPVAL(expr.nparams, nargs);
@@ -1411,20 +1484,52 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 						EMIT_OPCODE(PCODE_DATA_QUERY);
 					}
+					else
+					{
+						Assert(stmt->name != NULL);
+
+						var->cursor.data_addr = fetchPrepared(cstate, stmt->name);
+						var->cursor.is_dynamic = true;
+						var->cursor.prepname = stmt->name;
+					}
 				}
 				break;
 
 			case PLPSM_STMT_OPEN:
 				{
 					const char *fieldname;
+					int	params = -1;
 
-					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
-					if (obj->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
-						elog(ERROR, "variable \"%s\" isn't cursor", obj->name);
-					SET_OPVAL(cursor.addr, obj->cursor.data_addr);
-					SET_OPVAL(cursor.offset, obj->cursor.offset);
-					SET_OPVAL(cursor.name, obj->name);
-					EMIT_OPCODE(PCODE_CURSOR_OPEN);
+					var = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
+					if (var->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
+						elog(ERROR, "variable \"%s\" isn't cursor", var->name);
+
+					if (stmt->var_list != NIL)
+					{
+						if (!var->cursor.is_dynamic)
+							elog(ERROR, "using a USAGE clause in static cursor \"%s\"", 
+														var->name);
+						compile_usage_clause(cstate, stmt, &params);
+					}
+
+					if (!var->cursor.is_dynamic)
+					{
+						SET_OPVAL(cursor.addr, var->cursor.data_addr);
+						SET_OPVAL(cursor.offset, var->cursor.offset);
+						SET_OPVAL(cursor.name, var->name);
+						EMIT_OPCODE(PCODE_CURSOR_OPEN);
+					}
+					else
+					{
+						SET_OPVAL(cursor.addr, var->cursor.data_addr);
+						SET_OPVAL(cursor.offset, var->cursor.offset);
+						SET_OPVAL(cursor.name, var->name);
+						SET_OPVAL(cursor.params, params);
+						SET_OPVAL(cursor.prepname, var->cursor.prepname);
+						EMIT_OPCODE(PCODE_CURSOR_OPEN_DYNAMIC);
+						if (params != -1)
+							PARAMBUILDER(FREE, params);
+					}
 				}
 				break;
 
@@ -1569,9 +1674,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 						initStringInfo(&ds);
 
-						SET_OPVAL(strbuilder.data, dataidx);
-						SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_INIT);
-						EMIT_OPCODE(PCODE_STRBUILDER);
+						STRBUILDER(INIT, dataidx);
 
 						addr1 = PC(m);
 						SET_OPVAL(expr.data, cstate->stack.ndata++);
@@ -1584,18 +1687,12 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 							if (!isfirst)
 							{
 								appendStringInfoChar(&ds, ',');
-								SET_OPVAL(strbuilder.data, dataidx);
-								SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_APPEND_CHAR);
-								SET_OPVAL(strbuilder.chr, ' ');
-								EMIT_OPCODE(PCODE_STRBUILDER);
+								STRBUILDER1(APPEND_CHAR, dataidx, chr, ' ');
 							}
 							else
 								isfirst = false;
 
-							SET_OPVAL(strbuilder.data, dataidx);
-							SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_APPEND_FIELD);
-							SET_OPVAL(strbuilder.fnumber, i++);
-							EMIT_OPCODE(PCODE_STRBUILDER);
+							STRBUILDER1(APPEND_FIELD, dataidx, fnumber, i++);
 
 							appendStringInfo(&ds, "(%s)::text", strVal(lfirst(l)));
 						}
@@ -1603,10 +1700,8 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						SET_OPVAL_ADDR(addr1, expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs));
 						SET_OPVAL_ADDR(addr1, expr.nparams, nargs);
 						SET_OPVAL_ADDR(addr1, expr.typoids, argtypes);
-					
-						SET_OPVAL(strbuilder.data, dataidx);
-						SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_PRINT_FREE);
-						EMIT_OPCODE(PCODE_STRBUILDER);
+
+						STRBUILDER(PRINT_FREE, dataidx);
 					}
 					else
 					{
@@ -1682,63 +1777,22 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 			case PLPSM_STMT_EXECUTE:
 				{
+					int dataidx = -1;
+				
 					if (stmt->var_list != NIL)
 					{
-						Oid	*argtypes;
-						int	nargs;
-						StringInfoData ds;
-						ListCell *l;
-						int		i = 1;
-						bool	isFirst = true;
-						int dataidx = cstate->stack.ndata++;
-
-						initStringInfo(&ds);
-
-						PARAMBUILDER1(PLPSM_PARAMBUILDER_INIT, dataidx, nargs, list_length(stmt->var_list));
-
-						addr1 = PC(m);
-						SET_OPVAL(expr.data, cstate->stack.ndata++);
-						SET_OPVAL(expr.is_multicol, true);
-						EMIT_OPCODE(PCODE_EXEC_EXPR);
-						appendStringInfoString(&ds, "SELECT ");
-
-						foreach (l, stmt->var_list)
-						{
-							Plpsm_object *var;
-							const char *fieldname;
-						
-							if (!isFirst)
-								appendStringInfoChar(&ds, ',');
-							else
-								isFirst = false;
-
-							var = resolve_target(cstate, (List *) lfirst(l), &fieldname, stmt->location);
-							if (fieldname == NULL)
-								appendStringInfo(&ds, "$%d", var->offset + 1);
-							else
-								appendStringInfo(&ds, "$%d.%s", var->offset + 1, fieldname);
-
-							PARAMBUILDER1(PLPSM_PARAMBUILDER_APPEND, dataidx, fnumber, i++);
-						}
-
-						SET_OPVAL_ADDR(addr1, expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs));
-						SET_OPVAL_ADDR(addr1, expr.nparams, nargs);
-						SET_OPVAL_ADDR(addr1, expr.typoids, argtypes);
-
-						SET_OPVAL(execute.name, stmt->name);
+						compile_usage_clause(cstate, stmt, &dataidx);
 						SET_OPVAL(execute.params, dataidx);
-						SET_OPVAL(execute.sqlstr, fetchPrepared(cstate, stmt->name));
-						EMIT_OPCODE(PCODE_EXECUTE);
-
-						PARAMBUILDER(PLPSM_PARAMBUILDER_FREE, dataidx);
 					}
 					else
-					{
-						SET_OPVAL(execute.name, stmt->name);
 						SET_OPVAL(execute.params, -1);
-						SET_OPVAL(execute.sqlstr, fetchPrepared(cstate,stmt->name));
-						EMIT_OPCODE(PCODE_EXECUTE);
-					}
+
+					SET_OPVAL(execute.name, stmt->name);
+					SET_OPVAL(execute.sqlstr, fetchPrepared(cstate, stmt->name));
+					EMIT_OPCODE(PCODE_EXECUTE);
+
+					if (dataidx != -1)
+						PARAMBUILDER(FREE, dataidx);
 
 					if (stmt->compound_target != NIL)
 					{

@@ -90,7 +90,11 @@ typedef struct Plpsm_stmt
 	int	option;
 	char	*query;
 	char	*expr;
-	List		*expr_list;
+	union
+	{
+		List		*expr_list;
+		List		*var_list;
+	};
 	char			*debug;
 	struct Plpsm_stmt *next;
 	struct Plpsm_stmt *last;
@@ -116,6 +120,8 @@ typedef struct Plpsm_object
 		{
 			int	data_addr;
 			int16	offset;
+			bool	is_dynamic;
+			char *prepname;
 		} cursor;
 		int16		offset;
 	};
@@ -151,11 +157,16 @@ typedef enum
 	PCODE_SIGNAL_NODATA,
 	PCODE_DATA_QUERY,
 	PCODE_CURSOR_OPEN,
+	PCODE_CURSOR_OPEN_DYNAMIC,
 	PCODE_CURSOR_CLOSE,
 	PCODE_CURSOR_RELEASE,
 	PCODE_SQLSTATE_REFRESH,
 	PCODE_SQLCODE_REFRESH,
-	PCODE_STRBUILDER
+	PCODE_STRBUILDER,
+	PCODE_CHECK_DATA,
+	PCODE_EXECUTE_IMMEDIATE,
+	PCODE_PREPARE,
+	PCODE_PARAMBUILDER
 } Plpsm_pcode_type;
 
 typedef enum
@@ -164,8 +175,16 @@ typedef enum
 	PLPSM_STRBUILDER_APPEND_CHAR,
 	PLPSM_STRBUILDER_APPEND_RESULT,
 	PLPSM_STRBUILDER_APPEND_FIELD,
-	PLPSM_STRBUILDER_PRINT_FREE
+	PLPSM_STRBUILDER_PRINT_FREE,
+	PLPSM_STRBUILDER_FREE
 } Plpsm_strbuilder_op_type;
+
+typedef enum
+{
+	PLPSM_PARAMBUILDER_INIT,
+	PLPSM_PARAMBUILDER_APPEND,
+	PLPSM_PARAMBUILDER_FREE
+} Plpsm_parambuilder_op_type;
 
 typedef struct
 {
@@ -184,9 +203,9 @@ typedef struct
 		} expr;
 		struct
 		{
-			char *expr;
 			char *name;
-		} prep;
+			int	data;
+		} prepare;
 		struct
 		{
 			int16	typlen;
@@ -204,7 +223,9 @@ typedef struct
 		{
 			int	addr;
 			int	offset;
+			int	params;
 			char *name;
+			char *prepname;
 		} cursor;
 		struct 
 		{
@@ -240,9 +261,27 @@ typedef struct
 			{
 				char	chr;
 				int16	fnumber;
+				char	*str;
 			};
 		} strbuilder;
+		struct
+		{
+			int	params;
+			int	sqlstr;
+			char *name;
+		} execute;
+		struct
+		{
+			int	data;
+			Plpsm_parambuilder_op_type op;
+			union
+			{
+				int	nargs;
+				int	fnumber;
+			};
+		} parambuilder;
 		int	size;
+		int16	ncolumns;
 	};
 } Plpsm_pcode;
 
