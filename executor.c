@@ -23,7 +23,7 @@ plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
 	Datum	*values = NULL;
 	char	*nulls = NULL;
 	void	**DataPtrs = NULL;
-	int		PC = 0;
+	int		PC = 1;
 	int		SP = 0;
 	bool			clean_result = false;
 	Datum		result = (Datum) 0;
@@ -79,7 +79,20 @@ next_op:
 				CallStack[SP++] = PC + 1;
 				PC = pcode->addr;
 				goto next_op;
-				
+
+			case PCODE_CALL_NOT_FOUND:
+				{
+					if (SPI_processed == 0)
+					{
+						if (SP == 1024)
+							elog(ERROR, "runtime error, stack is full");
+						CallStack[SP++] = PC + 1;
+						PC = pcode->addr;
+						goto next_op;
+					}
+				}
+				break;
+
 			case PCODE_RET_SUBR:
 				if (SP < 1)
 					elog(ERROR, "broken stack");
@@ -158,6 +171,43 @@ next_op:
 					}
 				}
 				break;
+
+			case PCODE_EXEC_QUERY:
+				{
+					int rc;
+					SPIPlanPtr plan = DataPtrs[pcode->expr.data];
+
+					if (clean_result)
+						SPI_freetuptable(SPI_tuptable);
+
+					if (plan == NULL)
+					{
+						plan =  SPI_prepare(pcode->expr.expr, pcode->expr.nparams, pcode->expr.typoids);
+						DataPtrs[pcode->expr.data] = plan;
+						if (plan == NULL)
+							elog(ERROR, "query \"%s\" cannot be prepared", pcode->expr.expr);
+					}
+
+					rc = SPI_execute_plan(plan, values, nulls, false, 2);
+
+					if (rc < 0)
+						elog(ERROR, "SPI_execute failed executing query \"%s\" : %s",
+									pcode->expr.expr, SPI_result_code_string(rc));
+
+					switch (rc)
+					{
+						case SPI_OK_SELECT:
+						case SPI_OK_INSERT_RETURNING:
+						case SPI_OK_DELETE_RETURNING:
+						case SPI_OK_UPDATE_RETURNING:
+							elog(ERROR, "query \"%s\" returns data",
+												pcode->expr.expr);
+					}
+
+					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
+				}
+				break;
+
 			case PCODE_EXECUTE_IMMEDIATE:
 				{
 					char *sqlstr;
@@ -410,6 +460,12 @@ next_op:
 								 errmsg("no data")));
 				}
 				break;
+			case PCODE_SIGNAL_INVALID_CALL:
+				{
+					elog(ERROR, "Call or Jump on addr 0");
+				}
+				break;
+
 			case PCODE_STRBUILDER:
 				{
 					StringInfo ds;
@@ -468,7 +524,6 @@ next_op:
 					switch (pcode->parambuilder.op)
 					{
 						case PLPSM_PARAMBUILDER_INIT:
-						
 							params = palloc(sizeof(Params));
 							params->nargs = pcode->parambuilder.nargs;
 							params->argtypes = palloc(params->nargs * sizeof(Oid));
@@ -575,6 +630,6 @@ leave_process:
 	while ((offset = bms_first_member(acursors)) >= 0)
 		SPI_cursor_close((Portal) DatumGetPointer(values[offset]));
 	bms_free(acursors);
-	
+
 	return (Datum) 0;
 }

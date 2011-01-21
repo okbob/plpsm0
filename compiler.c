@@ -28,7 +28,7 @@ typedef struct
 } SQLHostVar;
 
 typedef struct PreparedStatement
-{
+{							/* prepared statements has own scope inside function */
 	const char *name;
 	int	data;
 	struct PreparedStatement *next;
@@ -49,6 +49,7 @@ typedef struct
 		}			oids;
 		bool	has_sqlstate;			/* true, when sqlstate variable is declared */
 		bool	has_sqlcode;			/* true, when sqlcode variable is declared */
+		bool	has_notfound_continue_handler;	/* true, when in current scope not found continue handler exists */
 		int	ndata;				/* number of data address global		*/
 	}			stack;
 	struct						/* used as data for parsing a SQL expression */
@@ -86,6 +87,10 @@ void plpsm_parser_setup(struct ParseState *pstate, CompileState cstate);
 static Plpsm_object *lookup_var(Plpsm_object *scope, const char *name);
 static void compile_expr(CompileState cstate, char *expr, Oid targetoid, int16 typmod);
 
+/*
+ * Returns a offset of prepared statement, reserves a new offset
+ * when prepered statement with the name isn't registered yet.
+ */
 static int
 fetchPrepared(CompileState cstate, const char *name)
 {
@@ -174,6 +179,13 @@ lookup_object_with_label_in_scope(Plpsm_object *scope, char *name)
 	if (scope == NULL)
 		return NULL;
 
+	/*
+	 * control flow cannot to leave a handler declaration when
+	 * we assemble a condition's handler body.
+	 */
+	if (scope->typ == PLPSM_STMT_DECLARE_HANDLER)
+		return NULL;
+
 	iterator = scope->inner;
 
 	while (iterator != NULL)
@@ -196,6 +208,19 @@ lookup_object_with_label_in_scope(Plpsm_object *scope, char *name)
 
 	/* try to find label in outer scope */
 	return lookup_object_with_label_in_scope(scope->outer, name);
+}
+
+static Plpsm_object *
+create_handler_for(Plpsm_stmt *handler_def, CompileState cstate, int handler_addr)
+{
+	Plpsm_object *handler = new_object_for(handler_def, cstate->current_scope);
+
+	if (handler_def->option != PLPSM_HANDLER_CONTINUE)
+		elog(ERROR, "Only continue not found handler is suported");
+
+	handler->calls.entry_addr = handler_addr;
+	cstate->current_scope = handler;
+	return handler;
 }
 
 /*
@@ -496,6 +521,30 @@ lookup_var(Plpsm_object *scope, const char *name)
 	return lookup_var(scope->outer, name);
 }
 
+/*
+ * lookup a not found continue handler
+ */
+static Plpsm_object *
+lookup_notfound_continue_handler(Plpsm_object *scope)
+{
+	Plpsm_object  *iterator;
+
+	if (scope == NULL)
+		return NULL;
+
+	iterator = scope->inner;
+	
+	while (iterator != NULL)
+	{
+		if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
+			return iterator;
+		iterator = iterator->next;
+	}
+
+	/* return handler in outer scope */
+	return lookup_notfound_continue_handler(scope->outer);
+}
+
 
 /*
  * Assign info about Object reference to state 
@@ -613,13 +662,27 @@ resolve_column_ref(CompileState cstate, ColumnRef *cref)
  * specified field, then fieldname is filled.
  */
 static Plpsm_object *
-resolve_target(CompileState cstate, List *target, const char **fieldname, int location)
+resolve_target(CompileState cstate, List *target, const char **fieldname, int location, int target_type)
 {
 	const char *name1;
 	const char *name2 = NULL;
 	Plpsm_object *var;
+	const char *objectclass;
 
 	*fieldname = NULL;
+
+	switch (target_type)
+	{
+		case PLPSM_STMT_DECLARE_CURSOR:
+			objectclass= "cursor";
+			break;
+		case PLPSM_STMT_DECLARE_VARIABLE:
+			objectclass = "target variable";
+			break;
+		default:
+			objectclass = "unspecified identifier";
+			break;
+	}
 
 	switch (list_length(target))
 	{
@@ -630,7 +693,7 @@ resolve_target(CompileState cstate, List *target, const char **fieldname, int lo
 				name1 = strVal(field1);
 				var = lookup_var(cstate->current_scope, name1);
 				if (var == NULL)
-					elog(ERROR, "a missing target variable \"%s\"", name1);
+					elog(ERROR, "a missing %s \"%s\"", objectclass, name1);
 				return var;
 			}
 		case 2:
@@ -658,7 +721,7 @@ resolve_target(CompileState cstate, List *target, const char **fieldname, int lo
 				{
 					var = lookup_var(cstate->current_scope, name1);
 					if (var == NULL)
-						elog(ERROR, "a missing target variable \"%s\"", name1);
+						elog(ERROR, "a missing %s \"%s\"", objectclass, name1);
 					*fieldname = name2;
 					return var;
 				}
@@ -679,7 +742,7 @@ resolve_target(CompileState cstate, List *target, const char **fieldname, int lo
 
 				var = lookup_qualified_var(cstate->current_scope, name1, name2);
 				if (var == NULL)
-					elog(ERROR, "a missing target variable \"%s\" with label \"%s\"", name2, name1);
+					elog(ERROR, "a missing %s \"%s\" with label \"%s\"", objectclass, name2, name1);
 				*fieldname = name3;
 			}
 	}
@@ -713,7 +776,7 @@ list(Plpsm_pcode_module *m)
 	appendStringInfo(&ds, "   Local data size: %d pointers\n", m->ndata);
 	appendStringInfo(&ds, "   Size: %d instruction(s)\n\n", m->length);
 
-	for (pc = 0; pc < m->length; pc++)
+	for (pc = 1; pc < m->length; pc++)
 	{
 		appendStringInfo(&ds, "%5d", pc);
 		appendStringInfoChar(&ds, '\t');
@@ -732,7 +795,10 @@ list(Plpsm_pcode_module *m)
 				appendStringInfo(&ds, "Jmp_not_found %d", VALUE(addr));
 				break;
 			case PCODE_CALL:
-				appendStringInfo(&ds, "call %d", VALUE(addr));
+				appendStringInfo(&ds, "Call %d", VALUE(addr));
+				break;
+			case PCODE_CALL_NOT_FOUND:
+				appendStringInfo(&ds, "Call_not_found %d", VALUE(addr));
 				break;
 			case PCODE_RETURN:
 				appendStringInfo(&ds, "Return size:%d, byval:%s", VALUE(target.typlen),
@@ -751,6 +817,23 @@ list(Plpsm_pcode_module *m)
 					}
 					
 					appendStringInfo(&ds, "ExecExpr \"%s\",{%s}, data[%d]", VALUE(expr.expr),ds2.data,
+											VALUE(expr.data));
+					pfree(ds2.data);
+				}
+				break;
+			case PCODE_EXEC_QUERY:
+				{
+					StringInfoData ds2;
+					int	i;
+					initStringInfo(&ds2);
+					for (i = 0; i < VALUE(expr.nparams); i++)
+					{
+						if (i > 0)
+							appendStringInfoChar(&ds2, ',');
+						appendStringInfo(&ds2,"%d", VALUE(expr.typoids[i]));
+					}
+					
+					appendStringInfo(&ds, "ExecQuery \"%s\",{%s}, data[%d]", VALUE(expr.expr),ds2.data,
 											VALUE(expr.data));
 					pfree(ds2.data);
 				}
@@ -943,8 +1026,6 @@ check_module_size(Plpsm_pcode_module *m)
 						EMIT_OPCODE(PCODE_STRBUILDER); \
 					} while (0)
 
-
-
 static void
 compile_release_cursors(CompileState cstate)
 {
@@ -1027,13 +1108,28 @@ compile_leave_iterate(CompileState cstate,
 				compile_leave_iterate(cstate, scope->outer, stmt);
 			}
 			break;
+		case PLPSM_STMT_SCHEMA:
+			{
+				/* 
+				 * isn't possible directly leave or iterate schema,
+				 * but schema has still release block and has a parents,
+				 */
+				if (scope->calls.has_release_call)
+				{
+					scope->calls.release_calls = lappend(scope->calls.release_calls, 
+													makeInteger(PC(m)));
+					EMIT_OPCODE(PCODE_CALL);
+				}
+				compile_leave_iterate(cstate, scope->outer, stmt);
+			}
+			break;
 		default:
 			/* do nothing */;
 	}
 }
 
 /*
- * finalize a compilation
+ * finalize a compilation - append implicit RETURN statement
  */
 static void
 compile_done(CompileState cstate)
@@ -1059,15 +1155,22 @@ compile_done(CompileState cstate)
 	}
 }
 
+/*
+ * Ensure correct settings of release calls and leave jmps
+ *
+ * Every compound statement has a release block (active only when execution
+ * is leaving from this block). Before leaving block, a release call should
+ * be done. Next instruction is jump to target address. 
+ *
+ */
 static Plpsm_object *
 release_psm_object(CompileState cstate, Plpsm_object *obj, int release_entry, int leave_entry)
 {
 	Plpsm_pcode_module *m = cstate->module;
+	ListCell	*l;
 
 	if (obj->calls.release_calls)
 	{
-		ListCell	*l;
-
 		Assert(release_entry != 0);
 		foreach(l, obj->calls.release_calls)
 		{
@@ -1077,8 +1180,7 @@ release_psm_object(CompileState cstate, Plpsm_object *obj, int release_entry, in
 
 	if (obj->calls.leave_jmps)
 	{
-		ListCell	*l;
-
+		Assert(leave_entry != 0);
 		foreach(l, obj->calls.leave_jmps)
 		{
 			SET_OPVAL_ADDR(intVal(lfirst(l)), addr, leave_entry);
@@ -1096,6 +1198,9 @@ plpsm_parser_setup(struct ParseState *pstate, CompileState cstate)
 	pstate->p_ref_hook_state = (void *) cstate;
 }
 
+/*
+ * Transform a query string - replace vars's identifiers by placeholders
+ */
 static char *
 replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs, TupleDesc *tupdesc)
 {
@@ -1278,7 +1383,7 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt)
 		Plpsm_object *var;
 		char	*expr;
 
-		var = resolve_target(cstate, (List *) lfirst(l1), &fieldname, stmt->location);
+		var = resolve_target(cstate, (List *) lfirst(l1), &fieldname, stmt->location, PLPSM_STMT_DECLARE_VARIABLE);
 		expr = strVal(lfirst(l2));
 
 		if (!isfirst)
@@ -1354,7 +1459,7 @@ compile_usage_clause(CompileState cstate, Plpsm_stmt *stmt, int *params)
 		else
 			isFirst = false;
 
-		var = resolve_target(cstate, (List *) lfirst(l), &fieldname, stmt->location);
+		var = resolve_target(cstate, (List *) lfirst(l), &fieldname, stmt->location, PLPSM_STMT_DECLARE_VARIABLE);
 		if (fieldname == NULL)
 			appendStringInfo(&ds, "$%d", var->offset + 1);
 		else
@@ -1466,6 +1571,8 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					bool	has_sqlstate = cstate->stack.has_sqlstate;
 					bool	has_sqlcode = cstate->stack.has_sqlcode;
+					bool	has_notfound_continue_handler = cstate->stack.has_notfound_continue_handler;
+
 					Plpsm_stmt *loopvar_stmt = palloc0(sizeof(Plpsm_stmt));
 					Plpsm_stmt *decl_cur = palloc0(sizeof(Plpsm_stmt));
 					Plpsm_object *loopvar_obj;
@@ -1572,6 +1679,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 					cstate->stack.has_sqlstate = has_sqlstate;
 					cstate->stack.has_sqlcode = has_sqlcode;
+					cstate->stack.has_notfound_continue_handler = has_notfound_continue_handler;
 
 					FreeTupleDesc(tupdesc);
 				}
@@ -1581,15 +1689,42 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					bool	has_sqlstate = cstate->stack.has_sqlstate;
 					bool	has_sqlcode = cstate->stack.has_sqlcode;
+					bool	has_notfound_continue_handler = cstate->stack.has_notfound_continue_handler;
 
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					compile(cstate, stmt->inner_left);
 
 					cstate->stack.has_sqlstate = has_sqlstate;
 					cstate->stack.has_sqlcode = has_sqlcode;
+					cstate->stack.has_notfound_continue_handler = has_notfound_continue_handler;
 
 					/* generate release block */
 					finalize_block(cstate, obj);
+				}
+				break;
+
+			case PLPSM_STMT_DECLARE_HANDLER:
+				{
+					/*
+					 * In this moment, only continue not found handlers are supported
+					 */
+					addr1 = PC(m);
+					EMIT_OPCODE(PCODE_JMP);
+					addr2 = PC(m);
+
+					obj = create_handler_for(stmt, cstate, PC(m));
+
+					/* 
+					 * handler object is used as barier against to lookup
+					 * labels outside a handler body.
+					 */
+					cstate->stack.has_notfound_continue_handler = false;
+					compile(cstate, stmt->inner_left);
+					EMIT_OPCODE(PCODE_RET_SUBR);
+					SET_OPVAL_ADDR(addr1, addr, PC(m));
+
+					cstate->stack.has_notfound_continue_handler = true;
+					cstate->current_scope = obj->outer;
 				}
 				break;
 
@@ -1656,7 +1791,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					const char *fieldname;
 					int	params = -1;
 
-					var = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
+					var = resolve_target(cstate, stmt->target,  &fieldname, stmt->location, PLPSM_STMT_DECLARE_CURSOR);
 					if (var->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
 						elog(ERROR, "variable \"%s\" isn't cursor", var->name);
 					if (var->cursor.is_for_stmt_cursor)
@@ -1697,7 +1832,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					ListCell *l;
 					int	i = 1;
 
-					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
+					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location, PLPSM_STMT_DECLARE_CURSOR);
 					if (obj->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
 						elog(ERROR, "variable \"%s\" isn't cursor", obj->name);
 					if (obj->cursor.is_for_stmt_cursor)
@@ -1729,11 +1864,19 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					{
 						Plpsm_object	*var = resolve_target(cstate, (List *) lfirst(l),
 													    &fieldname,
-														stmt->location);
+														stmt->location,
+														    PLPSM_STMT_DECLARE_VARIABLE);
 						SET_OPVALS_DATUM_INFO(saveto_field, var);
 						SET_OPVAL(saveto_field.data, cstate->stack.ndata++);
 						SET_OPVAL(saveto_field.fnumber, i++);
 						EMIT_OPCODE(PCODE_SAVETO_FIELD);
+					}
+
+					if (cstate->stack.has_notfound_continue_handler)
+					{
+						Plpsm_object *notfound_handler = lookup_notfound_continue_handler(cstate->current_scope);
+						SET_OPVAL(addr, notfound_handler->calls.entry_addr);
+						EMIT_OPCODE(PCODE_CALL_NOT_FOUND);
 					}
 				}
 				break;
@@ -1742,7 +1885,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					const char *fieldname;
 
-					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
+					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location, PLPSM_STMT_DECLARE_VARIABLE);
 					if (obj->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
 						elog(ERROR, "variable \"%s\" isn't cursor", obj->name);
 					if (obj->cursor.is_for_stmt_cursor)
@@ -1881,7 +2024,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 					if (stmt->target != NIL)
 					{
-						obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location);
+						obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location, PLPSM_STMT_DECLARE_VARIABLE);
 						compile_expr(cstate, stmt->expr, obj->stmt->datum.typoid, obj->stmt->datum.typmod);
 						SET_OPVALS_DATUM_COPY(target, obj);
 						EMIT_OPCODE(PCODE_SAVETO);
@@ -1939,6 +2082,26 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				}
 				break;
 
+			case PLPSM_STMT_SQL:
+				{
+					Oid	*argtypes;
+					int	nargs;
+				
+					SET_OPVAL(expr.expr, replace_vars(cstate, stmt->query, &argtypes, &nargs, NULL));
+					SET_OPVAL(expr.nparams, nargs);
+					SET_OPVAL(expr.typoids, argtypes);
+					SET_OPVAL(expr.data, cstate->stack.ndata++);
+					EMIT_OPCODE(PCODE_EXEC_QUERY);
+
+					if (cstate->stack.has_notfound_continue_handler)
+					{
+						Plpsm_object *notfound_handler = lookup_notfound_continue_handler(cstate->current_scope);
+						SET_OPVAL(addr, notfound_handler->calls.entry_addr);
+						EMIT_OPCODE(PCODE_CALL_NOT_FOUND);
+					}
+				}
+				break;
+
 			case PLPSM_STMT_EXECUTE:
 				{
 					int dataidx = -1;
@@ -1969,7 +2132,8 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						{
 							Plpsm_object	*var = resolve_target(cstate, (List *) lfirst(l),
 														    &fieldname,
-																stmt->location);
+																stmt->location,
+																    PLPSM_STMT_DECLARE_VARIABLE);
 							SET_OPVALS_DATUM_INFO(saveto_field, var);
 							SET_OPVAL(saveto_field.data, cstate->stack.ndata++);
 							SET_OPVAL(saveto_field.fnumber, i++);
@@ -2050,6 +2214,7 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	cstate.stack.oids.data = (Oid *) palloc(cstate.stack.oids.size * sizeof(Oid));
 	cstate.stack.has_sqlstate = false;
 	cstate.stack.has_sqlcode = false;
+	cstate.stack.has_notfound_continue_handler = false;
 	cstate.prepared = NULL;
 
 	cstate.finfo.result.datum.typoid = procStruct->prorettype;
@@ -2067,6 +2232,9 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	cstate.finfo.nargs = numargs;
 	cstate.finfo.name = pstrdup(NameStr(procStruct->proname));
 	m->name = cstate.finfo.name;
+
+	/* address 0 is reserved */
+	EMIT_OPCODE(PCODE_SIGNAL_INVALID_CALL);
 
 	for (i = 0; i < numargs; i++)
 	{

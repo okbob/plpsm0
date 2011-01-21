@@ -612,24 +612,75 @@ x1:for select * from footab do
 end;
 $$ language psm0;
 
-create table footab2(a int)
-insert into footab2 values(1),(2),(3);
+create or replace function test37_06()
+returns int as $$
+begin
+    declare s int;
+    set s = 0;
+x1: begin
+  x2: for select * from footab do
+        set s = s + a;
+        if s > 5 then
+          leave x1;
+        end if;
+      end for x2;
+      set s = s + 10;
+    end;
+    return s;
+end;
+$$ language psm0;
 
-create or replace function test25()
+create or replace function test37_07()
+returns int as $$
+begin
+    declare s int;
+    set s = 0;
+x1: begin
+  x2: for select * from footab  where a = 100 do
+        set s = s + a;
+        if s > 5 then
+          leave x1;
+        end if;
+      end for x2;
+      set s = s + 10;
+    end;
+    return s;
+end;
+$$ language psm0;
+
+create or replace function test38()
+returns int as $$
+begin
+  declare aux int;
+  declare s int default 0;
+  declare done boolean default false;
+  declare c1 cursor for select a from footab;
+  declare continue handler for not found set done = true;
+  open c1;
+  fetch c1 into aux;
+  while not done do
+    set s = s + aux;
+    fetch c1 into aux;
+  end while;
+  return s;
+end;
+$$ language psm0;
+
+create or replace function test39()
 returns int as $$
 x1:begin
      declare a int;
      declare s int default 0;
-     declare done boolean = false;
-     declare c1 cursor for select a from footab;
+     declare done boolean default false;
+     declare c1 cursor for select f.a from footab f order by 1;
      declare continue handler for not found set done = true;
      open c1;
-     fetch c1 into aux;
+     fetch c1 into a;
      while not done do
        begin
          declare a int;
-         declare done boolean = false;
-         declare c2 cursor for select a from footab2;
+         declare done boolean default false;
+         declare c2 cursor for select f.a from footab2 f order by 1;
          declare continue handler for not found set done = true;
          open c2;
          fetch c2 into a;
@@ -642,17 +693,16 @@ x1:begin
      end while;
      return s;
    end;
-end
 $$ language psm0;
 
-create or replace function test26()
+create or replace function test40()
 returns int as $$
 begin
   declare a1, a2 int;
-  declare s int default = 0;
-  declare done boolean = false;
-  declare c1 cursor for select a from footab;
-  declare c2 cursor for select a from footab2;
+  declare s int default 0;
+  declare done boolean default false;
+  declare c1 cursor for select f.a from footab f order by 1;
+  declare c2 cursor for select f.a from footab2 f order by 1;
   declare continue handler for not found set done = true;
   open c1;
   fetch c1 into a1;
@@ -670,6 +720,122 @@ begin
   return s;
 end;
 $$ language psm0;
+
+create or replace function test41()
+returns int as $$
+begin
+  declare aux int;
+  declare s int default 0;
+  declare done boolean default false;
+  declare c1 cursor for select a from footab;
+  declare continue handler
+     for not found
+     begin
+       while s < 100 do
+         set s = s + 1;
+       end while;
+       set done = true;
+     end;
+  open c1;
+  fetch c1 into aux;
+  while not done do
+    set s = s + aux;
+    fetch c1 into aux;
+  end while;
+  return s;
+end;
+$$ language psm0;
+
+create or replace function test42()
+returns int as $$
+begin
+  declare aux int;
+  declare s int default 0;
+  declare done boolean default false;
+  declare c1 cursor for select a from footab;
+  declare continue handler
+     for not found
+     begin
+     x1:while s < 100 do
+          set s = s + 1;
+            if s > 90 then
+              leave x1;
+            end if;
+        end while x1;
+        set done = true;
+     end;
+  open c1;
+  fetch c1 into aux;
+  while not done do
+    set s = s + aux;
+    fetch c1 into aux;
+  end while;
+  return s;
+end;
+$$ language psm0;
+
+create or replace function test43()
+returns int as $$
+begin
+  declare aux int;
+  declare s int default 0;
+  declare done boolean default false;
+  declare c1 cursor for select a from footab;
+  declare continue handler
+     for not found
+     begin
+     x1:while s < 100 do
+          set s = s + 1;
+            if s > 90 then
+              leave x1;
+            end if;
+        end while x1;
+        set done = true;
+     end;
+  open c1;
+  fetch c1 into aux;
+  while not done do
+    set s = s + aux;
+    fetch c1 into aux;
+  end while;
+  set s = s + 10;
+  return s;
+end;
+$$ language psm0;
+
+create or replace function test44()
+returns int as $$
+begin
+  declare aux int;
+  declare s int default 0;
+  declare done boolean default false;
+  declare c1 cursor for select a from footab;
+  declare continue handler for not found return s;
+  open c1;
+  fetch c1 into aux;
+  while not done do
+    set s = s + aux;
+    fetch c1 into aux;
+  end while;
+  set s = s + 33;
+  return s;
+end;
+$$ language psm0;
+
+create or replace function test50(p int)
+returns int as $$
+begin
+  declare s int default 0;
+  delete from footab;
+  insert into footab values(p),(p);
+  update footab set a = p + 10;
+  for select a from footab do
+    set s = s + a;
+  end for;
+  return s;
+end;
+$$ language psm0;
+
 
 -- using a subselect in assign statement newer raise a handler
 create or replace function test29()
@@ -798,6 +964,16 @@ begin
   perform assert('test37_03',  6, test37_03());
   perform assert('test37_04',  6, test37_04());
   perform assert('test37_05', 10, test37_05());
+  perform assert('test37_06',  6, test37_06());
+  perform assert('test37_07', 10, test37_07());
+  perform assert('test38', 10, test38());
+  perform assert('test39', 60, test39());
+  perform assert('test40', 60, test40());
+  perform assert('test41',100, test41());
+  perform assert('test42', 91, test42());
+  perform assert('test43',101, test43());
+  perform assert('test44', 10, test44());
+  perform assert('test50', 26, test50(3));
 
   raise notice '******* All tests are ok *******';
 end;

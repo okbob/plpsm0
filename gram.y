@@ -50,6 +50,8 @@ static const char *parser_stmt_name(Plpsm_stmt_type typ);
 static void stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level);
 static void elog_stmt(int level, Plpsm_stmt *stmt);
 
+static Plpsm_stmt *make_stmt_sql(const char *prefix, int location);
+
 #define ENABLE_DEBUG_ATTR
 
 #ifdef ENABLE_DEBUG_ATTR
@@ -116,6 +118,7 @@ static void elog_stmt(int level, Plpsm_stmt *stmt);
 %type <stmt>	stmt_open stmt_fetch stmt_close stmt_for for_prefetch
 %type <stmt>	stmt_case case_when_list case_when opt_case_else
 %type <str>	opt_expr_until_when expr_until_semi_or_coma_or_parent
+%type <stmt>	stmt_sql
 
 /*
  * Basic non-keyword token types.  These are hard-wired into the core lexer.
@@ -182,6 +185,10 @@ static void elog_stmt(int level, Plpsm_stmt *stmt);
 %token <keyword>	VALUE
 %token <keyword>	WHEN
 %token <keyword>	WHILE
+
+%token <keyword>	INSERT
+%token <keyword>	UPDATE
+%token <keyword>	DELETE
 
 %%
 
@@ -254,6 +261,7 @@ stmt:
 			| stmt_for				{ $$ = $1; }
 			| stmt_if				{ $$ = $1; }
 			| stmt_case				{ $$ = $1; }
+			| stmt_sql				{ $$ = $1; }
 		;
 
 /*----
@@ -1017,6 +1025,12 @@ for_prefetch:
 				}
 		;
 
+stmt_sql:
+			INSERT 				{ $$ = make_stmt_sql("INSERT", @1); }
+			| UPDATE 			{ $$ = make_stmt_sql("UPDATE", @1); }
+			| DELETE			{ $$ = make_stmt_sql("DELETE", @1); }
+			;
+
 expr_until_semi:
 				{
 					$$ = read_expr_until_semi();
@@ -1126,6 +1140,21 @@ expr_until_semi_or_coma_or_parent:
 		;
 
 %%
+
+static Plpsm_stmt *
+make_stmt_sql(const char *prefix, int location)
+{
+	StringInfoData ds;
+	char *expr;
+	Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SQL, location);
+
+	initStringInfo(&ds);
+	expr = read_until(';', 0, 0, ";", false, false, NULL, -1);
+	appendStringInfo(&ds, "%s %s", prefix, expr);
+	pfree(expr);
+	new->query = ds.data;
+	return new;
+}
 
 static char 
 *read_expr_until_semi(void)
@@ -1686,4 +1715,3 @@ elog_stmt(int level, Plpsm_stmt *stmt)
 	elog(level, "Parser stage result:\n%s", ds.data);
 	pfree(ds.data);
 }
-
