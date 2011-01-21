@@ -6,6 +6,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 
 typedef struct
 {
@@ -33,6 +34,18 @@ plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
 	Bitmapset	*acursors = NULL;		/* active cursors */
 	int	offset;
 	int	rc;
+
+	MemoryContext	exec_ctx;
+	MemoryContext	oldctx;
+
+	/*
+	 * The temp context is a child of current context
+	 */
+	exec_ctx = AllocSetContextCreate(CurrentMemoryContext,
+										   "plpsm execution context",
+										   ALLOCSET_DEFAULT_MINSIZE,
+										   ALLOCSET_DEFAULT_INITSIZE,
+										   ALLOCSET_DEFAULT_MAXSIZE);
 
 	if (module->ndatums)
 	{
@@ -132,7 +145,11 @@ next_op:
 					SPIPlanPtr plan = DataPtrs[pcode->expr.data];
 
 					if (clean_result)
+					{
 						SPI_freetuptable(SPI_tuptable);
+						MemoryContextReset(exec_ctx);
+						clean_result = false;
+					}
 
 					if (plan == NULL)
 					{
@@ -142,7 +159,10 @@ next_op:
 							elog(ERROR, "query \"%s\" cannot be prepared", pcode->expr.expr);
 					}
 
+					oldctx = MemoryContextSwitchTo(exec_ctx);
 					rc = SPI_execute_plan(plan, values, nulls, false, 2);
+					MemoryContextSwitchTo(oldctx);
+
 
 					if (rc != SPI_OK_SELECT)
 						elog(ERROR, "SPI_execute failed executing query \"%s\" : %s",
@@ -178,7 +198,10 @@ next_op:
 					SPIPlanPtr plan = DataPtrs[pcode->expr.data];
 
 					if (clean_result)
+					{
 						SPI_freetuptable(SPI_tuptable);
+						MemoryContextReset(exec_ctx);
+					}
 
 					if (plan == NULL)
 					{
@@ -188,11 +211,15 @@ next_op:
 							elog(ERROR, "query \"%s\" cannot be prepared", pcode->expr.expr);
 					}
 
+					oldctx = MemoryContextSwitchTo(exec_ctx);
 					rc = SPI_execute_plan(plan, values, nulls, false, 2);
+					MemoryContextSwitchTo(oldctx);
 
 					if (rc < 0)
 						elog(ERROR, "SPI_execute failed executing query \"%s\" : %s",
 									pcode->expr.expr, SPI_result_code_string(rc));
+
+					clean_result = true;
 
 					switch (rc)
 					{
@@ -214,6 +241,9 @@ next_op:
 					int		rc;
 
 					sqlstr = text_to_cstring(DatumGetTextP(result));
+					SPI_freetuptable(SPI_tuptable);
+					MemoryContextReset(exec_ctx);
+
 					rc = SPI_execute(sqlstr, false, 0);
 
 					if (rc < 0)
@@ -229,6 +259,8 @@ next_op:
 												sqlstr);
 					}
 					pfree(sqlstr);
+					SPI_freetuptable(SPI_tuptable);
+					clean_result = false;
 				}
 				break;
 			case PCODE_PREPARE:
@@ -251,7 +283,12 @@ next_op:
 				if (isnull)
 					elog(NOTICE, "NULL");
 				else
-					elog(NOTICE, "%s", text_to_cstring(DatumGetTextP(result)));
+				{
+					char *str = text_to_cstring(DatumGetTextP(result));
+					
+					elog(NOTICE, "%s", str);
+					pfree(str);
+				}
 				break;
 			case PCODE_DEBUG:
 			case PCODE_NOOP:
@@ -373,11 +410,21 @@ next_op:
 				{
 					if (nulls[pcode->fetch.offset] != ' ')
 						elog(ERROR, "cursor \"%s\" isn't open", pcode->fetch.name);
+
+					if (clean_result)
+					{
+						SPI_freetuptable(SPI_tuptable);
+						MemoryContextReset(exec_ctx);
+						clean_result = false;
+					}
+
+					oldctx = MemoryContextSwitchTo(exec_ctx);
 					SPI_cursor_fetch((Portal) DatumGetPointer(values[pcode->fetch.offset]), true, pcode->fetch.count);
+					MemoryContextSwitchTo(oldctx);
+
 					if (SPI_tuptable->tupdesc->natts != pcode->fetch.nvars)
 						elog(ERROR, "too few or too much variables");
-					if (SPI_processed > 0)
-						clean_result = true;
+					clean_result = true;
 
 					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
 				}

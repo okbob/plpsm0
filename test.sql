@@ -535,14 +535,26 @@ begin
 end;
 $$ language psm0;
 
-/*
- * NOT_FOUND event of FOR stmt isn't possible handled by custom
- * condition handlers!
- */
 create or replace function test37()
 returns int as $$
 begin
   declare s int default 0;
+  for ft as c1 cursor for select * from footab do
+    set s = s + ft.a;
+  end for;
+  return s;
+end;
+$$ language psm0;
+
+/*
+ * NOT_FOUND event of FOR stmt isn't possible handled by custom
+ * condition handlers!
+ */
+create or replace function test37_00()
+returns int as $$
+begin
+  declare s int default 0;
+  declare continue handler for not found return -1;
   for ft as c1 cursor for select * from footab do
     set s = s + ft.a;
   end for;
@@ -664,6 +676,27 @@ begin
   end while;
   return s;
 end;
+$$ language psm0;
+
+create or replace function test38_01()
+returns int as $$
+ begin
+   declare aux int;
+   declare s int default 0;
+   declare done boolean;
+   declare c cursor for select * from footab;
+   declare continue handler for not found set done = true;
+   open c;
+x1:loop
+     fetch c into aux;
+     if done then
+       close c;
+       leave x1;
+     end if;
+     set s = s + aux;
+   end loop;
+   return s;
+ end;
 $$ language psm0;
 
 create or replace function test39()
@@ -959,6 +992,7 @@ begin
   perform assert('test36',  3, test36('footab'));
   perform assert('test36_01', 7, test36_01('footab'));
   perform assert('test37', 10, test37());
+  perform assert('test37_00', 10, test37_00());
   perform assert('test37_01', 10, test37_01());
   perform assert('test37_02', 10, test37_02());
   perform assert('test37_03',  6, test37_03());
@@ -967,6 +1001,7 @@ begin
   perform assert('test37_06',  6, test37_06());
   perform assert('test37_07', 10, test37_07());
   perform assert('test38', 10, test38());
+  perform assert('test38_01', 10, test38_01());
   perform assert('test39', 60, test39());
   perform assert('test40', 60, test40());
   perform assert('test41',100, test41());
