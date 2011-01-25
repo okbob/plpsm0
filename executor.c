@@ -52,6 +52,7 @@ plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
 		values = palloc(module->ndatums * sizeof(Datum));
 		nulls = palloc(module->ndatums * sizeof(char));
 	}
+
 	if (module->ndata >= 1)
 	{
 		DataPtrs = palloc0((module->ndata + 1) * sizeof(void*) );
@@ -61,6 +62,9 @@ plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
 	{
 		Plpsm_pcode *pcode;
 next_op:
+
+		if (PC == 0)
+			elog(ERROR, "invalid memory reference");
 
 		pcode = &module->code[PC];
 		switch (pcode->typ)
@@ -72,8 +76,8 @@ next_op:
 						PC = pcode->addr;
 						goto next_op;
 					}
-					break;
 				}
+				break;
 
 			case PCODE_JMP:
 				PC = pcode->addr;
@@ -86,6 +90,7 @@ next_op:
 					goto next_op;
 				}
 				break;
+
 			case PCODE_CALL:
 				if (SP == 1024)
 					elog(ERROR, "runtime error, stack is full");
@@ -113,7 +118,7 @@ next_op:
 				if (PC == 0)
 					elog(ERROR, "broken stack");
 				goto next_op;
-				
+
 			case PCODE_RETURN:
 				{
 					/*
@@ -139,6 +144,7 @@ next_op:
 					fcinfo->isnull = isnull;
 					return (Datum) result;
 				}
+
 			case PCODE_EXEC_EXPR:
 				{
 					int rc;
@@ -173,6 +179,8 @@ next_op:
 					if (SPI_tuptable->tupdesc->natts != 1 && !pcode->expr.is_multicol)
 						elog(ERROR, "query returned %d column", 
 										SPI_tuptable->tupdesc->natts);
+
+					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
 
 					if (SPI_processed == 0)
 					{
@@ -258,11 +266,14 @@ next_op:
 							elog(ERROR, "query \"%s\" returns data",
 												sqlstr);
 					}
+					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
+
 					pfree(sqlstr);
 					SPI_freetuptable(SPI_tuptable);
 					clean_result = false;
 				}
 				break;
+
 			case PCODE_PREPARE:
 				{
 					/*
@@ -279,6 +290,7 @@ next_op:
 					DataPtrs[pcode->prepare.data] = text_to_cstring(DatumGetTextP(result));
 				}
 				break;
+
 			case PCODE_PRINT:
 				if (isnull)
 					elog(NOTICE, "NULL");
@@ -290,17 +302,17 @@ next_op:
 					pfree(str);
 				}
 				break;
-			case PCODE_DEBUG:
-			case PCODE_NOOP:
+
 			case PCODE_DONE:
 				goto leave_process;
-			case PCODE_IF_NOTEXIST_PREPARE:
+
 			case PCODE_SET_NULL:
 				{
 					/* in this moment, a variable must be empty, so there will not be pfreed */
 					nulls[pcode->target.offset] = 'n';
-					break;
 				}
+				break;
+
 			case PCODE_SAVETO:
 				{
 					/* release a memory */
@@ -317,8 +329,9 @@ next_op:
 					{
 						nulls[pcode->target.offset] = 'n';
 					}
-					break;
 				}
+				break;
+
 			case PCODE_COPY_PARAM:
 				{
 					/* in this moment a variables must be empty */
@@ -351,12 +364,14 @@ next_op:
 					nulls[pcode->target.offset] = ' ';
 				}
 				break;
+
 			case PCODE_SQLCODE_REFRESH:
 				{
 					values[pcode->target.offset] = Int32GetDatum(sqlstate);
 					nulls[pcode->target.offset] = ' ';
 				}
 				break;
+
 			case PCODE_CURSOR_OPEN:
 				{
 					Portal portal;
@@ -507,11 +522,6 @@ next_op:
 								 errmsg("no data")));
 				}
 				break;
-			case PCODE_SIGNAL_INVALID_CALL:
-				{
-					elog(ERROR, "Call or Jump on addr 0");
-				}
-				break;
 
 			case PCODE_STRBUILDER:
 				{
@@ -564,6 +574,7 @@ next_op:
 					}
 				}
 				break;
+
 			case PCODE_PARAMBUILDER:
 				{
 					Params *params;
@@ -626,6 +637,7 @@ next_op:
 					}
 				}
 				break;
+
 			case PCODE_EXECUTE:
 				{
 					char *sqlstr = DataPtrs[pcode->execute.sqlstr];
@@ -644,21 +656,27 @@ next_op:
 					else
 						rc = SPI_execute(sqlstr, false, 0);
 
+					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
+
 					clean_result = true;
 				}
 				break;
+
 			case PCODE_CHECK_DATA:
 				{
 					if (SPI_processed == 0)
 						elog(ERROR, "Query doesn't return data");
 				}
 				break;
+
 			case PCODE_RETURN_VOID:
 			case PCODE_RETURN_NULL:
 				goto leave_process;
+
 			case PCODE_DATA_QUERY:
 				/* do nothing */
 				break;
+
 			default:
 				elog(ERROR, "unknown pcode %d %d", pcode->typ, PC);
 		}
@@ -667,7 +685,7 @@ next_op:
 	}
 
 	if (PC >= module->length)
-		elog(ERROR, "Segmentation fault");
+		elog(ERROR, "invalid memory reference");
 
 leave_process:
 

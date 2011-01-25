@@ -497,6 +497,15 @@ begin
 end;
 $$ language psm0;
 
+create or replace function test35_01(a int, b int)
+returns footype as $$
+begin
+  declare x footype;
+  select (a, b) into x;
+  return x;
+end;
+$$ language psm0;
+
 create or replace function test36(t text)
 returns int as $$
 begin
@@ -699,6 +708,26 @@ x1:loop
  end;
 $$ language psm0;
 
+create or replace function test38_02()
+returns int as $$
+begin
+  declare aux int;
+  declare s int default 0;
+  declare sqlstate char(5);
+  declare sqlcode int;
+  declare done boolean default false;
+  declare c1 cursor for select a from footab;
+  declare continue handler for not found set done = true;
+  open c1;
+  fetch c1 into aux;
+  while not done and sqlstate = '00000' and sqlcode = 0 do
+    set s = s + aux;
+    fetch c1 into aux;
+  end while;
+  return s;
+end;
+$$ language psm0;
+
 create or replace function test39()
 returns int as $$
 x1:begin
@@ -869,41 +898,106 @@ begin
 end;
 $$ language psm0;
 
+create or replace function test51()
+returns int as $$
+begin
+  declare result int;
+  select a into result from footab order by 1 limit 1;
+  return result;
+end;
+$$ language psm0;
+
+create or replace function test52()
+returns int as $$
+begin
+  declare result int;
+  select 33 into result;
+  return result;
+end;
+$$ language psm0;
+
+create or replace function test53()
+returns int as $$
+begin
+  declare result numeric;
+  select a into result from footab order by 1 limit 1;
+  return result;
+end;
+$$ language psm0;
+
+create or replace function test53_01()
+returns int as $$
+begin
+  declare result numeric;
+  declare _result int;
+  select a,a into result,_result from footab order by 1 limit 1;
+  return result + _result;
+end;
+$$ language psm0;
+
+create or replace function test54()
+returns int as $$
+begin
+  declare sqlcode int;
+  declare result numeric;
+  delete from footab;
+  print sqlcode;
+  select a into result from footab order by 1 limit 1;
+  print sqlcode;
+  if sqlcode <> 0 then
+    return -1;
+  else
+    return +1;
+  end if;
+end;
+$$ language psm0;
 
 -- using a subselect in assign statement newer raise a handler
-create or replace function test29()
-returns int as $$ 
+create or replace function test55()
+returns int as $$
 begin
   declare ret int default 100;
   declare continue handler for not found set ret = -100;
+  delete from footab;
   set ret = (select a from footab limit 1); -- subselect just returns NULL;
   return coalesce(ret, -1);
 end;
 $$ language psm0; --returns -1
 
 -- using a select into raise a handler
-create or replace function test30()
+create or replace function test56()
 returns int as $$
 begin
-  declare ret default 100;
+  declare ret int default 100;
   declare continue handler for not found set ret = -100;
+  delete from footab;
   select a into ret from footab; -- raise error, when query returns more than one row
   return coalesce(ret, -1);
 end;
-$$ language psm0; -- returns -100;
+$$ language psm0; -- returns -100
 
-create or replace function test31()
+create or replace function test56_01()
 returns int as $$
 begin
-  declare ret default 100;
+  declare ret int;
+  declare continue handler for not found return -100;
+  delete from footab;
+  select a into ret from footab; -- raise error, when query returns more than one row
+  return coalesce(ret, -1);
+end;
+$$ language psm0; -- returns -100
+
+create or replace function test57()
+returns int as $$
+begin
+  declare ret int default 100;
   select a into ret from footab;
   return coalesce(ret, -1);
 end;
 $$ language psm0; -- returns -1
 
-
 /*************************************************
- * Assert functions
+ * Assert functions - sure, it is in plgsql :)
  */
 create or replace function assert(text, int, int)
 returns void as $$
@@ -989,6 +1083,7 @@ begin
   perform assert('test34',  0, test34());
   perform assert('test35', 30, test35(10,20));
   perform assert('test35', 40, test35(0, (20,30)));
+  perform assert('test35_01', 10, (test35_01(10,20)).a);
   perform assert('test36',  3, test36('footab'));
   perform assert('test36_01', 7, test36_01('footab'));
   perform assert('test37', 10, test37());
@@ -1002,6 +1097,7 @@ begin
   perform assert('test37_07', 10, test37_07());
   perform assert('test38', 10, test38());
   perform assert('test38_01', 10, test38_01());
+  perform assert('test38_02', 10, test38_02());
   perform assert('test39', 60, test39());
   perform assert('test40', 60, test40());
   perform assert('test41',100, test41());
@@ -1009,11 +1105,19 @@ begin
   perform assert('test43',101, test43());
   perform assert('test44', 10, test44());
   perform assert('test50', 26, test50(3));
+  perform assert('test51', 13, test51());
+  perform assert('test52', 33, test52());
+  perform assert('test53', 13, test53());
+  perform assert('test53_01', 26, test53_01());
+  perform assert('test54', -1, test54());
+  perform assert('test55', -1, test55());
+  perform assert('test56', -100, test56());
+  perform assert('test56_01', -100, test56_01());
+  perform assert('test57', -1, test57());
 
   raise notice '******* All tests are ok *******';
 end;
 $$ language plpgsql;
-
 
 select test();
 

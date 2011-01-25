@@ -780,8 +780,6 @@ list(Plpsm_pcode_module *m)
 	{
 		appendStringInfo(&ds, "%5d", pc);
 		appendStringInfoChar(&ds, '\t');
-		if (VALUE(typ) != PCODE_DEBUG)
-			appendStringInfoChar(&ds, '\t');
 
 		switch (VALUE(typ))
 		{
@@ -857,12 +855,6 @@ list(Plpsm_pcode_module *m)
 				break;
 			case PCODE_PRINT:
 				appendStringInfo(&ds, "Print");
-				break;
-			case PCODE_DEBUG:
-				appendStringInfo(&ds, "/* %s */", VALUE(str));
-				break;
-			case PCODE_NOOP:
-				appendStringInfo(&ds, "Noop");
 				break;
 			case PCODE_DONE:
 				appendStringInfoString(&ds, "Done.");
@@ -1351,7 +1343,7 @@ replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs, Tupl
  * Compile a SET statement in (var,var,..) = (expr, expr, ..) form
  */
 static void
-compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt)
+compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, const char *from_clause)
 {
 	Plpsm_pcode_module *m = cstate->module;
 	int	addr;
@@ -1396,6 +1388,9 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt)
 		SET_OPVAL(saveto_field.fnumber, i++);
 		EMIT_OPCODE(PCODE_SAVETO_FIELD);
 	}
+
+	if (from_clause != NULL)
+		appendStringInfo(&ds, " %s", from_clause);
 
 	SET_OPVAL_ADDR(addr, expr.expr, replace_vars(cstate, ds.data, &locargtypes, &nargs, NULL));
 	SET_OPVAL_ADDR(addr, expr.nparams, nargs);
@@ -1476,6 +1471,39 @@ compile_usage_clause(CompileState cstate, Plpsm_stmt *stmt, int *params)
 	SET_OPVAL_ADDR(addr1, expr.nparams, nargs);
 	SET_OPVAL_ADDR(addr1, expr.typoids, argtypes);
 	*params = dataidx;
+}
+
+/*
+ * emits a code for refreshing a basic diagnostics
+ * sqlstate, sqlcode and possible not found warning.
+ */
+static void
+compile_refresh_basic_diagnostic(CompileState cstate)
+{
+	Plpsm_pcode_module *m = cstate->module;
+
+	if (cstate->stack.has_sqlstate)
+	{
+		Plpsm_object *var = lookup_var(cstate->current_scope, "sqlstate");
+		Assert(var != NULL);
+		SET_OPVALS_DATUM_COPY(target, var);
+		EMIT_OPCODE(PCODE_SQLSTATE_REFRESH);
+	}
+
+	if (cstate->stack.has_sqlcode)
+	{
+		Plpsm_object *var = lookup_var(cstate->current_scope, "sqlcode");
+		Assert(var != NULL);
+		SET_OPVALS_DATUM_COPY(target, var);
+		EMIT_OPCODE(PCODE_SQLCODE_REFRESH);
+	}
+
+	if (cstate->stack.has_notfound_continue_handler)
+	{
+		Plpsm_object *notfound_handler = lookup_notfound_continue_handler(cstate->current_scope);
+		SET_OPVAL(addr, notfound_handler->calls.entry_addr);
+		EMIT_OPCODE(PCODE_CALL_NOT_FOUND);
+	}
 }
 
 /*
@@ -1844,22 +1872,6 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					SET_OPVAL(fetch.count, 1);
 					EMIT_OPCODE(PCODE_CURSOR_FETCH);
 
-					if (cstate->stack.has_sqlstate)
-					{
-						Plpsm_object *var = lookup_var(cstate->current_scope, "sqlstate");
-						Assert(var != NULL);
-						SET_OPVALS_DATUM_COPY(target, var);
-						EMIT_OPCODE(PCODE_SQLSTATE_REFRESH);
-					}
-
-					if (cstate->stack.has_sqlcode)
-					{
-						Plpsm_object *var = lookup_var(cstate->current_scope, "sqlcode");
-						Assert(var != NULL);
-						SET_OPVALS_DATUM_COPY(target, var);
-						EMIT_OPCODE(PCODE_SQLCODE_REFRESH);
-					}
-
 					foreach (l, stmt->compound_target)
 					{
 						Plpsm_object	*var = resolve_target(cstate, (List *) lfirst(l),
@@ -1872,12 +1884,14 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						EMIT_OPCODE(PCODE_SAVETO_FIELD);
 					}
 
-					if (cstate->stack.has_notfound_continue_handler)
-					{
-						Plpsm_object *notfound_handler = lookup_notfound_continue_handler(cstate->current_scope);
-						SET_OPVAL(addr, notfound_handler->calls.entry_addr);
-						EMIT_OPCODE(PCODE_CALL_NOT_FOUND);
-					}
+					compile_refresh_basic_diagnostic(cstate);
+				}
+				break;
+
+			case PLPSM_STMT_SELECT_INTO:
+				{
+					compile_multiset_stmt(cstate, stmt, stmt->from_clause);
+					compile_refresh_basic_diagnostic(cstate);
 				}
 				break;
 
@@ -2032,7 +2046,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					else
 					{
 						Assert(stmt->compound_target != NIL && stmt->expr_list != NIL);
-						compile_multiset_stmt(cstate, stmt);
+						compile_multiset_stmt(cstate, stmt, NULL);
 					}
 				}
 				break;
@@ -2079,6 +2093,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					compile_expr(cstate, stmt->expr, TEXTOID, -1);
 					EMIT_OPCODE(PCODE_EXECUTE_IMMEDIATE);
+					compile_refresh_basic_diagnostic(cstate);
 				}
 				break;
 
@@ -2092,13 +2107,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					SET_OPVAL(expr.typoids, argtypes);
 					SET_OPVAL(expr.data, cstate->stack.ndata++);
 					EMIT_OPCODE(PCODE_EXEC_QUERY);
-
-					if (cstate->stack.has_notfound_continue_handler)
-					{
-						Plpsm_object *notfound_handler = lookup_notfound_continue_handler(cstate->current_scope);
-						SET_OPVAL(addr, notfound_handler->calls.entry_addr);
-						EMIT_OPCODE(PCODE_CALL_NOT_FOUND);
-					}
+					compile_refresh_basic_diagnostic(cstate);
 				}
 				break;
 
@@ -2140,6 +2149,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 							EMIT_OPCODE(PCODE_SAVETO_FIELD);
 						}
 					}
+					compile_refresh_basic_diagnostic(cstate);
 				}
 				break;
 
@@ -2222,6 +2232,7 @@ plpsm_compile(Oid funcOid, bool forValidator)
 
 	m = init_module();
 	cstate.module = m;
+	m->length = 1;
 
 	/* 
 	 * append to scope a variables for parameters, and store 
@@ -2232,9 +2243,6 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	cstate.finfo.nargs = numargs;
 	cstate.finfo.name = pstrdup(NameStr(procStruct->proname));
 	m->name = cstate.finfo.name;
-
-	/* address 0 is reserved */
-	EMIT_OPCODE(PCODE_SIGNAL_INVALID_CALL);
 
 	for (i = 0; i < numargs; i++)
 	{

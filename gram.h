@@ -54,47 +54,54 @@
      CWORD = 270,
      AS = 271,
      BEGIN = 272,
-     CLOSE = 273,
-     CONDITION = 274,
-     CONTINUE = 275,
-     CURSOR = 276,
-     DECLARE = 277,
-     DEFAULT = 278,
-     DO = 279,
-     ELSE = 280,
-     ELSEIF = 281,
-     END = 282,
-     EXECUTE = 283,
-     EXIT = 284,
-     FETCH = 285,
-     FOR = 286,
-     FOUND = 287,
-     FROM = 288,
-     HANDLER = 289,
-     IF = 290,
-     IMMEDIATE = 291,
-     INTO = 292,
-     ITERATE = 293,
-     LEAVE = 294,
-     LOOP = 295,
-     NO = 296,
-     NOT = 297,
-     OPEN = 298,
-     PREPARE = 299,
-     PRINT = 300,
-     REPEAT = 301,
-     RETURN = 302,
-     SCROLL = 303,
-     SET = 304,
-     SQLEXCEPTION = 305,
-     SQLSTATE = 306,
-     SQLWARNING = 307,
-     THEN = 308,
-     UNDO = 309,
-     UNTIL = 310,
-     USING = 311,
-     VALUE = 312,
-     WHILE = 313
+     CASE = 273,
+     CLOSE = 274,
+     CONDITION = 275,
+     CONTINUE = 276,
+     CURSOR = 277,
+     DECLARE = 278,
+     DEFAULT = 279,
+     DO = 280,
+     ELSE = 281,
+     ELSEIF = 282,
+     END = 283,
+     EXECUTE = 284,
+     EXIT = 285,
+     FETCH = 286,
+     FOR = 287,
+     FOUND = 288,
+     FROM = 289,
+     HANDLER = 290,
+     IF = 291,
+     IMMEDIATE = 292,
+     INTO = 293,
+     ITERATE = 294,
+     LEAVE = 295,
+     LOOP = 296,
+     NO = 297,
+     NOT = 298,
+     OPEN = 299,
+     PREPARE = 300,
+     PRINT = 301,
+     REPEAT = 302,
+     RETURN = 303,
+     SCROLL = 304,
+     SELECT = 305,
+     SET = 306,
+     SQLEXCEPTION = 307,
+     SQLSTATE = 308,
+     SQLCODE = 309,
+     SQLWARNING = 310,
+     THEN = 311,
+     UNDO = 312,
+     UNTIL = 313,
+     USING = 314,
+     VALUE = 315,
+     WHEN = 316,
+     WHILE = 317,
+     INSERT = 318,
+     UPDATE = 319,
+     DELETE = 320
    };
 #endif
 
@@ -105,7 +112,7 @@ typedef union YYSTYPE
 {
 
 /* Line 1676 of yacc.c  */
-#line 84 "gram.y"
+#line 89 "gram.y"
 
 		core_YYSTYPE		core_yystype;
 		/* these fields must match core_YYSTYPE */
@@ -123,7 +130,7 @@ typedef union YYSTYPE
 
 
 /* Line 1676 of yacc.c  */
-#line 127 "gram.h"
+#line 134 "gram.h"
 } YYSTYPE;
 # define YYSTYPE_IS_TRIVIAL 1
 # define yystype YYSTYPE /* obsolescent; will be withdrawn */

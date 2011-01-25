@@ -66,7 +66,8 @@ typedef enum
 	PLPSM_STMT_FOR,
 	PLPSM_STMT_IF,
 	PLPSM_STMT_CASE,
-	PLPSM_STMT_SQL
+	PLPSM_STMT_SQL,
+	PLPSM_STMT_SELECT_INTO
 } Plpsm_stmt_type;
 
 typedef struct Plpsm_stmt
@@ -93,6 +94,7 @@ typedef struct Plpsm_stmt
 			char *loopvar_name;
 			char *cursor_name;
 		} stmtfor;
+		char *from_clause;
 	};
 	void			*data;
 	int	option;
@@ -142,7 +144,6 @@ typedef struct Plpsm_object
 
 typedef enum
 {
-	PCODE_NOOP = 0,
 	PCODE_JMP_FALSE_UNKNOWN,
 	PCODE_JMP,
 	PCODE_JMP_NOT_FOUND,
@@ -155,9 +156,7 @@ typedef enum
 	PCODE_EXEC_EXPR,
 	PCODE_EXEC_QUERY,
 	PCODE_PRINT,
-	PCODE_DEBUG,
 	PCODE_DONE,
-	PCODE_IF_NOTEXIST_PREPARE,
 	PCODE_EXECUTE,
 	PCODE_SET_NULL,
 	PCODE_SAVETO,
@@ -166,7 +165,6 @@ typedef enum
 	PCODE_UPDATE_DATUM,
 	PCODE_COPY_PARAM,
 	PCODE_SIGNAL_NODATA,
-	PCODE_SIGNAL_INVALID_CALL,
 	PCODE_DATA_QUERY,
 	PCODE_CURSOR_OPEN,
 	PCODE_CURSOR_OPEN_DYNAMIC,

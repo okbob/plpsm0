@@ -113,12 +113,12 @@ static Plpsm_stmt *make_stmt_sql(const char *prefix, int location);
 %type <str>	expr_until_semi_into_using expr_until_then
 %type <str>	opt_label opt_end_label
 %type <node>	condition sqlstate opt_sqlstate
-%type <list>	condition_list expr_list
+%type <list>	condition_list expr_list expr_list_into
 %type <stmt>	stmt_prepare stmt_execute stmt_execute_immediate
 %type <stmt>	stmt_open stmt_fetch stmt_close stmt_for for_prefetch
 %type <stmt>	stmt_case case_when_list case_when opt_case_else
 %type <str>	opt_expr_until_when expr_until_semi_or_coma_or_parent
-%type <stmt>	stmt_sql
+%type <stmt>	stmt_sql stmt_select_into
 
 /*
  * Basic non-keyword token types.  These are hard-wired into the core lexer.
@@ -262,6 +262,7 @@ stmt:
 			| stmt_if				{ $$ = $1; }
 			| stmt_case				{ $$ = $1; }
 			| stmt_sql				{ $$ = $1; }
+			| stmt_select_into			{ $$ = $1; }
 		;
 
 /*----
@@ -1030,6 +1031,53 @@ stmt_sql:
 			| UPDATE 			{ $$ = make_stmt_sql("UPDATE", @1); }
 			| DELETE			{ $$ = make_stmt_sql("DELETE", @1); }
 			;
+
+stmt_select_into:
+			SELECT expr_list_into qual_identif_list 
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SELECT_INTO, @1);
+					new->expr_list = $2;
+					new->compound_target = $3;
+					if (list_length($2) != list_length($3))
+						elog(ERROR, "number of target variables is different than number of attributies");
+
+					$$ = new;
+				}
+			| SELECT expr_list_into qual_identif_list FROM
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SELECT_INTO, @1);
+					new->expr_list = $2;
+					new->compound_target = $3;
+					if (list_length($2) != list_length($3))
+						elog(ERROR, "number of target variables is different than number of attributies");
+
+					new->from_clause = read_until(';', 0, 0, ";", false, false, NULL, @4);
+					$$ = new;
+				}
+			;
+
+expr_list_into:
+				{
+					int endtok;
+					List	*expr_list = NIL;
+
+					do
+					{
+						char *expr;
+						StringInfoData	ds;
+						expr = read_until(',', INTO, 0, ", or INTO", true, false, &endtok, -1);
+						initStringInfo(&ds);
+						appendStringInfo(&ds, "SELECT (%s)", expr);
+						check_sql_expr(ds.data);
+						pfree(ds.data);
+						if (endtok == ',')
+							yylex();
+
+						expr_list = lappend(expr_list, makeString(expr));
+					} while (endtok != INTO);
+					$$ = expr_list;
+				}
+		;
 
 expr_until_semi:
 				{
