@@ -136,13 +136,7 @@ next_op:
 						memcpy(tmp, DatumGetPointer(result), len);
 						result =  PointerGetDatum(tmp);
 					}
-
-					/* release a opened cursors */
-					while ((offset = bms_first_member(acursors)) >= 0)
-						SPI_cursor_close((Portal) DatumGetPointer(values[offset]));
-					
-					fcinfo->isnull = isnull;
-					return (Datum) result;
+					goto leave_process;
 				}
 
 			case PCODE_EXEC_EXPR:
@@ -670,7 +664,10 @@ next_op:
 				break;
 
 			case PCODE_RETURN_VOID:
+				goto leave_process;
+
 			case PCODE_RETURN_NULL:
+				isnull = true;
 				goto leave_process;
 
 			case PCODE_DATA_QUERY:
@@ -689,12 +686,22 @@ next_op:
 
 leave_process:
 
-	fcinfo->isnull = true;
-	
+	fcinfo->isnull = isnull;
+	MemoryContextDelete(exec_ctx);
+
 	/* release a opened cursors */
 	while ((offset = bms_first_member(acursors)) >= 0)
 		SPI_cursor_close((Portal) DatumGetPointer(values[offset]));
 	bms_free(acursors);
 
-	return (Datum) 0;
+	if (values)
+	{
+		pfree(nulls);
+		pfree(values);
+	}
+
+	if (DataPtrs)
+		pfree(DataPtrs);
+
+	return (Datum) result;
 }

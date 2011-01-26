@@ -94,6 +94,15 @@ else
 end if;
 $$ language psm0;
 
+create or replace function test06_07(a int)
+returns int as $$
+begin
+  declare x,y,z int;
+  set (x,y,z) = (select 10,20,a+10);
+  return x + y + z;
+end;
+$$ language psm0;
+
 create or replace function test07(a int)
 returns int as $$
   x1: begin
@@ -728,6 +737,21 @@ begin
 end;
 $$ language psm0;
 
+create or replace function test38_03(out s int)
+as $$
+begin
+  declare aux int;
+  declare c cursor for select a from footab;
+  declare continue handler for not found return;
+  set s = 0;
+  open c;
+  loop
+    fetch c into aux;
+    set s = s + aux;
+  end loop;
+end;
+$$ language psm0;
+
 create or replace function test39()
 returns int as $$
 x1:begin
@@ -1035,6 +1059,7 @@ begin
   perform assert('test06_04', 'Hello', (test06_04()).a);
   perform assert('test06_05', 8, test06_05(5));
   perform assert('test06_06', 720, test06_06(6));
+  perform assert('test06_07', 50, test06_07(10));
   perform assert('test07',  5, test07(3));
   perform assert('test08',  3, test08(3));
   perform assert('test09', 15, test09(3));
@@ -1098,6 +1123,7 @@ begin
   perform assert('test38', 10, test38());
   perform assert('test38_01', 10, test38_01());
   perform assert('test38_02', 10, test38_02());
+  perform assert('test38_03', 10, test38_03());
   perform assert('test39', 60, test39());
   perform assert('test40', 60, test40());
   perform assert('test41',100, test41());
