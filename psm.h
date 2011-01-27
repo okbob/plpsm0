@@ -162,7 +162,7 @@ typedef enum
 	PCODE_SAVETO,
 	PCODE_SAVETO_FIELD,
 	PCODE_CURSOR_FETCH,
-	PCODE_UPDATE_DATUM,
+	PCODE_UPDATE_FIELD,
 	PCODE_COPY_PARAM,
 	PCODE_SIGNAL_NODATA,
 	PCODE_DATA_QUERY,
@@ -239,13 +239,12 @@ typedef struct
 		} cursor;
 		struct 
 		{
-			int16 typlen;
 			Oid	typoid;
+			int16	typmod;
 			int offset;
-			int16	attypmod;
-			int16   attyplen;
-			int16	fieldnum;
-		} update;
+			int	fno;				/* number of attrib in composite */
+			int	fnumber;			/* number of field in result */
+		} update_field;
 		struct
 		{
 			int16	typlen;

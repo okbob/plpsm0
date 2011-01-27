@@ -321,15 +321,24 @@ begin
   if a is null then set s = s + 1; end if;
   set a = (10,20)::xx;
   if a.a + a.b = 30 then set s = s + 1; end if;
-  --set a.a = 40;
-  if a.a = 40 then set s = s + 1; end if;
+  if a.a = 40 then set s = -1; end if;
   set a = null;
   if a is null then set s = s + 1; end if;
   return s;
 end;
 $$ language psm0;
 
-DROP TYPE xx;
+create or replace function test26_01(a int, b int)
+returns int as $$
+begin
+  declare x xx;
+  set x = (a,b);
+  set (x.a, x.b) = (x.a + 1, x.b + 1);
+  set x.a = x.a + 1;
+  set x.b = x.b + 1;
+  return x.a + x.b * 10;
+end;
+$$ language psm0;
 
 create or replace function test27(a int)
 returns int as $$
@@ -414,6 +423,24 @@ begin
   return i;
 end;
 $$ language psm0;
+
+create or replace function test31_01()
+returns int as $$
+begin
+  declare s int default  0;
+  declare x xx;
+  declare sqlcode int;
+  declare c2 cursor for select a, a + 1 from footab2;
+  open c2;
+  fetch c2 into x.a, x.b;
+  while sqlcode = 0 do
+    set s = s + x.a + x.b;
+    fetch c2 into x.a, x.b;
+  end while;
+  return s;
+end;
+$$ language psm0;
+
 
 create or replace function test32()
 returns int as $$
@@ -1020,6 +1047,20 @@ begin
 end;
 $$ language psm0; -- returns -1
 
+create or replace function test58()
+returns int as $$
+begin
+  declare x xx;
+  select 10,20 into x.a, x.b;
+  return x.a + x.b;
+end;
+$$ language psm0;
+
+create or replace function test58_01(out x xx)
+returns xx as $$
+  select 10,20 into x.a, x.b;
+$$ language psm0;
+
 /*************************************************
  * Assert functions - sure, it is in plgsql :)
  */
@@ -1096,12 +1137,15 @@ begin
   perform assert('test24', -1, coalesce(test24(10), -1));
   perform assert('test25',  2, test25(2));
   perform assert('test25', -1, coalesce(test25(10),-1));
+  perform assert('test26', 3, test26());
+  perform assert('test26_01', 232, test26_01(10,20));
   perform assert('test27', 40, test27(5));
   perform assert('test28',  6, test28(4));
   perform assert('test30', 10, (select s from test30()));
   perform assert('test30', 128,(select sqlcode from test30()));
   perform assert('test30', '02000', (select sqlstate from test30()));
   perform assert('test31', 12, test31());
+  perform assert('test31_01', 15, test31_01());
   perform assert('test32', 12, test32());
   perform assert('test32_01', 60, test32_01());
   perform assert('test33',  0, test33());
@@ -1140,6 +1184,8 @@ begin
   perform assert('test56', -100, test56());
   perform assert('test56_01', -100, test56_01());
   perform assert('test57', -1, test57());
+  perform assert('test58', 30, test58());
+  perform assert('test58_01', 10, (test58_01()).a);
 
   raise notice '******* All tests are ok *******';
 end;
@@ -1147,5 +1193,6 @@ $$ language plpgsql;
 
 select test();
 
+DROP TYPE xx CASCADE;
 drop schema regtest cascade;
 set search_path = public;

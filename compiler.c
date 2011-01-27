@@ -874,6 +874,11 @@ list(Plpsm_pcode_module *m)
 											VALUE(saveto_field.typoid), 
 											VALUE(saveto_field.typmod));
 				break;
+			case PCODE_UPDATE_FIELD:
+				appendStringInfo(&ds, "UpdateToField #%d @%d.%d, oid:%d typmod %d", VALUE(update_field.fnumber), VALUE(update_field.offset), VALUE(update_field.fno),
+											VALUE(update_field.typoid), 
+											VALUE(update_field.typmod));
+				break;
 			case PCODE_COPY_PARAM:
 				appendStringInfo(&ds, "CopyParam %d, @%d, size:%d, byval:%s", 
 											VALUE(copyto.src),
@@ -1340,6 +1345,35 @@ replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs, Tupl
 }
 
 /*
+ * returns necessary informations about field of composite type
+ */
+static int
+resolve_composite_field(Oid rowoid, int16 rowtypmod, const char *fieldname, Oid *typoid, int16 *typmod)
+{
+	TupleDesc tupdesc = lookup_rowtype_tupdesc(rowoid, rowtypmod);
+	int		i;
+
+	Assert(fieldname != NULL);
+
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = tupdesc->attrs[i];
+
+		if (strcmp(fieldname, NameStr(att->attname)) == 0 && !att->attisdropped)
+		{
+			*typoid = att->atttypid;
+			*typmod = att->atttypmod;
+			ReleaseTupleDesc(tupdesc);
+			return i + 1;
+		}
+	}
+
+	elog(ERROR, "there are no field \"%s\" in type \"%s\"", fieldname,
+				format_type_with_typemod(rowoid, rowtypmod));
+	return -1;		/* be compiler quiete */
+}
+
+/*
  * Compile a SET statement in (var,var,..) = (expr, expr, ..) form
  */
 static void
@@ -1383,10 +1417,31 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, const char *from_cl
 		else
 			isfirst = false;
 
-		appendStringInfo(&ds, "(%s)::%s", expr, format_type_with_typemod(var->stmt->datum.typoid, var->stmt->datum.typmod));
-		SET_OPVALS_DATUM_INFO(saveto_field, var);
-		SET_OPVAL(saveto_field.fnumber, i++);
-		EMIT_OPCODE(PCODE_SAVETO_FIELD);
+		if (fieldname != NULL)
+		{
+			int16	typmod = -1;
+			Oid	typoid = InvalidOid;
+			int	fno;
+
+			fno = resolve_composite_field(var->stmt->datum.typoid, var->stmt->datum.typmod, fieldname,
+														    &typoid,
+														    &typmod);
+			appendStringInfo(&ds, "(%s)::%s", expr, format_type_with_typemod(typoid, typmod));
+			SET_OPVAL(update_field.fno, fno);
+			SET_OPVAL(update_field.typoid, var->stmt->datum.typoid);
+			SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
+			SET_OPVAL(update_field.offset, var->offset);
+			SET_OPVAL(update_field.fnumber, i++);
+			EMIT_OPCODE(PCODE_UPDATE_FIELD);
+		}
+		else
+		{
+			appendStringInfo(&ds, "(%s)::%s", expr, 
+							format_type_with_typemod(var->stmt->datum.typoid, var->stmt->datum.typmod));
+			SET_OPVALS_DATUM_INFO(saveto_field, var);
+			SET_OPVAL(saveto_field.fnumber, i++);
+			EMIT_OPCODE(PCODE_SAVETO_FIELD);
+		}
 	}
 
 	if (from_clause != NULL)
@@ -1878,10 +1933,31 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 													    &fieldname,
 														stmt->location,
 														    PLPSM_STMT_DECLARE_VARIABLE);
-						SET_OPVALS_DATUM_INFO(saveto_field, var);
-						SET_OPVAL(saveto_field.data, cstate->stack.ndata++);
-						SET_OPVAL(saveto_field.fnumber, i++);
-						EMIT_OPCODE(PCODE_SAVETO_FIELD);
+
+						if (fieldname != NULL)
+						{
+							int16	typmod = -1;
+							Oid	typoid = InvalidOid;
+				    			int	fno;
+
+							fno = resolve_composite_field(var->stmt->datum.typoid, var->stmt->datum.typmod, fieldname,
+																		    &typoid,
+																		    &typmod);
+
+							SET_OPVAL(update_field.fno, fno);
+							SET_OPVAL(update_field.typoid, var->stmt->datum.typoid);
+							SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
+							SET_OPVAL(update_field.offset, var->offset);
+							SET_OPVAL(update_field.fnumber, i++);
+							EMIT_OPCODE(PCODE_UPDATE_FIELD);
+						}
+						else
+						{
+							SET_OPVALS_DATUM_INFO(saveto_field, var);
+							SET_OPVAL(saveto_field.data, cstate->stack.ndata++);
+							SET_OPVAL(saveto_field.fnumber, i++);
+							EMIT_OPCODE(PCODE_SAVETO_FIELD);
+						}
 					}
 
 					compile_refresh_basic_diagnostic(cstate);
@@ -2038,10 +2114,32 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 					if (stmt->target != NIL)
 					{
-						obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location, PLPSM_STMT_DECLARE_VARIABLE);
-						compile_expr(cstate, stmt->expr, obj->stmt->datum.typoid, obj->stmt->datum.typmod);
-						SET_OPVALS_DATUM_COPY(target, obj);
-						EMIT_OPCODE(PCODE_SAVETO);
+						var = resolve_target(cstate, stmt->target,  &fieldname, stmt->location, PLPSM_STMT_DECLARE_VARIABLE);
+
+						if (fieldname != NULL)
+						{
+							int16	typmod = -1;
+							Oid	typoid = InvalidOid;
+				    			int	fno;
+
+							fno = resolve_composite_field(var->stmt->datum.typoid, var->stmt->datum.typmod, fieldname,
+																		    &typoid,
+																		    &typmod);
+
+							compile_expr(cstate, stmt->expr, typoid, typmod);
+							SET_OPVAL(update_field.fno, fno);
+							SET_OPVAL(update_field.typoid, var->stmt->datum.typoid);
+							SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
+							SET_OPVAL(update_field.offset, var->offset);
+							SET_OPVAL(update_field.fnumber, 1);
+							EMIT_OPCODE(PCODE_UPDATE_FIELD);
+						}
+						else
+						{
+							compile_expr(cstate, stmt->expr, var->stmt->datum.typoid, var->stmt->datum.typmod);
+							SET_OPVALS_DATUM_COPY(target, var);
+							EMIT_OPCODE(PCODE_SAVETO);
+						}
 					}
 					else
 					{

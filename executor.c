@@ -1,4 +1,9 @@
 #include "psm.h"
+
+#include "postgres.h"
+#include "funcapi.h"
+
+#include "catalog/pg_type.h"
 #include "commands/prepare.h"
 #include "executor/spi.h"
 #include "nodes/bitmapset.h"
@@ -6,6 +11,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
+#include "utils/typcache.h"
 #include "utils/memutils.h"
 
 typedef struct
@@ -62,7 +68,7 @@ plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
 	{
 		Plpsm_pcode *pcode;
 next_op:
-
+/* elog(NOTICE, "PC %d", PC); */
 		if (PC == 0)
 			elog(ERROR, "invalid memory reference");
 
@@ -436,6 +442,120 @@ next_op:
 					clean_result = true;
 
 					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
+				}
+				break;
+
+			case PCODE_UPDATE_FIELD:
+				{
+					int	fno = pcode->update_field.fno;
+					int	fnumber = pcode->update_field.fnumber;
+					int	offset = pcode->update_field.offset;
+					bool	isnull;
+					Datum		value = (Datum) 0;
+
+					if (SPI_processed > 0)
+						value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, fnumber, &isnull);
+					else
+						isnull = true;
+
+					if (nulls[offset] != 'n' || !isnull)
+					{
+						int	natts;
+						Datum		*_values;
+						bool		*_nulls;
+						bool		*_replaces;
+						HeapTupleHeader		td;
+						HeapTupleData		tmptup;
+						Oid	tupType;
+						int16	tupTypmod;
+						TupleDesc tupdesc;
+						HeapTuple newtup;
+						HeapTupleHeader result;
+
+
+						if (pcode->update_field.typoid != RECORDOID)
+						{
+							tupdesc = lookup_rowtype_tupdesc(pcode->update_field.typoid, pcode->update_field.typmod);
+						}
+						else
+						{
+							td = DatumGetHeapTupleHeader(value);
+
+							tupType = HeapTupleHeaderGetTypeId(td);
+							tupTypmod = HeapTupleHeaderGetTypMod(td);
+							tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+						}
+
+						natts = tupdesc->natts;
+
+						_values = palloc(sizeof(Datum) * natts);
+						_nulls = palloc(sizeof(bool) * natts);
+						_replaces = palloc(sizeof(bool) * natts);
+						memset(_replaces, false, sizeof(bool) * natts);
+
+						BlessTupleDesc(tupdesc);
+
+						/* check possible IO conversion */
+						if (!isnull)
+						{
+							Form_pg_attribute src_attr = SPI_tuptable->tupdesc->attrs[fnumber - 1];
+							Form_pg_attribute dest_attr = tupdesc->attrs[fno - 1];
+
+							if (src_attr->atttypid != dest_attr->atttypid || src_attr->atttypmod != dest_attr->atttypmod)
+							{
+								Oid			typoutput;
+								bool		typIsVarlena;
+								char *str;
+
+								Oid			typinput;
+								Oid			typioparam;
+								FmgrInfo	finfo_input;
+
+								getTypeOutputInfo(src_attr->atttypid, &typoutput, &typIsVarlena);
+								str =  OidOutputFunctionCall(typoutput, value);
+								getTypeInputInfo(dest_attr->atttypid, &typinput, &typioparam);
+								fmgr_info(typinput, &finfo_input);
+								value = InputFunctionCall(&finfo_input, str, typioparam, dest_attr->atttypmod);
+								pfree(str);
+							}
+						}
+
+						if (nulls[pcode->update_field.offset] != 'n')
+						{
+							td = DatumGetHeapTupleHeader(values[offset]);
+							_values[fno - 1] = value;
+							_replaces[fno - 1] = true;
+							_nulls[fno - 1] = isnull;
+
+							tmptup.t_len = HeapTupleHeaderGetDatumLength(td);
+							ItemPointerSetInvalid(&(tmptup.t_self));
+							tmptup.t_tableOid = InvalidOid;
+							tmptup.t_data = td;
+
+							newtup = heap_modify_tuple(&tmptup, tupdesc, _values, _nulls, _replaces);
+						}
+						else
+						{
+							_values[fno - 1] = value;
+							_nulls[fno - 1] = isnull;
+
+							newtup = heap_form_tuple(tupdesc, _values, _nulls);
+						}
+
+						result = (HeapTupleHeader) palloc(newtup->t_len);
+						memcpy(result, newtup->t_data, newtup->t_len);
+						heap_freetuple(newtup);
+
+						values[offset] = PointerGetDatum(result);
+
+						nulls[offset] = ' ';
+
+						ReleaseTupleDesc(tupdesc);
+
+						pfree(_values);
+						pfree(_nulls);
+						pfree(_replaces);
+					}
 				}
 				break;
 
