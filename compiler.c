@@ -4,6 +4,7 @@
 #include "access/tupdesc.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_proc_fn.h"
 #include "catalog/pg_type.h"
 #include "nodes/bitmapset.h"
 #include "tcop/tcopprot.h"
@@ -18,6 +19,10 @@
 
 Plpsm_stmt *plpsm_parser_tree;
 bool	plpsm_debug_compiler = false;
+
+#define parser_errposition(pos)		plpsm_scanner_errposition(pos)
+
+const char *plpsm_error_funcname;
 
 typedef struct
 {							/* it's used for storing data from SQL parser */
@@ -64,6 +69,7 @@ typedef struct
 	{
 		int	nargs;
 		char *name;
+		char	*source;
 		struct
 		{
 			struct
@@ -85,7 +91,10 @@ static void compile(CompileState cstate, Plpsm_stmt *stmt);
 static Node *resolve_column_ref(CompileState cstate, ColumnRef *cref);
 void plpsm_parser_setup(struct ParseState *pstate, CompileState cstate);
 static Plpsm_object *lookup_var(Plpsm_object *scope, const char *name);
-static void compile_expr(CompileState cstate, char *expr, Oid targetoid, int16 typmod);
+static void compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid targetoid, int16 typmod);
+
+static void plpsm_compile_error_callback(void *arg);
+
 
 /*
  * Returns a offset of prepared statement, reserves a new offset
@@ -370,11 +379,16 @@ plpsm_post_column_ref(ParseState *pstate, ColumnRef *cref, Node *var)
 				 errmsg("column reference \"%s\" is ambiguous",
 							    NameListToString(cref->fields)),
 				 errdetail("It could refer to either a PL/pgSQL variable or a table column."),
-				 parser_errposition(pstate, cref->location)));
+				 errposition(cref->location + 1)));
 	}
 
 	if (myvar == NULL && var == NULL && cstate->pdata.is_expression)
-		elog(ERROR, "variable \"%s\" isn't available in current scope", NameListToString(cref->fields));
+	{
+		ereport(ERROR,
+			(errcode(ERRCODE_INVALID_NAME),
+			 errmsg("variable \"%s\" isn't available in current scope", NameListToString(cref->fields)),
+					errposition(cref->location + 1)));
+	}
 
 	if (myvar != NULL)
 		cstate->pdata.has_external_params = true;
@@ -396,7 +410,7 @@ plpsm_paramref_hook(ParseState *pstate, ParamRef *pref)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_PARAMETER),
 				 errmsg("there is no parameter $%d", paramno),
-				 parser_errposition(pstate, pref->location)));
+				 errposition(pref->location + 1)));
 
 	param = makeNode(Param);
 	param->paramkind = PARAM_EXTERN;
@@ -461,8 +475,11 @@ make_fieldSelect(Plpsm_object *var, ColumnRef *cref, const char *fieldname)
 		}
 	}
 
-	elog(ERROR, "there are no field \"%s\" in type \"%s\"", fieldname,
-									format_type_with_typemod(typoid, typmod));
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+			 errmsg("there are no field \"%s\" in type \"%s\"", fieldname,
+									format_type_with_typemod(typoid, typmod)),
+					errposition(cref->location + 1)));
 	return NULL; 		/* be compiler quiet */
 }
 
@@ -617,7 +634,11 @@ resolve_column_ref(CompileState cstate, ColumnRef *cref)
 				if (var != NULL)
 				{
 					if (lookup_var(cstate->current_scope, name1))
-						elog(ERROR, "there is conflict between compound statement label and composite variable");
+						ereport(ERROR,
+								(errcode(ERRCODE_AMBIGUOUS_COLUMN),
+								 errmsg("there is conflict between compound statement label and composite variable"),
+								 parser_errposition(cref->location)));
+
 					appendHostVar(cstate, cref->location, name1, name2, var->offset + 1);
 					return make_param(var, cref);
 				}
@@ -680,7 +701,7 @@ resolve_target(CompileState cstate, List *target, const char **fieldname, int lo
 			objectclass = "target variable";
 			break;
 		default:
-			objectclass = "unspecified identifier";
+			objectclass = "identifier";
 			break;
 	}
 
@@ -693,7 +714,10 @@ resolve_target(CompileState cstate, List *target, const char **fieldname, int lo
 				name1 = strVal(field1);
 				var = lookup_var(cstate->current_scope, name1);
 				if (var == NULL)
-					elog(ERROR, "a missing %s \"%s\"", objectclass, name1);
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("a %s \"%s\" is undefined", objectclass, name1),
+							 parser_errposition(location)));
 				return var;
 			}
 		case 2:
@@ -721,7 +745,7 @@ resolve_target(CompileState cstate, List *target, const char **fieldname, int lo
 				{
 					var = lookup_var(cstate->current_scope, name1);
 					if (var == NULL)
-						elog(ERROR, "a missing %s \"%s\"", objectclass, name1);
+						elog(ERROR, "%s \"%s\" is undefined", objectclass, name1);
 					*fieldname = name2;
 					return var;
 				}
@@ -742,7 +766,7 @@ resolve_target(CompileState cstate, List *target, const char **fieldname, int lo
 
 				var = lookup_qualified_var(cstate->current_scope, name1, name2);
 				if (var == NULL)
-					elog(ERROR, "a missing %s \"%s\" with label \"%s\"", objectclass, name2, name1);
+					elog(ERROR, "%s \"%s\" with label \"%s\" is undefined", objectclass, name2, name1);
 				*fieldname = name3;
 			}
 	}
@@ -774,7 +798,7 @@ list(Plpsm_pcode_module *m)
 
 	appendStringInfo(&ds, "\n   Datums: %d variable(s) \n", m->ndatums);
 	appendStringInfo(&ds, "   Local data size: %d pointers\n", m->ndata);
-	appendStringInfo(&ds, "   Size: %d instruction(s)\n\n", m->length);
+	appendStringInfo(&ds, "   Size: %d instruction(s)\n\n", m->length - 1);
 
 	for (pc = 1; pc < m->length; pc++)
 	{
@@ -1135,7 +1159,7 @@ compile_done(CompileState cstate)
 
 	if (cstate->finfo.return_expr != NULL && cstate->finfo.result.datum.typoid != VOIDOID)
 	{
-		compile_expr(cstate,cstate->finfo.return_expr,
+		compile_expr(cstate, NULL, cstate->finfo.return_expr,
 						cstate->finfo.result.datum.typoid, -1);
 		SET_OPVAL(target.typlen, cstate->finfo.result.datum.typlen);
 		SET_OPVAL(target.typbyval, cstate->finfo.result.datum.typbyval);
@@ -1377,7 +1401,7 @@ resolve_composite_field(Oid rowoid, int16 rowtypmod, const char *fieldname, Oid 
  * Compile a SET statement in (var,var,..) = (expr, expr, ..) form
  */
 static void
-compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, const char *from_clause)
+compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, Plpsm_ESQL *from_clause)
 {
 	Plpsm_pcode_module *m = cstate->module;
 	int	addr;
@@ -1390,7 +1414,7 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, const char *from_cl
 
 	initStringInfo(&ds);
 
-	if (list_length(stmt->compound_target) != list_length(stmt->expr_list))
+	if (list_length(stmt->compound_target) != list_length(stmt->esql_list))
 		elog(ERROR, "there are different number of target variables and expressions in list");
 
 	/* 
@@ -1403,14 +1427,14 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, const char *from_cl
 	EMIT_OPCODE(PCODE_EXEC_EXPR);
 	appendStringInfoString(&ds, "SELECT ");
 
-	forboth (l1, stmt->compound_target, l2, stmt->expr_list)
+	forboth (l1, stmt->compound_target, l2, stmt->esql_list)
 	{
 		const char *fieldname;
 		Plpsm_object *var;
-		char	*expr;
+		Plpsm_ESQL *esql;
 
 		var = resolve_target(cstate, (List *) lfirst(l1), &fieldname, stmt->location, PLPSM_STMT_DECLARE_VARIABLE);
-		expr = strVal(lfirst(l2));
+		esql = (Plpsm_ESQL *) lfirst(l2);
 
 		if (!isfirst)
 			appendStringInfoChar(&ds, ',');
@@ -1426,7 +1450,7 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, const char *from_cl
 			fno = resolve_composite_field(var->stmt->datum.typoid, var->stmt->datum.typmod, fieldname,
 														    &typoid,
 														    &typmod);
-			appendStringInfo(&ds, "(%s)::%s", expr, format_type_with_typemod(typoid, typmod));
+			appendStringInfo(&ds, "(%s)::%s", esql->sqlstr, format_type_with_typemod(typoid, typmod));
 			SET_OPVAL(update_field.fno, fno);
 			SET_OPVAL(update_field.typoid, var->stmt->datum.typoid);
 			SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
@@ -1436,7 +1460,7 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, const char *from_cl
 		}
 		else
 		{
-			appendStringInfo(&ds, "(%s)::%s", expr, 
+			appendStringInfo(&ds, "(%s)::%s", esql->sqlstr, 
 							format_type_with_typemod(var->stmt->datum.typoid, var->stmt->datum.typmod));
 			SET_OPVALS_DATUM_INFO(saveto_field, var);
 			SET_OPVAL(saveto_field.fnumber, i++);
@@ -1445,7 +1469,7 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, const char *from_cl
 	}
 
 	if (from_clause != NULL)
-		appendStringInfo(&ds, " %s", from_clause);
+		appendStringInfo(&ds, " %s", from_clause->sqlstr);
 
 	SET_OPVAL_ADDR(addr, expr.expr, replace_vars(cstate, ds.data, &locargtypes, &nargs, NULL));
 	SET_OPVAL_ADDR(addr, expr.nparams, nargs);
@@ -1456,12 +1480,27 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, const char *from_cl
  * emit instruction to execute a expression with specified targetoid and typmod
  */
 static void 
-compile_expr(CompileState cstate, char *expr, Oid targetoid, int16 typmod)
+compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid targetoid, int16 typmod)
 {
 	StringInfoData	ds;
 	Plpsm_pcode_module *m = cstate->module;
 	int	nargs;
 	Oid	*argtypes;
+	Plpsm_sql_error_callback_arg 		cbarg;
+	ErrorContextCallback  			syntax_errcontext;
+
+	if (esql != NULL)
+	{
+		expr = esql->sqlstr;
+
+		cbarg.location = esql->location;
+		cbarg.leaderlen = strlen("SELECT (");
+
+		syntax_errcontext.callback = plpsm_sql_error_callback;
+		syntax_errcontext.arg = &cbarg;
+		syntax_errcontext.previous = error_context_stack;
+		error_context_stack = &syntax_errcontext;
+	}
 
 	initStringInfo(&ds);
 	appendStringInfo(&ds, "SELECT (%s)::%s", expr, format_type_with_typemod(targetoid, typmod));
@@ -1471,6 +1510,12 @@ compile_expr(CompileState cstate, char *expr, Oid targetoid, int16 typmod)
 	SET_OPVAL(expr.data, cstate->stack.ndata++);
 	SET_OPVAL(expr.is_multicol, false);
 	EMIT_OPCODE(PCODE_EXEC_EXPR);
+
+	if (esql != NULL)
+	{
+		/* Restore former ereport callback */
+		error_context_stack = syntax_errcontext.previous;
+	}
 }
 
 /*
@@ -1628,7 +1673,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					addr1 = PC(m);
-					compile_expr(cstate, stmt->expr, BOOLOID, -1);
+					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					addr2 = PC(m);
 					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
 					compile(cstate, stmt->inner_left);
@@ -1643,7 +1688,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					addr1 = PC(m);
 					compile(cstate, stmt->inner_left);
-					compile_expr(cstate, stmt->expr, BOOLOID, -1);
+					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					SET_OPVAL(addr, addr1);
 					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
 					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
@@ -1681,7 +1726,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					cursor->cursor.data_addr = PC(m);
 					cursor->cursor.is_dynamic = false;
 
-					SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->query), &argtypes, &nargs, &tupdesc));
+					SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->esql->sqlstr), &argtypes, &nargs, &tupdesc));
 					SET_OPVAL(expr.nparams, nargs);
 					SET_OPVAL(expr.typoids, argtypes);
 					SET_OPVAL(expr.data, cstate->stack.ndata++);
@@ -1815,15 +1860,15 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					ListCell *l;
 
-					if (stmt->expr != NULL)
-						compile_expr(cstate, stmt->expr, stmt->datum.typoid, stmt->datum.typmod);
+					if (stmt->esql != NULL)
+						compile_expr(cstate, stmt->esql, NULL, stmt->datum.typoid, stmt->datum.typmod);
 
 					foreach(l, stmt->compound_target)
 					{
 						char *name = strVal(lfirst(l));
 						var = create_variable_for(stmt, cstate, name, PLPSM_VARIABLE);
 
-						if (stmt->expr != NULL)
+						if (stmt->esql != NULL)
 						{
 							SET_OPVALS_DATUM_COPY(target, var);
 							EMIT_OPCODE(PCODE_SAVETO);
@@ -1842,7 +1887,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					char *name = strVal(linitial(stmt->target)) ;
 
 					var = create_variable_for(stmt, cstate, name, PLPSM_VARIABLE);
-					if (stmt->query != NULL)
+					if (stmt->esql != NULL)
 					{
 						Oid	*argtypes;
 						int	nargs;
@@ -1850,7 +1895,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						var->cursor.data_addr = PC(m);
 						var->cursor.is_dynamic = false;
 
-						SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->query), &argtypes, &nargs, NULL));
+						SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->esql->sqlstr), &argtypes, &nargs, NULL));
 						SET_OPVAL(expr.nparams, nargs);
 						SET_OPVAL(expr.typoids, argtypes);
 						SET_OPVAL(expr.data, cstate->stack.ndata++);
@@ -1990,7 +2035,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 			case PLPSM_STMT_IF:
 				{
-					compile_expr(cstate, stmt->expr, BOOLOID, -1);
+					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					addr1 = PC(m);
 					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
 					compile(cstate, stmt->inner_left);
@@ -2018,18 +2063,18 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					{
 						char *expr;
 
-						if (outer_case->expr != NULL)
+						if (outer_case->esql != NULL)
 						{
 							StringInfoData	ds;
 
 							initStringInfo(&ds);
-							appendStringInfo(&ds, "%s IN (%s)", outer_case->expr, cond->expr);
+							appendStringInfo(&ds, "%s IN (%s)", outer_case->esql->sqlstr, cond->esql->sqlstr);
 							expr = ds.data;
 						}
 						else
-							expr = pstrdup(cond->expr);
+							expr = pstrdup(cond->esql->sqlstr);
 
-						compile_expr(cstate, expr, BOOLOID, -1);
+						compile_expr(cstate, NULL, expr, BOOLOID, -1);
 						addr1 = PC(m);
 						EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
 						compile(cstate, cond->inner_left);
@@ -2059,7 +2104,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 			case PLPSM_STMT_PRINT:
 				{
-					if (list_length(stmt->compound_target) > 1)
+					if (list_length(stmt->esql_list) > 1)
 					{
 						ListCell *l;
 						bool	isfirst = true;
@@ -2079,7 +2124,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						EMIT_OPCODE(PCODE_EXEC_EXPR);
 						appendStringInfoString(&ds, "SELECT ");
 
-						foreach (l, stmt->compound_target)
+						foreach (l, stmt->esql_list)
 						{
 							if (!isfirst)
 							{
@@ -2091,7 +2136,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 							STRBUILDER1(APPEND_FIELD, dataidx, fnumber, i++);
 
-							appendStringInfo(&ds, "(%s)::text", strVal(lfirst(l)));
+							appendStringInfo(&ds, "(%s)::text", ((Plpsm_ESQL *)(lfirst(l)))->sqlstr);
 						}
 
 						SET_OPVAL_ADDR(addr1, expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs, NULL));
@@ -2102,7 +2147,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					}
 					else
 					{
-						compile_expr(cstate, strVal(linitial(stmt->compound_target)), TEXTOID, -1);
+						compile_expr(cstate, linitial(stmt->esql_list), NULL, TEXTOID, -1);
 						EMIT_OPCODE(PCODE_PRINT);
 					}
 				}
@@ -2126,7 +2171,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 																		    &typoid,
 																		    &typmod);
 
-							compile_expr(cstate, stmt->expr, typoid, typmod);
+							compile_expr(cstate, stmt->esql, NULL, typoid, typmod);
 							SET_OPVAL(update_field.fno, fno);
 							SET_OPVAL(update_field.typoid, var->stmt->datum.typoid);
 							SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
@@ -2136,14 +2181,14 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						}
 						else
 						{
-							compile_expr(cstate, stmt->expr, var->stmt->datum.typoid, var->stmt->datum.typmod);
+							compile_expr(cstate, stmt->esql, NULL, var->stmt->datum.typoid, var->stmt->datum.typmod);
 							SET_OPVALS_DATUM_COPY(target, var);
 							EMIT_OPCODE(PCODE_SAVETO);
 						}
 					}
 					else
 					{
-						Assert(stmt->compound_target != NIL && stmt->expr_list != NIL);
+						Assert(stmt->compound_target != NIL && stmt->esql_list != NIL);
 						compile_multiset_stmt(cstate, stmt, NULL);
 					}
 				}
@@ -2164,13 +2209,13 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					if (cstate->finfo.result.datum.typoid != VOIDOID)
 					{
 						if (cstate->finfo.return_expr != NULL && 
-							stmt->expr != NULL)
+							stmt->esql != NULL)
 							elog(ERROR, "using RETURN expr in function with OUT arguments");
 
-						if (stmt->expr != NULL)
-							compile_expr(cstate, stmt->expr, cstate->finfo.result.datum.typoid, -1);
+						if (stmt->esql != NULL)
+							compile_expr(cstate, stmt->esql, NULL, cstate->finfo.result.datum.typoid, -1);
 						else
-							compile_expr(cstate, cstate->finfo.return_expr,
+							compile_expr(cstate, NULL, cstate->finfo.return_expr,
 											cstate->finfo.result.datum.typoid, -1);
 
 						SET_OPVAL(target.typlen, cstate->finfo.result.datum.typlen);
@@ -2180,7 +2225,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					else
 					{
 						Assert(cstate->finfo.return_expr == NULL);
-						if (stmt->expr != NULL)
+						if (stmt->esql != NULL)
 							elog(ERROR, "returned a value in VOID function");
 						EMIT_OPCODE(PCODE_RETURN_VOID);
 					}
@@ -2189,7 +2234,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 			case PLPSM_STMT_EXECUTE_IMMEDIATE:
 				{
-					compile_expr(cstate, stmt->expr, TEXTOID, -1);
+					compile_expr(cstate, stmt->esql, NULL, TEXTOID, -1);
 					EMIT_OPCODE(PCODE_EXECUTE_IMMEDIATE);
 					compile_refresh_basic_diagnostic(cstate);
 				}
@@ -2200,7 +2245,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					Oid	*argtypes;
 					int	nargs;
 				
-					SET_OPVAL(expr.expr, replace_vars(cstate, stmt->query, &argtypes, &nargs, NULL));
+					SET_OPVAL(expr.expr, replace_vars(cstate, stmt->esql->sqlstr, &argtypes, &nargs, NULL));
 					SET_OPVAL(expr.nparams, nargs);
 					SET_OPVAL(expr.typoids, argtypes);
 					SET_OPVAL(expr.data, cstate->stack.ndata++);
@@ -2254,7 +2299,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 			case PLPSM_STMT_PREPARE:
 				{
 					int	prepnum = fetchPrepared(cstate, stmt->name);
-					compile_expr(cstate, stmt->expr, TEXTOID, -1);
+					compile_expr(cstate, stmt->esql, NULL, TEXTOID, -1);
 					SET_OPVAL(prepare.name, stmt->name);
 					SET_OPVAL(prepare.data, prepnum);
 					EMIT_OPCODE(PCODE_PREPARE);
@@ -2288,6 +2333,7 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	int16	typlen;
 	bool	typbyval;
 	Bitmapset	*outargs = NULL;
+	ErrorContextCallback	plerrcontext;
 
 	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcOid));
 	if (!HeapTupleIsValid(procTup))
@@ -2302,12 +2348,17 @@ plpsm_compile(Oid funcOid, bool forValidator)
 
 	proc_source = TextDatumGetCString(prosrcdatum);
 
+	plerrcontext.callback = plpsm_compile_error_callback;
+	plerrcontext.arg = proc_source;
+	plerrcontext.previous = error_context_stack;
+	error_context_stack = &plerrcontext;
+
+	plpsm_error_funcname = NameStr(procStruct->proname);
+
 	plpsm_scanner_init(proc_source);
 	parse_rc = plpsm_yyparse();
 	if (parse_rc != 0)
 		elog(ERROR, "plpsm parser returned %d", parse_rc);
-
-	plpsm_scanner_finish();
 
 	memset(&outer_scope, 0, sizeof(Plpsm_object));
 	outer_scope.typ = PLPSM_STMT_COMPOUND_STATEMENT;
@@ -2340,6 +2391,9 @@ plpsm_compile(Oid funcOid, bool forValidator)
 						&argtypes, &argnames, &argmodes);
 	cstate.finfo.nargs = numargs;
 	cstate.finfo.name = pstrdup(NameStr(procStruct->proname));
+	cstate.finfo.source = proc_source;
+
+
 	m->name = cstate.finfo.name;
 
 	for (i = 0; i < numargs; i++)
@@ -2437,7 +2491,27 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	if (plpsm_debug_compiler)
 		list(m);
 
+	error_context_stack = plerrcontext.previous;
+
+	plpsm_scanner_finish();
+
 	ReleaseSysCache(procTup);
 
 	return m;
+}
+
+/*
+ * error context callback
+ */
+static void
+plpsm_compile_error_callback(void *arg)
+{
+	if (arg)
+	{
+		if (function_parse_error_transpose((const char *) arg))
+			return;
+	}
+
+	errcontext("compilation of PLPSM function \"%s\" near line %d",
+				plpsm_error_funcname, plpsm_latest_lineno());
 }

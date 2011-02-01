@@ -33,15 +33,21 @@ union YYSTYPE;
 
 bool	plpsm_debug_parser = false;
 
+#define parser_errposition(pos)		plpsm_scanner_errposition(pos)
 
-static char * read_until(int until1, int until2, int until3, const char *expected, 
-							bool is_expr, bool is_datatype, 
-							int *endtoken,
-							int startlocation);
-static void check_sql_expr(const char *stmt);
-static void parse_datatype(const char *string, Oid *type_id, int32 *typmod);
+static Plpsm_ESQL *read_embeded_sql(int until1,
+						int until2,
+						int until3,
+							const char *expected,
+								Plpsm_esql_type expected_type,
+											bool valid_sql,
+												int *endtoken, int startlocation,
+													Oid *typoid, int32 *typmod);
 
-static char *read_expr_until_semi(void);
+static void check_sql_expr(const char *stmt, int location, int leaderlen);
+static void parse_datatype(const char *string, int location, Oid *typoid, int32 *typmod);
+
+static Plpsm_ESQL *read_expr_until_semi(void);
 static Plpsm_stmt *declare_prefetch(void);
 static void check_labels(const char *label1, const char *label2);
 static bool is_unreserved_keyword(int tok);
@@ -50,35 +56,7 @@ static const char *parser_stmt_name(Plpsm_stmt_type typ);
 static void stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level);
 static void elog_stmt(int level, Plpsm_stmt *stmt);
 
-static Plpsm_stmt *make_stmt_sql(const char *prefix, int location);
-
-#define ENABLE_DEBUG_ATTR
-
-#ifdef ENABLE_DEBUG_ATTR
-#define DEBUG_INIT		StringInfoData debug_string;
-#define DEBUG_SET(S,b) \
-	do { \
-		if (!(S)->debug) \
-		{ \
-			initStringInfo(&debug_string); \
-			plpsm_push_back_token(yylex()); \
-			plpsm_append_source_text(&debug_string, b, yylloc); \
-			(S)->debug = debug_string.data; \
-		} \
-	} while (0)
-#define DEBUG_SET_PART(S,b,c) \
-	do { \
-		initStringInfo(&debug_string); \
-		debug_token = yylex(); \
-		plpsm_append_source_text(&debug_string, b, c); \
-		plpsm_push_back_token(debug_token); \
-		(S)->debug = debug_string.data; \
-	} while (0)
-#else
-#define DEBUG_INT
-#define DEBUG_SET(S,b) 
-#define DEBUG_SET_PART(S,b,c)
-#endif
+static Plpsm_stmt *make_stmt_sql(int location);
 
 %}
 
@@ -98,6 +76,7 @@ static Plpsm_stmt *make_stmt_sql(const char *prefix, int location);
 		void			*ptr;
 		List				*list;
 		Plpsm_stmt			*stmt;
+		Plpsm_ESQL			*esql;
 		Node		*node;
 }
 
@@ -109,15 +88,15 @@ static Plpsm_stmt *make_stmt_sql(const char *prefix, int location);
 %type <stmt>	declaration declarations declare_prefetch
 %type <stmt>	stmt_if stmt_else
 %type <list>	qual_identif_list qual_identif
-%type <str>	expr_until_semi_or_coma expr_until_semi expr_until_do expr_until_end
-%type <str>	expr_until_semi_into_using expr_until_then
+%type <esql>	expr_until_semi_or_coma expr_until_semi expr_until_do expr_until_end
+%type <esql>	expr_until_semi_into_using expr_until_then
 %type <str>	opt_label opt_end_label
 %type <node>	condition sqlstate opt_sqlstate
 %type <list>	condition_list expr_list expr_list_into
 %type <stmt>	stmt_prepare stmt_execute stmt_execute_immediate
 %type <stmt>	stmt_open stmt_fetch stmt_close stmt_for for_prefetch
 %type <stmt>	stmt_case case_when_list case_when opt_case_else
-%type <str>	opt_expr_until_when expr_until_semi_or_coma_or_parent
+%type <esql>	opt_expr_until_when expr_until_semi_or_coma_or_parent
 %type <stmt>	stmt_sql stmt_select_into
 
 /*
@@ -228,18 +207,8 @@ statements:
  */
 dstmt:			stmt
 				{
-					int	location = $1->location;
-					DEBUG_INIT;
-					/* recheck "last" ptr */
 					if (!$1->last)
 						$1->last = $1;
-#ifdef ENABLE_DEBUG_ATTR
-					while ($1)
-					{
-						DEBUG_SET($1, location);
-						$1 = $1->next;
-					}
-#endif
 				}
 
 stmt:
@@ -280,7 +249,7 @@ stmt:
 stmt_compound:
 			opt_label BEGIN statements ';' END opt_end_label
 				{
-					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, $1 ? @1: @2);
 					new->name = $1;
 					new->inner_left = $3;
 					check_labels($1, $6);
@@ -288,7 +257,7 @@ stmt_compound:
 				}
 			| opt_label BEGIN declarations ';' END opt_end_label
 				{
-					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, $1 ? @1: @2);
 					new->name = $1;
 					new->inner_left = $3;
 					check_labels($1, $6);
@@ -296,7 +265,7 @@ stmt_compound:
 				}
 			| opt_label BEGIN declarations ';' statements ';' END opt_end_label
 				{
-					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, $1 ? @1: @2);
 					new->name = $1;
 					/* join declarations and statements */
 					$3->last->next = $5;
@@ -307,17 +276,26 @@ stmt_compound:
 				}
 			| opt_label BEGIN END opt_end_label
 				{
-					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, @2);
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, $1 ? @1: @2);
 					new->name = $1;
 					check_labels($1, $4);
 					$$ = new;
 				}
 		;
 
+/*
+ * When missing a colon, then move a position back, because we want
+ * to mark a WORD, not next token.
+ */
 opt_label:
-			WORD ':'
+			WORD
 				{
 					$$ = $1.ident;
+					if (yylex() != ':')
+						ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("syntax error, bizzare label \"%s\"", $1.ident),
+									parser_errposition(@1)));
 				}
 			|
 				{
@@ -380,46 +358,44 @@ declarations:
 declaration:
 			DECLARE declare_prefetch
 				{
-					DEBUG_INIT;
 					if ($2->typ != PLPSM_STMT_DECLARE_VARIABLE)
 						yyerror("syntax error");
+					$2->lineno = plpsm_location_to_lineno(@1);
 					$$ = $2;
-					DEBUG_SET($2, @1);
 				}
 			| DECLARE declare_prefetch CONDITION opt_sqlstate
 				{
-					DEBUG_INIT;
 					if ($2->typ != PLPSM_STMT_DECLARE_CONDITION)
 						yyerror("syntax error");
 					$2->data = $4;
+					$2->lineno = plpsm_location_to_lineno(@1);
 					$$ = $2;
-					DEBUG_SET($2, @1);
 				}
 			| DECLARE declare_prefetch CURSOR FOR 
 				{
 					int	tok;
-					DEBUG_INIT;
 					if ($2->typ != PLPSM_STMT_DECLARE_CURSOR)
 						yyerror("syntax error");
 					if ((tok = yylex()) != WORD)
 					{
 						plpsm_push_back_token(tok);
-						$2->query = read_until(';', 0, 0, ";", false, false, NULL, -1);
+						$2->esql = read_embeded_sql(';', 0, 0, ";", PLPSM_ESQL_QUERY,
+													    true, NULL, -1,
+															    NULL, NULL);
 					}
 					else
 						$2->name = yylval.word.ident;
+					$2->lineno = plpsm_location_to_lineno(@1);
 					$$ = $2;
-					DEBUG_SET($2, @1);
 				}
 			| DECLARE declare_prefetch HANDLER FOR condition_list dstmt
 				{
-					DEBUG_INIT;
 					if ($2->typ != PLPSM_STMT_DECLARE_HANDLER)
 						yyerror("syntax error");
 					$2->inner_left = $6;
 					$2->data = $5;
+					$2->lineno = plpsm_location_to_lineno(@1);
 					$$ = $2;
-					DEBUG_SET($2, @1);
 				}
 		;
 
@@ -517,7 +493,7 @@ opt_value:
 stmt_if:		IF expr_until_then statements ';' stmt_else END IF
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_IF, @1);
-					new->expr = $2;
+					new->esql = $2;
 					new->inner_left = $3;
 					new->inner_right = $5;
 					$$ = new;
@@ -531,12 +507,10 @@ stmt_else:
 			| ELSEIF expr_until_then statements ';' stmt_else
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_IF, @1);
-					DEBUG_INIT;
-					new->expr = $2;
+					new->esql = $2;
 					new->inner_left = $3;
 					new->inner_right = $5;
 					$$ = new;
-					DEBUG_SET(new, @1);
 				}
 			| ELSE statements ';'
 				{
@@ -553,33 +527,12 @@ stmt_else:
 stmt_case: 		CASE opt_expr_until_when case_when_list opt_case_else END CASE
 					{
 						Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_CASE, @1);
-						new->expr = $2;
+						new->esql = $2;
 						new->inner_left = $3;
 						new->inner_right = $4;
 						$$ = new;
 					}
 				;
-
-opt_expr_until_when:
-				{
-					char *expr = NULL;
-					int	tok = yylex();
-					StringInfoData	ds;
-
-					if (tok != WHEN)
-					{
-						plpsm_push_back_token(tok);
-						initStringInfo(&ds);
-						expr = read_until(WHEN, -1, -1, "WHEN", true, false, NULL, -1);
-						appendStringInfo(&ds, "SELECT (%s)", expr);
-						check_sql_expr(ds.data);
-						pfree(ds.data);
-						$$ = expr;
-					}
-					plpsm_push_back_token(WHEN);
-					$$ = expr;
-				}
-		;
 
 case_when_list:
 			case_when_list case_when
@@ -596,7 +549,7 @@ case_when_list:
 case_when:		WHEN expr_until_then statements ';'
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_CASE, @1);
-					new->expr = $2;
+					new->esql = $2;
 					new->inner_left = $3;
 					new->last = new;
 					$$ = new;
@@ -626,12 +579,13 @@ opt_case_else:
 stmt_set:		SET assign_list
 				{
 					$$ = $2;
+					$$->location = @1;
 				}
 			| SET '(' qual_identif_list ')' '=' '(' expr_list ')'
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SET, @1);
 					new->compound_target = $3;
-					new->expr_list = $7;
+					new->esql_list = $7;
 					$$ = new;
 				}
 		;
@@ -653,7 +607,7 @@ assign_list:
 assign_item:		target '=' expr_until_semi_or_coma
 				{
 					$1->typ = PLPSM_STMT_SET;
-					$1->expr = $3;
+					$1->esql = $3;
 					$$ = $1;
 				}
 		;
@@ -706,7 +660,7 @@ qual_identif:
 stmt_print:		PRINT expr_list
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_PRINT, @1);
-					new->compound_target = $2;
+					new->esql_list = $2;
 					$$ = new;
 				}
 		;
@@ -729,7 +683,7 @@ stmt_return:
 					else
 					{
 						plpsm_push_back_token(tok);
-						new->expr = read_expr_until_semi();
+						new->esql = read_expr_until_semi();
 					}
 					$$ = new;
 				}
@@ -761,7 +715,7 @@ stmt_while:		opt_label WHILE expr_until_do statements ';' END WHILE opt_end_labe
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_WHILE, $1 ? @1 : @2);
 					new->name = $1;
-					new->expr = $3;
+					new->esql = $3;
 					new->inner_left = $4;
 					check_labels($1, $8);
 					$$ = new;
@@ -778,7 +732,7 @@ stmt_repeat_until:	opt_label REPEAT statements ';' UNTIL expr_until_end REPEAT o
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_REPEAT_UNTIL, $1 ? @1 : @2);
 					new->name = $1;
-					new->expr = $6;
+					new->esql = $6;
 					new->inner_left = $3;
 					check_labels($1, $8);
 					$$ = new;
@@ -825,7 +779,7 @@ stmt_prepare:		PREPARE WORD FROM expr_until_semi
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_PREPARE, @1);
 					new->name = $2.ident;
-					new->expr = $4;
+					new->esql = $4;
 					$$ = new;
 				}
 		;
@@ -878,7 +832,7 @@ stmt_execute_immediate:
 			EXECUTE IMMEDIATE expr_until_semi_into_using
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE_IMMEDIATE, @1);
-					new->expr = $3;
+					new->esql = $3;
 					$$ = new;
 				}
 		;
@@ -947,6 +901,7 @@ stmt_for:
 				{
 					Plpsm_stmt *new = $3;
 					new->location = $1 ? @1 : @2;
+					new->lineno = plpsm_location_to_lineno(new->location);
 					new->name = $1;
 					new->inner_left = $4;
 					check_labels($1, $8);
@@ -1021,37 +976,45 @@ for_prefetch:
 						new->stmtfor.cursor_name = cursor_name;
 						new->stmtfor.loopvar_name = loopvar_name;
 					}
-					new->query = read_until(DO, -1, -1, "DO", false, false, NULL, startloc);
+					new->esql = read_embeded_sql(DO, -1, -1, "DO", PLPSM_ESQL_QUERY, true, NULL, startloc, NULL, NULL);
 					$$ = new;
 				}
 		;
 
 stmt_sql:
-			INSERT 				{ $$ = make_stmt_sql("INSERT", @1); }
-			| UPDATE 			{ $$ = make_stmt_sql("UPDATE", @1); }
-			| DELETE			{ $$ = make_stmt_sql("DELETE", @1); }
+			INSERT 				{ $$ = make_stmt_sql(@1); }
+			| UPDATE 			{ $$ = make_stmt_sql(@1); }
+			| DELETE			{ $$ = make_stmt_sql(@1); }
 			;
 
 stmt_select_into:
 			SELECT expr_list_into qual_identif_list 
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SELECT_INTO, @1);
-					new->expr_list = $2;
+					new->esql_list = $2;
 					new->compound_target = $3;
 					if (list_length($2) != list_length($3))
-						elog(ERROR, "number of target variables is different than number of attributies");
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("number of target variables is different than number of attributies"),
+								 parser_errposition(@1)));
 
 					$$ = new;
 				}
 			| SELECT expr_list_into qual_identif_list FROM
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SELECT_INTO, @1);
-					new->expr_list = $2;
+					new->esql_list = $2;
 					new->compound_target = $3;
 					if (list_length($2) != list_length($3))
-						elog(ERROR, "number of target variables is different than number of attributies");
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("number of target variables is different than number of attributies"),
+								 parser_errposition(@1)));
 
-					new->from_clause = read_until(';', 0, 0, ";", false, false, NULL, @4);
+					new->from_clause = read_embeded_sql(';', 0, 0, ";", PLPSM_ESQL_QUERY, false, 
+														    NULL, @4, 
+															    NULL, NULL);
 					$$ = new;
 				}
 			;
@@ -1059,23 +1022,20 @@ stmt_select_into:
 expr_list_into:
 				{
 					int endtok;
-					List	*expr_list = NIL;
+					List	*esql_list = NIL;
 
 					do
 					{
-						char *expr;
-						StringInfoData	ds;
-						expr = read_until(',', INTO, 0, ", or INTO", true, false, &endtok, -1);
-						initStringInfo(&ds);
-						appendStringInfo(&ds, "SELECT (%s)", expr);
-						check_sql_expr(ds.data);
-						pfree(ds.data);
+						Plpsm_ESQL *esql = read_embeded_sql(',',INTO, 0, ", or INTO", 
+												PLPSM_ESQL_EXPR, true, 
+														    &endtok, -1, 
+															    NULL, NULL);
 						if (endtok == ',')
 							yylex();
 
-						expr_list = lappend(expr_list, makeString(expr));
+						esql_list = lappend(esql_list, esql);
 					} while (endtok != INTO);
-					$$ = expr_list;
+					$$ = esql_list;
 				}
 		;
 
@@ -1088,249 +1048,112 @@ expr_until_semi:
 expr_list:
 			expr_until_semi_or_coma_or_parent
 				{
-					$$ = list_make1(makeString($1));
+					$$ = list_make1($1);
 				}
 			| expr_list ',' expr_until_semi_or_coma_or_parent
 				{
-					$$ = lappend($1, makeString($3));
+					$$ = lappend($1, $3);
 				}
 			;
 
 expr_until_semi_or_coma:
 				{
-					StringInfoData		ds;
-					char *expr;
-					int	tok;
-
-					expr = read_until(';',',', 0, "; or ,", true, false, &tok, -1);
-					initStringInfo(&ds);
-					appendStringInfo(&ds, "SELECT (%s)", expr);
-					check_sql_expr(ds.data);
-					pfree(ds.data);
-					$$ = expr;
+					Plpsm_ESQL *esql = read_embeded_sql(';',',', 0, "; or ,", 
+												PLPSM_ESQL_EXPR, true, 
+														    NULL, -1, 
+															    NULL, NULL);
+					$$ = esql;
 				}
 		;
 
 expr_until_do:
 				{
-					StringInfoData		ds;
-					char *expr;
-
-					expr = read_until(DO, -1, -1, "DO", true, false, NULL, -1);
-					initStringInfo(&ds);
-					appendStringInfo(&ds, "SELECT (%s)", expr);
-					check_sql_expr(ds.data);
-					pfree(ds.data);
-					$$ = expr;
+					Plpsm_ESQL *esql = read_embeded_sql(DO, -1, -1, "DO", 
+												PLPSM_ESQL_EXPR, true, 
+														    NULL, -1, 
+															    NULL, NULL);
+					$$ = esql;
 				}
 		;
 
 expr_until_then:
 				{
-					StringInfoData		ds;
-					char *expr;
-
-					expr = read_until(THEN, -1, -1, "THEN", true, false, NULL, -1);
-					initStringInfo(&ds);
-					appendStringInfo(&ds, "SELECT (%s)", expr);
-					check_sql_expr(ds.data);
-					pfree(ds.data);
-					$$ = expr;
+					Plpsm_ESQL *esql = read_embeded_sql(THEN, -1, -1, "THEN", 
+												PLPSM_ESQL_EXPR, true, 
+														    NULL, -1, 
+															    NULL, NULL);
+					$$ = esql;
 				}
 		;
 
 expr_until_end:
 				{
-					StringInfoData		ds;
-					char *expr;
-
-					expr = read_until(END, -1, -1, "END", true, false, NULL, -1);
-					initStringInfo(&ds);
-					appendStringInfo(&ds, "SELECT (%s)", expr);
-					check_sql_expr(ds.data);
-					pfree(ds.data);
-					$$ = expr;
+					Plpsm_ESQL *esql = read_embeded_sql(END, -1, -1, "END", 
+												PLPSM_ESQL_EXPR, true, 
+														    NULL, -1, 
+															    NULL, NULL);
+					$$ = esql;
 				}
 		;
 
 expr_until_semi_into_using:
 				{
-					StringInfoData		ds;
-					char *expr;
-					int	endtok;
-
-					expr = read_until(';',INTO, USING, "; or INTO or USING", true, false, &endtok, -1);
-					initStringInfo(&ds);
-					appendStringInfo(&ds, "SELECT (%s)", expr);
-					check_sql_expr(ds.data);
-					pfree(ds.data);
+					int endtok;
+					Plpsm_ESQL *esql = read_embeded_sql(';',INTO, USING, "; or INTO or USING", 
+												PLPSM_ESQL_EXPR, true, 
+														    &endtok, -1, 
+															    NULL, NULL);
 					if (endtok != ';')
 						plpsm_push_back_token(endtok);
-					$$ = expr;
+					$$ = esql;
 				}
 		;
 
 expr_until_semi_or_coma_or_parent:
 				{
-					StringInfoData		ds;
-					char *expr;
-					int	endtok;
+					int endtok;
+					Plpsm_ESQL *esql = read_embeded_sql(';',',', ')', "; or , or )", 
+												PLPSM_ESQL_EXPR, true, 
+														    &endtok, -1, 
+															    NULL, NULL);
 
-					expr = read_until(';',',', ')', "; or , or )", true, false, &endtok, -1);
-					initStringInfo(&ds);
-					appendStringInfo(&ds, "SELECT (%s)", expr);
-					check_sql_expr(ds.data);
-					pfree(ds.data);
 					if (endtok != ';' && endtok != ',')
 						plpsm_push_back_token(endtok);
-					$$ = expr;
+					$$ = esql;
+				}
+		;
+
+opt_expr_until_when:
+				{
+					Plpsm_ESQL *esql = NULL;
+					int	tok = yylex();
+
+					if (tok != WHEN)
+					{
+						esql = read_embeded_sql(WHEN,-1, -1, "WHEN", 
+												PLPSM_ESQL_EXPR, true, 
+														    NULL, yylloc, 
+															    NULL, NULL);
+					}
+					plpsm_push_back_token(WHEN);
+					$$ = esql;
 				}
 		;
 
 %%
 
 static Plpsm_stmt *
-make_stmt_sql(const char *prefix, int location)
+make_stmt_sql(int location)
 {
-	StringInfoData ds;
-	char *expr;
 	Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SQL, location);
-
-	initStringInfo(&ds);
-	expr = read_until(';', 0, 0, ";", false, false, NULL, -1);
-	appendStringInfo(&ds, "%s %s", prefix, expr);
-	pfree(expr);
-	new->query = ds.data;
+	new->esql = read_embeded_sql(';', 0, 0, ";", PLPSM_ESQL_QUERY, true, NULL, location, NULL, NULL);
 	return new;
 }
 
-static char 
+static Plpsm_ESQL
 *read_expr_until_semi(void)
 {
-	StringInfoData		ds;
-	char *expr;
-
-	expr = read_until(';',0, 0, ";", true, false, NULL, -1);
-	initStringInfo(&ds);
-	appendStringInfo(&ds, "SELECT (%s)", expr);
-	
-	check_sql_expr(ds.data);
-	pfree(ds.data);
-	
-	return expr;
-}
-
-/*
- * when optional_endtoken is true, then expression can be finished
- * without identification of any until_tokens.
- */
-static char *
-read_until(int until1,
-			int until2,
-			int until3,
-			const char *expected,
-			bool	is_expr,
-			bool	is_datatype,
-			int *endtoken,
-			int startlocation)
-{
-	int				parenlevel = 0;
-	int tok;
-	StringInfoData		ds;
-
-	initStringInfo(&ds);
-
-	for (;;)
-	{
-		/* read a current location before you read a next tag */
-		tok = yylex();
-
-		if (startlocation < 0)
-			startlocation = yylloc;
-
-		/* 
-		 * When until1 is semicolon, then endtag is optional.
-		 * Any lists, or SQLs must not contains a zero tag and must not
-		 * contains a semicolon - but, parenlevel must be zero for
-		 * leaving cycle.
-		 */
-		if (tok == until1 || tok == until2 || tok == until3 || (until1 == ';' && tok == 0))
-		{
-			/* don't want to leave early - etc SET a = (10,20), b = .. */
-			if (tok == ';' || tok == 0 || parenlevel == 0 || 
-					(tok == ')' && parenlevel == 0) ||
-					(tok == ',' && parenlevel == 0))
-				break;
-		}
-		if (tok == '(' || tok == '[')
-			parenlevel++;
-		else if (tok == ')' || tok == ']')
-		{
-			parenlevel--;
-			if (parenlevel < 0)
-				yyerror("mismatched parentheses");
-		}
-
-		if (tok == 0)
-		{
-			if (parenlevel != 0)
-				yyerror("mismatched parentheses");
-
-			/*
-			 * Probably there can be a missing token, if object is
-			 * SQL expression, then try to verify expression first, there
-			 * can be more early detected missing symbol.
-			 */
-			if (is_expr)
-			{
-				StringInfoData	bexpr;
-
-				if (startlocation >= yylloc)
-					yyerror("missing expression");
-
-				initStringInfo(&bexpr);
-				appendStringInfoString(&bexpr, "SELECT (");
-				plpsm_append_source_text(&bexpr, startlocation, yylloc);
-				check_sql_expr(bexpr.data);
-				pfree(bexpr.data);
-			}
-
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("missing \"%s\" at end of SQL expression",
-										    expected)));
-		}
-	}
-
-	if (parenlevel != 0)
-		yyerror("mismatched parentheses");
-
-	if (endtoken)
-		*endtoken = tok;
-
-	if (is_expr && startlocation >= yylloc)
-		yyerror("missing expression");
-
-	if (is_datatype && startlocation >= yylloc)
-		yyerror("missing data type");
-
-	/* semicolon is usually returned back */
-	if (tok == ';' || tok == ',')
-		plpsm_push_back_token(tok);
-
-	plpsm_append_source_text(&ds, startlocation, yylloc);
-
-	return ds.data;
-}
-
-static void
-check_sql_expr(const char *stmt)
-{
-	MemoryContext oldCxt;
-
-	oldCxt = MemoryContextSwitchTo(CurrentMemoryContext);
-	(void) raw_parser(stmt);
-	MemoryContextSwitchTo(oldCxt);
+	return read_embeded_sql(';', 0, 0, ";", PLPSM_ESQL_EXPR, true, NULL, -1, NULL, NULL);
 }
 
 typedef enum
@@ -1366,8 +1189,8 @@ declare_prefetch(void)
 		if (state == EXPECTED_DATATYPE)
 		{
 			int endtok;
-			char *datatype;
-			Oid	type_id;
+			Plpsm_ESQL *datatype;
+			Oid	typoid;
 			int32	typmod;
 			int16		typlen;
 			bool		typbyval;
@@ -1380,13 +1203,15 @@ declare_prefetch(void)
 			 * because it raise a error to late. Datatype must not contains
 			 * a keywords, special chars etc
 			 */
-			datatype = read_until(';', DEFAULT, 0, "; or \"DEFAULT\"", false, true, &endtok, startlocation);
-			parse_datatype(datatype, &type_id, &typmod);
-			get_typlenbyval(type_id, &typlen, &typbyval);
+			datatype = read_embeded_sql(';', DEFAULT, -1, "; or \"DEFAULT\"", PLPSM_ESQL_DATATYPE, false, &endtok, 
+															    startlocation,
+																&typoid,
+																&typmod);
+			get_typlenbyval(typoid, &typlen, &typbyval);
 
-			result->datum.typoid = type_id;
+			result->datum.typoid = typoid;
 			result->datum.typmod = typmod;
-			result->datum.typname = datatype;
+			result->datum.typname = datatype->sqlstr;
 			result->datum.typlen = typlen;
 			result->datum.typbyval = typbyval;
 
@@ -1394,7 +1219,7 @@ declare_prefetch(void)
 				break;
 
 			/* when DEFAULT value is specified, then read a expression until semicolon */
-			result->expr = read_expr_until_semi();
+			result->esql = read_expr_until_semi();
 			break;
 		}
 
@@ -1613,19 +1438,13 @@ is_unreserved_keyword(int tok)
 	}
 }
 
-static void
-parse_datatype(const char *string, Oid *type_id, int32 *typmod)
-{
-	/* Let the main parser try to parse it under standard SQL rules */
-	parseTypeString(string, type_id, typmod);
-}
-
 Plpsm_stmt *
 plpsm_new_stmt(Plpsm_stmt_type typ, int location)
 {
 	Plpsm_stmt *n = palloc0(sizeof(Plpsm_stmt));
 	n->typ = typ;
-	n->location = location;
+	if ((n->location = location) != -1)
+		n->lineno = plpsm_location_to_lineno(location);
 	return n;
 }
 
@@ -1635,10 +1454,10 @@ plpsm_new_stmt(Plpsm_stmt_type typ, int location)
 static void
 check_labels(const char *label1, const char *label2)
 {
-	if (label2 == NULL || label1 == NULL)
-		return;
 	if (label2 != NULL && label1 == NULL)
 		yyerror("syntax error, missing begin label");
+	if (label2 == NULL || label1 == NULL)
+		return;
 	if (strcmp(label1, label2) != 0)
 		yyerror("end label is defferent than begin label");
 }
@@ -1699,6 +1518,39 @@ parser_stmt_name(Plpsm_stmt_type typ)
 	}
 }
 
+static void
+esql_out(StringInfo ds, Plpsm_ESQL *esql)
+{
+	switch (esql->typ)
+	{
+		case PLPSM_ESQL_EXPR:
+			appendStringInfo(ds, "EXPR: %s", esql->sqlstr);
+			break;
+		case PLPSM_ESQL_QUERY:
+			appendStringInfo(ds, "QUERY: %s", esql->sqlstr);
+			break;
+		case PLPSM_ESQL_DATATYPE:
+			appendStringInfo(ds, "DATATYPE: %s", esql->sqlstr);
+			break;
+	}
+}
+
+static void 
+esql_list_out(StringInfo ds, List *list)
+{
+	ListCell	*l;
+	bool	isFirst = true;
+
+	foreach (l, list)
+	{
+		if (!isFirst)
+			appendStringInfoChar(ds, ',');
+		else
+			isFirst = false;
+		esql_out(ds, (Plpsm_ESQL *) lfirst(l));
+	}
+}
+
 /*
  * helper routines to debug output of parser stage
  */
@@ -1719,9 +1571,12 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 	appendStringInfo(ds, "%s| Compound target: %s\n", ident, nodeToString(stmt->compound_target));
 	//appendStringInfo(ds, "%s| Data: %s\n", ident, nodeToString(stmt->data));
 	appendStringInfo(ds, "%s| Option: %d\n", ident, stmt->option);
-	appendStringInfo(ds, "%s| Query: %s\n", ident, stmt->query);
-	appendStringInfo(ds, "%s| Expr: %s\n", ident, stmt->expr);
-	appendStringInfo(ds, "%s| ExprList: %s\n", ident, nodeToString(stmt->expr_list));
+	appendStringInfo(ds, "%s| ESQL: ", ident);
+	esql_out(ds, stmt->esql);
+	appendStringInfoChar(ds, '\n');
+	appendStringInfo(ds, "%s| ESQL list: ", ident);
+	esql_list_out(ds, stmt->esql_list);
+	appendStringInfoChar(ds, '\n');
 	
 	switch (stmt->typ)
 	{
@@ -1735,8 +1590,7 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 		default:
 			/* do nothing */ ;
 	}
-	
-	appendStringInfo(ds, "%s| Debug: \"%s\"\n", ident, stmt->debug ? stmt->debug : "");
+
 	appendStringInfo(ds, "%s| Inner left:\n", ident);
 	stmt_out(ds, stmt->inner_left, nested_level + 1);
 	appendStringInfo(ds, "%s| Inner right:\n", ident);
@@ -1762,4 +1616,271 @@ elog_stmt(int level, Plpsm_stmt *stmt)
 	
 	elog(level, "Parser stage result:\n%s", ds.data);
 	pfree(ds.data);
+}
+
+/*
+ * when optional_endtoken is true, then expression can be finished
+ * without identification of any until_tokens.
+ */
+static Plpsm_ESQL *
+read_embeded_sql(int until1,
+			int until2,
+			int until3,
+			const char *expected,
+			Plpsm_esql_type expected_type,
+			bool valid_sql,
+			int *endtoken,
+			int startlocation,
+			Oid *typoid,
+			int32 *typmod)
+{
+	int				parenlevel = 0;
+	int tok;
+	StringInfoData		ds;
+	Plpsm_ESQL	*esql = palloc(sizeof(Plpsm_ESQL));
+
+	esql->typ = expected_type;
+
+	initStringInfo(&ds);
+
+	for (;;)
+	{
+		/* read a current location before you read a next tag */
+		tok = yylex();
+
+		if (startlocation < 0)
+			startlocation = yylloc;
+
+		/* 
+		 * When until1 is semicolon, then endtag is optional.
+		 * Any lists, or SQLs must not contains a zero tag and must not
+		 * contains a semicolon - but, parenlevel must be zero for
+		 * leaving cycle.
+		 */
+		if (tok == until1 || tok == until2 || tok == until3 || (until1 == ';' && tok == 0))
+		{
+			/* don't want to leave early - etc SET a = (10,20), b = .. */
+			if (tok == ';' || tok == 0 || parenlevel == 0 || 
+					(tok == ')' && parenlevel == 0) ||
+					(tok == ',' && parenlevel == 0))
+				break;
+		}
+		if (tok == '(' || tok == '[')
+			parenlevel++;
+		else if (tok == ')' || tok == ']')
+		{
+			parenlevel--;
+			if (parenlevel < 0)
+				yyerror("mismatched parentheses");
+		}
+
+		/* special rules for plpgsql users. Datatype cannot to contain '=' */
+		if (tok == '=' && expected_type == PLPSM_ESQL_DATATYPE)
+		{
+			plpsm_push_back_token(tok);
+			break;
+		}
+
+		/* PSM keywords without a few exceptions are prohibited */
+		switch (tok)
+		{
+			case BEGIN:
+			case CLOSE:
+			case CONDITION:
+			case CURSOR:
+			case DECLARE:
+			case DEFAULT:
+			case DO:
+			case ELSEIF:
+			case EXIT:
+			case FETCH:
+			case FOR:
+			case HANDLER:
+			case IF:
+			case ITERATE:
+			case LEAVE:
+			case LOOP:
+			case OPEN:
+			case PREPARE:
+			case PRINT:
+			case REPEAT:
+			case RETURN:
+			case WHILE:
+			case UNTIL:
+				yyerror("using not allowed PLPSM keyword");
+		}
+
+		/* expression, or query, or dataype must not contains a semicolon ever */
+		if (tok == ';')
+		{
+			plpsm_push_back_token(tok);
+			break;
+		}
+
+		if (tok == 0)
+		{
+			if (parenlevel != 0)
+				yyerror("mismatched parentheses");
+
+			/*
+			 * Probably there can be a missing token, if object is
+			 * SQL expression, then try to verify expression first, there
+			 * can be more early detected missing symbol.
+			 */
+			if (expected_type == PLPSM_ESQL_EXPR)
+			{
+				StringInfoData	bexpr;
+
+				if (startlocation >= yylloc)
+					yyerror("missing expression");
+
+				initStringInfo(&bexpr);
+				appendStringInfoString(&bexpr, "SELECT (");
+				plpsm_append_source_text(&bexpr, startlocation, yylloc);
+				check_sql_expr(bexpr.data, startlocation, strlen("SELECT ("));
+				pfree(bexpr.data);
+			}
+
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("missing \"%s\" at end of SQL expression",
+										    expected),
+					 parser_errposition(yylloc)));
+		}
+	}
+
+	if (parenlevel != 0)
+		yyerror("mismatched parentheses");
+
+	if (endtoken)
+		*endtoken = tok;
+
+	if (expected_type == PLPSM_ESQL_EXPR)
+	{
+		StringInfoData	bexpr;
+
+		if (startlocation >= yylloc)
+			yyerror("missing expression");
+		
+		plpsm_append_source_text(&ds, startlocation, yylloc);
+
+		if (valid_sql)
+		{
+			initStringInfo(&bexpr);
+			appendStringInfoString(&bexpr, "SELECT (");
+			plpsm_append_source_text(&bexpr, startlocation, yylloc);
+			appendStringInfoChar(&bexpr, ')');
+			check_sql_expr(bexpr.data, startlocation, strlen("SELECT ("));
+			pfree(bexpr.data);
+		}
+	}
+	else if (expected_type == PLPSM_ESQL_DATATYPE)
+	{
+		if (startlocation >= yylloc)
+			yyerror("missing data type");
+
+		plpsm_append_source_text(&ds, startlocation, yylloc);
+		parse_datatype(ds.data, startlocation, typoid, typmod);
+	}
+	else
+	{
+		plpsm_append_source_text(&ds, startlocation, yylloc);
+
+		if (valid_sql)
+			check_sql_expr(ds.data, startlocation, 0);
+	}
+
+	esql->location = startlocation;
+	esql->lineno = plpsm_location_to_lineno(startlocation);
+	esql->sqlstr = ds.data;
+
+	/* semicolon is usually returned back */
+	if (tok == ';' || tok == ',')
+		plpsm_push_back_token(tok);
+
+	return esql;
+}
+
+static void
+check_sql_expr(const char *stmt, int location, int leaderlen)
+{
+	Plpsm_sql_error_callback_arg cbarg;
+	ErrorContextCallback  syntax_errcontext;
+	MemoryContext oldCxt;
+
+	cbarg.location = location;
+	cbarg.leaderlen = leaderlen;
+
+	syntax_errcontext.callback = plpsm_sql_error_callback;
+	syntax_errcontext.arg = &cbarg;
+	syntax_errcontext.previous = error_context_stack;
+	error_context_stack = &syntax_errcontext;
+
+	oldCxt = MemoryContextSwitchTo(CurrentMemoryContext);
+	(void) raw_parser(stmt);
+	MemoryContextSwitchTo(oldCxt);
+
+	/* Restore former ereport callback */
+	error_context_stack = syntax_errcontext.previous;
+}
+
+void
+plpsm_sql_error_callback(void *arg)
+{
+	Plpsm_sql_error_callback_arg *cbarg = (Plpsm_sql_error_callback_arg *) arg;
+	int			errpos;
+
+	/*
+	 * First, set up internalerrposition to point to the start of the
+	 * statement text within the function text.  Note this converts
+	 * location (a byte offset) to a character number.
+	 */
+	parser_errposition(cbarg->location);
+
+	/*
+	 * If the core parser provided an error position, transpose it.
+	 * Note we are dealing with 1-based character numbers at this point.
+	 */
+	errpos = geterrposition();
+
+	if (errpos > cbarg->leaderlen)
+	{
+		int		myerrpos = getinternalerrposition();
+
+		if (myerrpos > 0)		/* safety check */
+			internalerrposition(myerrpos + errpos - cbarg->leaderlen - 1);
+	}
+
+	/* In any case, flush errposition --- we want internalerrpos only */
+	errposition(0);
+}
+
+/*
+ * Parse a SQL datatype name.
+ *
+ * The heavy lifting is done elsewhere.  Here we are only concerned
+ * with setting up an errcontext link that will let us give an error
+ * cursor pointing into the plpgsql function source, if necessary.
+ * This is handled the same as in check_sql_expr(), and we likewise
+ * expect that the given string is a copy from the source text.
+ */
+static void
+parse_datatype(const char *string, int location, Oid *typoid, int32 *typmod)
+{
+	Plpsm_sql_error_callback_arg cbarg;
+	ErrorContextCallback  syntax_errcontext;
+
+	cbarg.location = location;
+	cbarg.leaderlen = 0;
+
+	syntax_errcontext.callback = plpsm_sql_error_callback;
+	syntax_errcontext.arg = &cbarg;
+	syntax_errcontext.previous = error_context_stack;
+	error_context_stack = &syntax_errcontext;
+
+	/* Let the main parser try to parse it under standard SQL rules */
+	parseTypeString(string, typoid, typmod);
+
+	/* Restore former ereport callback */
+	error_context_stack = syntax_errcontext.previous;
 }

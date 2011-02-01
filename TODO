@@ -1,0 +1,13 @@
+* error trapping
+* support for triggers
+
+
+begin
+  declare newval mytab referencing new;
+  if newval.id > 10 then
+    signal sqlcode '83833';
+  end if;
+  set new.checked = true;
+  return newval;
+end;
+ 

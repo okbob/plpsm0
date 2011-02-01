@@ -148,10 +148,16 @@ static int	num_pushbacks;
 static int	pushback_token[MAX_PUSHBACKS];
 static TokenAuxData pushback_auxdata[MAX_PUSHBACKS];
 
+/* State for plpsm_location_to_lineno */
+static const char *cur_line_start;
+static const char *cur_line_end;
+static int cur_line_num;
+
 static int internal_yylex(TokenAuxData *auxdata);
 static void parse_word(char *word1, const char *yytxt, PLword *word);
 static void push_back_token(int token, TokenAuxData *auxdata);
 
+static void location_lineno_init(void);
 
 /*
  * This is the yylex routine called from the PL/PSM grammar.
@@ -203,7 +209,7 @@ plpsm_yylex(void)
 						/* not A.B.C, so just process A.B */
 						push_back_token(tok5, &aux5);
 						push_back_token(tok4, &aux4);
-						
+
 						aux1.lval.cword.idents = list_make2(makeString(aux1.lval.str),
 														makeString(aux3.lval.str));
 						tok1 = CWORD;
@@ -271,6 +277,34 @@ parse_word(char *word1, const char *yytxt, PLword *word)
 
 
 /*
+ * plpsm_scanner_errposition
+ *		Report an error cursor position, if possible.
+ *
+ * This is expected to be used within an ereport() call.  The return value
+ * is a dummy (always 0, in fact).
+ *
+ * Note that this can only be used for messages emitted during initial
+ * parsing of a plpgsql function, since it requires the scanorig string
+ * to still be available.
+ */
+int
+plpsm_scanner_errposition(int location)
+{
+	int			pos;
+
+	if (location < 0 || scanorig == NULL)
+		return 0;				/* no-op if location is unknown */
+
+	/* Convert byte offset to character number */
+	pos = pg_mbstrlen_with_len(scanorig, location) + 1;
+	/* And pass it to the ereport mechanism */
+	(void) internalerrposition(pos);
+	/* Also pass the function body string */
+	return internalerrquery(scanorig);
+}
+
+
+/*
  * Internal yylex function.  This wraps the core lexer and adds one feature:
  * a token pushback stack.	We also make a couple of trivial single-token
  * translations from what the core lexer does to what we want, in particular
@@ -312,7 +346,8 @@ plpsm_yyerror(const char *message)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 		/* translator: %s is typically the translation of "syntax error" */
-				 errmsg("%s at end of input", _(message))));
+				 errmsg("%s at end of input", _(message)),
+				 plpsm_scanner_errposition(plpsm_yylloc)));
 	}
 	else
 	{
@@ -327,10 +362,58 @@ plpsm_yyerror(const char *message)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 		/* translator: first %s is typically the translation of "syntax error" */
-				 errmsg("%s at or near \"%s\"", _(message), yytext)));
+				 errmsg("%s at or near \"%s\"", _(message), yytext),
+				 plpsm_scanner_errposition(plpsm_yylloc)));
 	}
 }
 
+/*
+ * Given a location (a byte offset in the function source text),
+ * return a line number.
+ *
+ * We expect that this is typically called for a sequence of increasing
+ * location values, so optimize accordingly by tracking the endpoints
+ * of the "current" line.
+ */
+int
+plpsm_location_to_lineno(int location)
+{
+	const char *loc;
+
+	if (location < 0 || scanorig == NULL)
+		return 0;				/* garbage in, garbage out */
+	loc = scanorig + location;
+
+	/* be correct, but not fast, if input location goes backwards */
+	if (loc < cur_line_start)
+		location_lineno_init();
+
+	while (cur_line_end != NULL && loc > cur_line_end)
+	{
+		cur_line_start = cur_line_end + 1;
+		cur_line_num++;
+		cur_line_end = strchr(cur_line_start, '\n');
+	}
+
+	return cur_line_num;
+}
+
+/* initialize or reset the state for plpgsql_location_to_lineno */
+static void
+location_lineno_init(void)
+{
+	cur_line_start = scanorig;
+	cur_line_num = 1;
+
+	cur_line_end = strchr(cur_line_start, '\n');
+}
+
+/* return the most recently computed lineno */
+int
+plpsm_latest_lineno(void)
+{
+	return cur_line_num;
+}
 
 void
 plpsm_scanner_init(const char *str)
@@ -341,6 +424,8 @@ plpsm_scanner_init(const char *str)
 	yyscanner = scanner_init(str, &core_yy,
 						reserved_keywords, num_reserved_keywords);
 	scanorig = str;
+
+	location_lineno_init();
 }
 
 void

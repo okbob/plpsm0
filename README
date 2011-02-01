@@ -1,0 +1,49 @@
+PLPSM is formal language specified by ANSI SQL - SQL/PSM part. This language is used in some
+comercial databases with name SPL - Stored Procedure Language. The main targets of PLPSM:
+
+* implementation that is near to standard
+* be simple, clean and robust
+* embeded SQL is validated in compile time
+* using a early casting and using only enabled conversions
+
+The main differnce between PLPSM and PL/pgSQL is:
+
+* more precise validation of embeded SQL and expressions:
+
+    PLPSM checkers can find more errors in compile time. Other - all database objects must be
+    well identified in compile time. There are not possible a generic types as RECORD, there 
+    are no possible polymorphic types, there are no possible static DDL statements.
+
+* PLPMS has simpler expression executor than PL/pgSQL has:
+
+    Some procedures that uses a lot of expressions can be two times slower. Updating a field
+    of composite type is slower than in PL/pgSQL. On second hand - using a composite values
+    can be faster, execution of embeded SQL can be faster in PLPSM. PLPSM isn't too optimized
+    like PL/pgSQL is - the target area of PLPSM isn't too wide. PLPSM isn't designed as
+    universal language like PL/pgSQL is it now. It is designed for implementation of 
+    bussnes logic in stored procedures environment. It's glue for embeded SQL. A expression
+    evaluator can be optimized in next versions. There is only one reason, whe execution
+    is slower. We wouldn't to duplicate all PL/pgSQL code. As outside project a PLPSM
+    should be hard maintaining with same code, that PL/pgSQL has.
+
+* PLPSM is based on compilation to simple virtual machine, PL/pgSQL is based on interpretation of
+  semantic tree. 
+  
+    Usually this factor isn't important. For stored procedures a main factor is a speed of
+    embeded SQL execution. Both environments uses a same API - SPI - so in typical use cases a 
+    execution of stored procedures in these enveroments will be same or similar. A interpretation
+    allows a some tricks - but the one significant goal of PLPSM is a disabling these techniques.
+    Code in PLPSM should be simply ported to other databases with SQL/PSM support so some ugly
+    tricks are not allowed (by design). A compilation allows deeper checking and early error's 
+    localization.
+    
+* PLPSM use a early checking of trigger's variables NEW and OLD validity. 
+
+    You can use a invalid varible NEW or OLD (in a given context) in PL/pgSQL, but you can't
+    to access a context of these variables. PLPSM is more strict, you can't to use a trigger
+    variable without adequate context. It is checking on start of trigger. 
+
+What is same between PLPSM and PL/pgSQL:
+
+* lot of routines, that ensure perfect syntax error diagnostic are taken from PL/pgSQL
+  source code.

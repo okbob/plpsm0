@@ -70,11 +70,42 @@ typedef enum
 	PLPSM_STMT_SELECT_INTO
 } Plpsm_stmt_type;
 
+typedef enum
+{
+	PLPSM_ESQL_EXPR,
+	PLPSM_ESQL_QUERY,
+	PLPSM_ESQL_DATATYPE
+} Plpsm_esql_type;
+
+typedef struct 
+{							/* used for embeded SQL expressions and SQL queries */
+	Plpsm_esql_type		typ;
+	int		lineno;
+	int		location;
+	char	*sqlstr;
+} Plpsm_ESQL;
+
+typedef struct
+{							/* used for variable identifiers */
+	int		lineno;
+	int		loc;
+	List	*qualId;
+} Plpsm_positioned_qualid;
+
+typedef struct
+{							/* Holds a basic info about Datum value */
+	Oid		typoid;
+	int32		typmod;
+	char		*typname;
+	bool	typbyval;
+	int16	typlen;
+} Plpsm_type_descriptor;
+
 typedef struct Plpsm_stmt
 {
 	Plpsm_stmt_type		typ;
 	int		location;
-	int		lno;
+	int		lineno;
 	char *name;
 	List *target;
 	List 	*compound_target;
@@ -94,18 +125,21 @@ typedef struct Plpsm_stmt
 			char *loopvar_name;
 			char *cursor_name;
 		} stmtfor;
-		char *from_clause;
+		Plpsm_ESQL *from_clause;
 	};
 	void			*data;
 	int	option;
-	char	*query;
-	char	*expr;
+	
+	Plpsm_ESQL	*esql;				/* used when we working with single expr or query */
+	List		*esql_list;			/* used when we working with list of expressions */
+	
+	//char	*query;
+	//char	*expr;
 	union
 	{
-		List		*expr_list;
+		//List		*expr_list;
 		List		*var_list;
 	};
-	char			*debug;
 	struct Plpsm_stmt *next;
 	struct Plpsm_stmt *last;
 	struct Plpsm_stmt *inner_left;
@@ -304,6 +338,12 @@ typedef struct
 	Plpsm_pcode code[1];
 } Plpsm_pcode_module;
 
+typedef struct
+{
+	int		location;
+	int		leaderlen;
+} Plpsm_sql_error_callback_arg;
+
 extern Plpsm_stmt *plpsm_parser_tree;
 extern Plpsm_object *plpsm_parser_objects;
 
@@ -317,6 +357,11 @@ extern Datum psm0_validator(PG_FUNCTION_ARGS);
 extern int		plpsm_yyparse(void);
 extern void plpsm_yyerror(const char *message);
 extern int plpsm_yylex(void);
+
+extern int plpsm_latest_lineno(void);
+extern int plpsm_location_to_lineno(int location);
+extern int plpsm_scanner_errposition(int location);
+
 extern void plpsm_scanner_init(const char *str);
 extern void plpsm_scanner_finish(void); 
 extern void plpsm_push_back_token(int token);
@@ -326,5 +371,7 @@ extern Plpsm_pcode_module *plpsm_compile(Oid funcOid, bool forValidator);
 extern Datum plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo);
 
 extern Plpsm_stmt *plpsm_new_stmt(Plpsm_stmt_type typ, int location);
+
+extern void plpsm_sql_error_callback(void *arg);
 
 #endif
