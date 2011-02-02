@@ -28,7 +28,7 @@ The main differnce between PLPSM and PL/pgSQL is:
 
 * PLPSM is based on compilation to simple virtual machine, PL/pgSQL is based on interpretation of
   semantic tree. 
-  
+
     Usually this factor isn't important. For stored procedures a main factor is a speed of
     embeded SQL execution. Both environments uses a same API - SPI - so in typical use cases a 
     execution of stored procedures in these enveroments will be same or similar. A interpretation
@@ -36,12 +36,18 @@ The main differnce between PLPSM and PL/pgSQL is:
     Code in PLPSM should be simply ported to other databases with SQL/PSM support so some ugly
     tricks are not allowed (by design). A compilation allows deeper checking and early error's 
     localization.
-    
+
 * PLPSM use a early checking of trigger's variables NEW and OLD validity. 
 
     You can use a invalid varible NEW or OLD (in a given context) in PL/pgSQL, but you can't
     to access a context of these variables. PLPSM is more strict, you can't to use a trigger
     variable without adequate context. It is checking on start of trigger. 
+
+* PLPSM doesn't use a prepared plans for cursors.
+
+    PLPGSQL uses a cached plans for cursors, queries and expressions. PLPSM uses
+    cache only for expressions and queries. It's mean, so inner loops over cursors
+    can be slower, but there less possibility of using a slow plan. 
 
 What is same between PLPSM and PL/pgSQL:
 

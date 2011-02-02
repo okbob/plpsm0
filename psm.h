@@ -2,6 +2,7 @@
 #define PSM_H
 
 #include "postgres.h"
+#include "access/htup.h"
 #include "nodes/pg_list.h"
 
 #include "fmgr.h"
@@ -323,14 +324,42 @@ typedef struct
 } Plpsm_pcode;
 
 typedef struct
+{							/* Hash lookup key for functions */
+	Oid			oid;
+	bool		isTrigger;
+
+	/*
+	 * For a trigger function, the OID of the relation triggered on is part of
+	 * the hashkey --- we want to compile the trigger separately for each
+	 * relation it is used with, in case the rowtype is different.	Zero if
+	 * not called as a trigger.
+	 */
+	Oid		trigrelOid;
+} Plpsm_module_hashkey;
+
+typedef struct
 {
 	int mlength;
 	int	length;
 	int		ndatums;		/* max number of used Datums */
 	int		ndata;			/* number of data address used for module's instance */
 	char *name;
+	bool		is_read_only;
 	Plpsm_pcode code[1];
 } Plpsm_pcode_module;
+
+typedef struct
+{
+	Oid		oid;
+	TransactionId		xmin;
+	ItemPointerData		tid;
+	Plpsm_module_hashkey	*hashkey;
+	MemoryContext cxt;
+	unsigned long use_count;
+	bool		is_read_only;
+	Plpsm_pcode_module *code;
+	void	**DataPtrs;			/* Pointer to persistent allocated pointers */
+} Plpsm_module; 
 
 typedef struct
 {
@@ -344,6 +373,9 @@ extern Plpsm_object *plpsm_parser_objects;
 extern bool plpsm_debug_parser;
 extern bool plpsm_debug_compiler;
 
+extern MemoryContext plpsm_compile_tmp_cxt;
+
+extern void _PG_init(void);
 extern Datum psm0_call_handler(PG_FUNCTION_ARGS);
 extern Datum psm0_inline_handler(PG_FUNCTION_ARGS);
 extern Datum psm0_validator(PG_FUNCTION_ARGS);
@@ -361,12 +393,15 @@ extern void plpsm_scanner_finish(void);
 extern void plpsm_push_back_token(int token);
 extern void plpsm_append_source_text(StringInfo buf, int startlocation, int endlocation);
 
-extern Plpsm_pcode_module *plpsm_compile(Oid funcOid, bool forValidator);
-extern Datum plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo);
+extern Plpsm_module *plpsm_compile(FunctionCallInfo fcinfo, bool forValidator);
+
+extern Datum plpsm_func_execute(Plpsm_module *module, FunctionCallInfo fcinfo);
 
 extern Plpsm_stmt *plpsm_new_stmt(Plpsm_stmt_type typ, int location);
 extern Plpsm_positioned_qualid *new_qualid(List *qualId, int location);
 
 extern void plpsm_sql_error_callback(void *arg);
+
+extern void plpsm_HashTableInit(void);
 
 #endif

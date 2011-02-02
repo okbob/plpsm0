@@ -25,7 +25,7 @@ typedef struct
 } Params;
 
 Datum
-plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
+plpsm_func_execute(Plpsm_module *mod, FunctionCallInfo fcinfo)
 {
 	Datum	*values = NULL;
 	char	*nulls = NULL;
@@ -40,9 +40,14 @@ plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
 	Bitmapset	*acursors = NULL;		/* active cursors */
 	int	offset;
 	int	rc;
+	Plpsm_pcode_module *module = mod->code;
+	bool		is_read_only = module->is_read_only;
 
 	MemoryContext	exec_ctx;
 	MemoryContext	oldctx;
+	MemoryContext	func_cxt = mod->cxt;
+
+	DataPtrs = mod->DataPtrs;
 
 	/*
 	 * The temp context is a child of current context
@@ -59,11 +64,6 @@ plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo)
 		nulls = palloc(module->ndatums * sizeof(char));
 	}
 
-	if (module->ndata >= 1)
-	{
-		DataPtrs = palloc0((module->ndata + 1) * sizeof(void*) );
-	}
-	
 	while (PC < module->length)
 	{
 		Plpsm_pcode *pcode;
@@ -160,15 +160,18 @@ next_op:
 					if (plan == NULL)
 					{
 						plan =  SPI_prepare(pcode->expr.expr, pcode->expr.nparams, pcode->expr.typoids);
-						DataPtrs[pcode->expr.data] = plan;
 						if (plan == NULL)
 							elog(ERROR, "query \"%s\" cannot be prepared", pcode->expr.expr);
+
+						oldctx = MemoryContextSwitchTo(func_cxt);
+						DataPtrs[pcode->expr.data] = SPI_saveplan(plan);
+						MemoryContextSwitchTo(oldctx);
 					}
 
-					oldctx = MemoryContextSwitchTo(exec_ctx);
-					rc = SPI_execute_plan(plan, values, nulls, false, 2);
-					MemoryContextSwitchTo(oldctx);
 
+					oldctx = MemoryContextSwitchTo(exec_ctx);
+					rc = SPI_execute_plan(plan, values, nulls, is_read_only, 2);
+					MemoryContextSwitchTo(oldctx);
 
 					if (rc != SPI_OK_SELECT)
 						elog(ERROR, "SPI_execute failed executing query \"%s\" : %s",
@@ -217,10 +220,14 @@ next_op:
 						DataPtrs[pcode->expr.data] = plan;
 						if (plan == NULL)
 							elog(ERROR, "query \"%s\" cannot be prepared", pcode->expr.expr);
+
+						oldctx = MemoryContextSwitchTo(func_cxt);
+						DataPtrs[pcode->expr.data] = SPI_saveplan(plan);
+						MemoryContextSwitchTo(oldctx);
 					}
 
 					oldctx = MemoryContextSwitchTo(exec_ctx);
-					rc = SPI_execute_plan(plan, values, nulls, false, 2);
+					rc = SPI_execute_plan(plan, values, nulls, is_read_only, 2);
 					MemoryContextSwitchTo(oldctx);
 
 					if (rc < 0)
@@ -252,7 +259,7 @@ next_op:
 					SPI_freetuptable(SPI_tuptable);
 					MemoryContextReset(exec_ctx);
 
-					rc = SPI_execute(sqlstr, false, 0);
+					rc = SPI_execute(sqlstr, is_read_only, 0);
 
 					if (rc < 0)
 						elog(ERROR, "SPI_execute failed executing query \"%s\" : %s",
@@ -382,7 +389,7 @@ next_op:
 										data->expr.expr,
 										data->expr.nparams, data->expr.typoids,
 												values, nulls,
-														false, 0);
+														is_read_only, 0);
 					values[pcode->cursor.offset] = PointerGetDatum(portal);
 					nulls[pcode->cursor.offset] = ' ';
 					acursors = bms_add_member(acursors, pcode->cursor.offset);
@@ -407,14 +414,14 @@ next_op:
 												 params->nargs, params->argtypes,
 															    params->values, 
 															    params->nulls,
-															    false, 0);
+															    is_read_only, 0);
 					}
 					else
 						portal = SPI_cursor_open_with_args(NULL,
 											sqlstr,
 												 0, NULL,
 															    NULL, NULL,
-															    false, 0);
+															    is_read_only, 0);
 					values[pcode->cursor.offset] = PointerGetDatum(portal);
 					nulls[pcode->cursor.offset] = ' ';
 					acursors = bms_add_member(acursors, pcode->cursor.offset);
@@ -696,14 +703,16 @@ next_op:
 					switch (pcode->parambuilder.op)
 					{
 						case PLPSM_PARAMBUILDER_INIT:
-							params = palloc(sizeof(Params));
-							params->nargs = pcode->parambuilder.nargs;
-							params->argtypes = palloc(params->nargs * sizeof(Oid));
-							params->values = palloc(params->nargs * sizeof(Datum));
-							params->nulls = palloc(params->nargs * sizeof(char));
-							params->typbyval = palloc(params->nargs * sizeof(bool));
-							params->typlen = palloc(params->nargs * sizeof(int16));
-							DataPtrs[pcode->parambuilder.data] = params;
+							{
+								params = palloc(sizeof(Params));
+								params->nargs = pcode->parambuilder.nargs;
+								params->argtypes = palloc(params->nargs * sizeof(Oid));
+								params->values = palloc(params->nargs * sizeof(Datum));
+								params->nulls = palloc(params->nargs * sizeof(char));
+								params->typbyval = palloc(params->nargs * sizeof(bool));
+								params->typlen = palloc(params->nargs * sizeof(int16));
+								DataPtrs[pcode->parambuilder.data] = params;
+							}
 							break;
 						case PLPSM_PARAMBUILDER_FREE:
 							{
@@ -765,10 +774,10 @@ next_op:
 						rc = SPI_execute_with_args(sqlstr, params->nargs, params->argtypes,
 														    params->values, 
 														    params->nulls,
-														    false, 0);
+														    is_read_only, 0);
 					}
 					else
-						rc = SPI_execute(sqlstr, false, 0);
+						rc = SPI_execute(sqlstr, is_read_only, 0);
 
 					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
 
@@ -819,9 +828,6 @@ leave_process:
 		pfree(nulls);
 		pfree(values);
 	}
-
-	if (DataPtrs)
-		pfree(DataPtrs);
 
 	return (Datum) result;
 }

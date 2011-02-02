@@ -16,6 +16,7 @@
 #include "parser/parser.h"
 #include "parser/parse_type.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 
 /* Location tracking support --- simpler than bison's default */
 #define YYLLOC_DEFAULT(Current, Rhs, N) \
@@ -1885,9 +1886,10 @@ check_sql_expr(const char *stmt, int location, int leaderlen)
 	syntax_errcontext.previous = error_context_stack;
 	error_context_stack = &syntax_errcontext;
 
-	oldCxt = MemoryContextSwitchTo(CurrentMemoryContext);
+	oldCxt = MemoryContextSwitchTo(plpsm_compile_tmp_cxt);
 	(void) raw_parser(stmt);
 	MemoryContextSwitchTo(oldCxt);
+	MemoryContextReset(plpsm_compile_tmp_cxt);
 
 	/* Restore former ereport callback */
 	error_context_stack = syntax_errcontext.previous;

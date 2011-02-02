@@ -6,6 +6,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_proc_fn.h"
 #include "catalog/pg_type.h"
+#include "commands/trigger.h"
 #include "nodes/bitmapset.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
@@ -19,6 +20,23 @@
 
 Plpsm_stmt *plpsm_parser_tree;
 bool	plpsm_debug_compiler = false;
+
+/* a context for short-term alloc during compilation */
+MemoryContext plpsm_compile_tmp_cxt;
+
+/*----
+ * Hash table for compiled functions
+ *----
+ */
+static HTAB *plpsm_HashTable = NULL;
+
+typedef struct 
+{
+	Plpsm_module_hashkey hashkey;
+	Plpsm_module *module;
+} Plpsm_HashEnt;
+
+#define FUNCS_PER_USER		128	/* initial table size */
 
 #define parser_errposition(pos)		plpsm_scanner_errposition(pos)
 
@@ -87,14 +105,26 @@ typedef struct
 
 typedef CompileStateData *CompileState;
 
-static void compile(CompileState cstate, Plpsm_stmt *stmt);
+static void _compile(CompileState cstate, Plpsm_stmt *stmt);
 static Node *resolve_column_ref(CompileState cstate, ColumnRef *cref);
 void plpsm_parser_setup(struct ParseState *pstate, CompileState cstate);
 static Plpsm_object *lookup_var(Plpsm_object *scope, const char *name);
 static void compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid targetoid, int16 typmod);
 
+static Plpsm_module *compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, 
+								Plpsm_module_hashkey *hashkey, bool forValidator);
 static void plpsm_compile_error_callback(void *arg);
 
+static void compute_module_hashkey(FunctionCallInfo fcinfo,
+						    Form_pg_proc procStruct,
+						    Plpsm_module_hashkey *key,
+						    bool forValidator);
+static void delete_module(Plpsm_module *mod);
+void plpsm_HashTableInit(void);
+static Plpsm_module *plpsm_HashTableLookup(Plpsm_module_hashkey *func_key);
+static void plpsm_HashTableInsert(Plpsm_module *module,
+						Plpsm_module_hashkey *func_key);
+static void plpsm_HashTableDelete(Plpsm_module *module);
 
 /*
  * Returns a offset of prepared statement, reserves a new offset
@@ -808,7 +838,7 @@ init_module(void)
 {
 	Plpsm_pcode_module *m = palloc0(1024 * sizeof(Plpsm_pcode) + offsetof(Plpsm_pcode_module, code));
 	m->mlength = 1024;
-	m->length = 0;
+	m->length = 1;
 	return m;
 }
 
@@ -1185,6 +1215,10 @@ static void
 compile_done(CompileState cstate)
 {
 	 Plpsm_pcode_module *m = cstate->module;
+
+	/* do nothing when previous command is RETURN */
+	if (m->code[m->length - 1].typ == PCODE_RETURN)
+		return;
 
 	if (cstate->finfo.return_expr != NULL && cstate->finfo.result.datum.typoid != VOIDOID)
 	{
@@ -1684,7 +1718,7 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
  * to dynamic object is necessary, then dynamic SQL must be used. ???
  */
 static void 
-compile(CompileState cstate, Plpsm_stmt *stmt)
+_compile(CompileState cstate, Plpsm_stmt *stmt)
 {
 	int	addr1;
 	int	addr2;
@@ -1699,7 +1733,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					addr1 = PC(m);
-					compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left);
 					EMIT_JMP(addr1);
 					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));\
 				}
@@ -1712,7 +1746,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					addr2 = PC(m);
 					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
-					compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left);
 					EMIT_JMP(addr1);
 					SET_OPVAL_ADDR(addr2, addr, PC(m));
 					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
@@ -1723,7 +1757,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					addr1 = PC(m);
-					compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left);
 					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					SET_OPVAL(addr, addr1);
 					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
@@ -1826,7 +1860,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					}
 					pfree(vars);
 
-					compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left);
 					EMIT_JMP(addr2);
 					SET_OPVAL_ADDR(addr1, addr, PC(m));
 
@@ -1856,7 +1890,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					bool	has_notfound_continue_handler = cstate->stack.has_notfound_continue_handler;
 
 					obj = new_psm_object_for(stmt, cstate, PC(m));
-					compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left);
 
 					cstate->stack.has_sqlstate = has_sqlstate;
 					cstate->stack.has_sqlcode = has_sqlcode;
@@ -1883,7 +1917,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					 * labels outside a handler body.
 					 */
 					cstate->stack.has_notfound_continue_handler = false;
-					compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left);
 					EMIT_OPCODE(PCODE_RET_SUBR);
 					SET_OPVAL_ADDR(addr1, addr, PC(m));
 
@@ -2097,13 +2131,13 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					addr1 = PC(m);
 					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
-					compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left);
 					if (stmt->inner_right)
 					{
 						addr2 = PC(m);
 						EMIT_OPCODE(PCODE_JMP);
 						SET_OPVAL_ADDR(addr1, addr, PC(m));
-						compile(cstate, stmt->inner_right);
+						_compile(cstate, stmt->inner_right);
 						SET_OPVAL_ADDR(addr2, addr, PC(m));
 					}
 					else
@@ -2136,7 +2170,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						compile_expr(cstate, NULL, expr, BOOLOID, -1);
 						addr1 = PC(m);
 						EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
-						compile(cstate, cond->inner_left);
+						_compile(cstate, cond->inner_left);
 						final_jmps = lappend(final_jmps, makeInteger(PC(m)));
 						EMIT_OPCODE(PCODE_JMP);
 						SET_OPVAL_ADDR(addr1, addr, PC(m));
@@ -2150,7 +2184,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						EMIT_OPCODE(PCODE_SIGNAL_NODATA);
 					}
 					else
-						compile(cstate, outer_case->inner_right);
+						_compile(cstate, outer_case->inner_right);
 
 					/* complete leave jumps */
 					foreach (l, final_jmps)
@@ -2378,16 +2412,87 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 	}
 }
 
-Plpsm_pcode_module *
-plpsm_compile(Oid funcOid, bool forValidator)
+Plpsm_module *
+plpsm_compile(FunctionCallInfo fcinfo, bool forValidator)
 {
+	Oid			funcOid = fcinfo->flinfo->fn_oid;
 	HeapTuple	procTup;
+	Form_pg_proc procStruct;
+	Plpsm_module *module;
+	Plpsm_module_hashkey hashkey;
+	bool		module_valid = false;
+	bool		hashkey_valid = false;
+
+
+	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcOid));
+	if (!HeapTupleIsValid(procTup))
+		elog(ERROR, "cache lookup failed for function %u", funcOid);
+	procStruct = (Form_pg_proc) GETSTRUCT(procTup);
+
+	/*
+	 * See if there's already a cache entry for the current FmgrInfo. If not,
+	 * try to find one in the hash table.
+	 */
+	module = (Plpsm_module *) fcinfo->flinfo->fn_extra;
+
+recheck:
+	if (!module)
+	{
+		/* Compute hashkey using function signature and actual arg types */
+		compute_module_hashkey(fcinfo, procStruct, &hashkey, forValidator);
+		hashkey_valid = true;
+
+		/* And do the lookup */
+		module = plpsm_HashTableLookup(&hashkey);
+	}
+
+	if (module)
+	{
+		if (module->xmin == HeapTupleHeaderGetXmin(procTup->t_data) &&
+			ItemPointerEquals(&module->tid, &procTup->t_self))
+			module_valid = true;
+		else
+		{
+			delete_module(module);
+			if (module->use_count != 0)
+			{
+				module = NULL;
+				if (!hashkey_valid)
+					goto recheck;
+			}
+		}
+	}
+
+	/*
+	 * if module isn't valid still, compile it 
+	 */
+	if (!module_valid)
+	{
+		if (!hashkey_valid)
+			compute_module_hashkey(fcinfo, procStruct, &hashkey,
+									forValidator);
+		module = compile(fcinfo, procTup, module,
+							    &hashkey, forValidator);
+	}
+
+	ReleaseSysCache(procTup);
+
+	/*
+	 * Save pointer in FmgrInfo to avoid search on subsequent calls 
+	 */
+	fcinfo->flinfo->fn_extra = (void *) module;
+
+	return module;
+}
+
+static Plpsm_module *
+compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_module_hashkey *hashkey, bool forValidator)
+{
 	int parse_rc;
 	Form_pg_proc procStruct;
 	char	*proc_source;
 	Datum	prosrcdatum;
 	bool		isnull;
-	Plpsm_pcode_module *m;
 	CompileStateData cstate;
 	Plpsm_object outer_scope;
 	int			numargs;
@@ -2399,10 +2504,8 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	bool	typbyval;
 	Bitmapset	*outargs = NULL;
 	ErrorContextCallback	plerrcontext;
-
-	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcOid));
-	if (!HeapTupleIsValid(procTup))
-		elog(ERROR, "cache lookup failed for function %u", funcOid);
+	MemoryContext	func_cxt;
+	Plpsm_pcode_module *m;
 
 	procStruct = (Form_pg_proc) GETSTRUCT(procTup);
 
@@ -2411,10 +2514,38 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	if (isnull)
 		elog(ERROR, "null prosrc");
 
+	if (module == NULL)
+	{
+		module = (Plpsm_module *)
+			MemoryContextAllocZero(TopMemoryContext, sizeof(Plpsm_module));
+
+	}
+	else
+	{
+		memset(module, 0, sizeof(Plpsm_module));
+	}
+
+	func_cxt = AllocSetContextCreate(TopMemoryContext,
+							    "PLPSM function context",
+							    ALLOCSET_DEFAULT_MINSIZE,
+							    ALLOCSET_DEFAULT_INITSIZE,
+							    ALLOCSET_DEFAULT_MAXSIZE);
+	plpsm_compile_tmp_cxt = MemoryContextSwitchTo(func_cxt);
+
+	module->oid = fcinfo->flinfo->fn_oid;
+	module->xmin = HeapTupleHeaderGetXmin(procTup->t_data);
+	module->tid = procTup->t_self;
+	module->cxt = func_cxt;
+
+	m = init_module();
+	cstate.module = m;
+	m->name = pstrdup(NameStr(procStruct->proname));
+	m->is_read_only = (procStruct->provolatile != PROVOLATILE_VOLATILE);
+
 	proc_source = TextDatumGetCString(prosrcdatum);
 
 	plerrcontext.callback = plpsm_compile_error_callback;
-	plerrcontext.arg = proc_source;
+	plerrcontext.arg = forValidator ? proc_source : NULL;
 	plerrcontext.previous = error_context_stack;
 	error_context_stack = &plerrcontext;
 
@@ -2444,10 +2575,6 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	cstate.finfo.result.datum.typoid = procStruct->prorettype;
 	get_typlenbyval(cstate.finfo.result.datum.typoid, &cstate.finfo.result.datum.typlen, &cstate.finfo.result.datum.typbyval);
 
-	m = init_module();
-	cstate.module = m;
-	m->length = 1;
-
 	/* 
 	 * append to scope a variables for parameters, and store 
 	 * instruction for copy from fcinfo
@@ -2455,11 +2582,8 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	numargs = get_func_arg_info(procTup,
 						&argtypes, &argnames, &argmodes);
 	cstate.finfo.nargs = numargs;
-	cstate.finfo.name = pstrdup(NameStr(procStruct->proname));
+	cstate.finfo.name = m->name;
 	cstate.finfo.source = proc_source;
-
-
-	m->name = cstate.finfo.name;
 
 	for (i = 0; i < numargs; i++)
 	{
@@ -2547,22 +2671,32 @@ plpsm_compile(Oid funcOid, bool forValidator)
 	else
 		cstate.finfo.return_expr = NULL;
 
-	compile(&cstate, plpsm_parser_tree);
+	_compile(&cstate, plpsm_parser_tree);
 	compile_done(&cstate);
 
 	m->ndatums = cstate.stack.ndatums;
 	m->ndata = cstate.stack.ndata;
 
+	module->code = m;
+
+	/* prepare a persistent memory */
+	module->DataPtrs = palloc0((m->ndata + 1) * sizeof(void*) );
+
 	if (plpsm_debug_compiler)
 		list(m);
 
+	plpsm_HashTableInsert(module, hashkey);
+
 	error_context_stack = plerrcontext.previous;
+	plpsm_error_funcname = NULL;
 
 	plpsm_scanner_finish();
+	pfree(proc_source);
 
-	ReleaseSysCache(procTup);
+	MemoryContextSwitchTo(plpsm_compile_tmp_cxt);
+	plpsm_compile_tmp_cxt = NULL;
 
-	return m;
+	return module		;
 }
 
 /*
@@ -2579,4 +2713,120 @@ plpsm_compile_error_callback(void *arg)
 
 	errcontext("compilation of PLPSM function \"%s\" near line %d",
 				plpsm_error_funcname, plpsm_latest_lineno());
+}
+
+/*
+ * Compute a module's hashkey
+ */
+static void
+compute_module_hashkey(FunctionCallInfo fcinfo,
+						    Form_pg_proc procStruct,
+						    Plpsm_module_hashkey *key,
+						    bool forValidator)
+{
+	/* Make sure any unused bytes of the struct are zero */
+	MemSet(key, 0, sizeof(Plpsm_module_hashkey));
+
+	/* get function OID */
+	key->oid = fcinfo->flinfo->fn_oid;
+
+	/* get call context */
+	key->isTrigger = CALLED_AS_TRIGGER(fcinfo);
+
+	/*
+	 * if trigger, get relation OID.  In validation mode we do not know what
+	 * relation is intended to be used, so we leave trigrelOid zero; the hash
+	 * entry built in this case will never really be used.
+	 */
+	if (key->isTrigger && !forValidator)
+	{
+		TriggerData *trigdata = (TriggerData *) fcinfo->context;
+
+		key->trigrelOid = RelationGetRelid(trigdata->tg_relation);
+	}
+}
+
+static void
+delete_module(Plpsm_module *mod)
+{
+	plpsm_HashTableDelete(mod);
+
+	if (mod->use_count == 0 && mod->cxt)
+	{
+		MemoryContextDelete(mod->cxt);
+		mod->cxt = NULL;
+	}
+}
+
+/* exported so we can call it from plpsm_init() */
+void
+plpsm_HashTableInit(void)
+{
+	HASHCTL		ctl;
+
+	/* don't allow double-initialization */
+	Assert(plpsm_HashTable == NULL);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Plpsm_module_hashkey);
+	ctl.entrysize = sizeof(Plpsm_HashEnt);
+	ctl.hash = tag_hash;
+	plpsm_HashTable = hash_create("PLPSM function cache",
+									FUNCS_PER_USER,
+									&ctl,
+									HASH_ELEM | HASH_FUNCTION);
+}
+
+static Plpsm_module *
+plpsm_HashTableLookup(Plpsm_module_hashkey *func_key)
+{
+	Plpsm_HashEnt *hentry;
+
+	hentry = (Plpsm_HashEnt *) hash_search(plpsm_HashTable,
+											 (void *) func_key,
+											 HASH_FIND,
+											 NULL);
+	if (hentry)
+		return hentry->module;
+	else
+		return NULL;
+}
+
+static void
+plpsm_HashTableInsert(Plpsm_module *module,
+						Plpsm_module_hashkey *func_key)
+{
+	Plpsm_HashEnt *hentry;
+	bool		found;
+
+	hentry = (Plpsm_HashEnt *) hash_search(plpsm_HashTable,
+											 (void *) func_key,
+											 HASH_ENTER,
+											 &found);
+	if (found)
+		elog(WARNING, "trying to insert a function that already exists");
+
+	hentry->module = module;
+	/* prepare back link from function to hashtable key */
+	module->hashkey = &hentry->hashkey;
+}
+
+static void
+plpsm_HashTableDelete(Plpsm_module *module)
+{
+	Plpsm_HashEnt *hentry;
+
+	/* do nothing if not in table */
+	if (module->hashkey == NULL)
+		return;
+
+	hentry = (Plpsm_HashEnt *) hash_search(plpsm_HashTable,
+											 (void *) module->hashkey,
+											 HASH_REMOVE,
+											 NULL);
+	if (hentry == NULL)
+		elog(WARNING, "trying to delete function that does not exist");
+
+	/* remove back link, which no longer points to allocated storage */
+	module->hashkey = NULL;
 }
