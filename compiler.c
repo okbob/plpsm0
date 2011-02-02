@@ -242,11 +242,20 @@ create_handler_for(Plpsm_stmt *handler_def, CompileState cstate, int handler_add
  * is using a non overlaped frames. 
  */
 static Plpsm_object *
-create_variable_for(Plpsm_stmt *decl_stmt, CompileState cstate, 
+create_variable_for(Plpsm_stmt *decl_stmt, CompileState cstate, Plpsm_positioned_qualid *qualid,
 						char *name, Plpsm_usage_variable_type typ)
 {
 	Plpsm_object *iterator = cstate->current_scope->inner;
 	Plpsm_object *var;
+	int	location = -1;
+
+	Assert(qualid != NULL || name != NULL);
+
+	if (qualid != NULL)
+	{
+		name = (char *)linitial(qualid->qualId);
+		location = qualid->location;
+	}
 
 	Assert(cstate->current_scope->typ == PLPSM_STMT_COMPOUND_STATEMENT ||
 	       cstate->current_scope->typ == PLPSM_STMT_SCHEMA);
@@ -260,7 +269,10 @@ create_variable_for(Plpsm_stmt *decl_stmt, CompileState cstate,
 			case PLPSM_STMT_DECLARE_VARIABLE:
 			case PLPSM_STMT_DECLARE_CURSOR:
 				if (strcmp(iterator->name, name) == 0)
-					elog(ERROR, "identifier \"%s\" is used yet", name);
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("identifier \"%s\" is used yet", name),
+							 parser_errposition(location)));
 				break;
 			default:
 				/* be compiler quite */;
@@ -299,7 +311,10 @@ create_variable_for(Plpsm_stmt *decl_stmt, CompileState cstate,
 	if (strcmp(name, "sqlstate") == 0)
 	{
 		if (cstate->stack.has_sqlstate)
-			elog(ERROR, "SQLSTATE variable is already defined");
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("SQLSTATE variable is already defined"),
+					 parser_errposition(location)));
 		cstate->stack.has_sqlstate = true;
 		switch (decl_stmt->datum.typoid)
 		{
@@ -307,20 +322,32 @@ create_variable_for(Plpsm_stmt *decl_stmt, CompileState cstate,
 			case BPCHAROID:
 			case VARCHAROID:
 				if (decl_stmt->datum.typmod < 9 && decl_stmt->datum.typmod != -1)
-					elog(ERROR, "too short datatype for SQLSTATE");
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("too short datatype for SQLSTATE"),
+							 parser_errposition(location)));
 				break;
 			default:
-				elog(ERROR, "SQLSTATE variable should be text, char or varchar");
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("SQLSTATE variable should be text, char or varchar"),
+							 parser_errposition(location)));
 		}
 	}
 
 	if (strcmp(name, "sqlcode") == 0)
 	{
 		if (cstate->stack.has_sqlcode)
-			elog(ERROR, "SQLOCODE variable is already defined");
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("SQLOCODE variable is already defined"),
+						 parser_errposition(location)));
 		cstate->stack.has_sqlcode = true;
 		if (decl_stmt->datum.typoid != INT4OID)
-			elog(ERROR, "SQLCODE variable should be integer");
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("SQLCODE variable should be integer"),
+						 parser_errposition(location)));
 	}
 
 	return var;
@@ -343,7 +370,10 @@ new_psm_object_for(Plpsm_stmt *stmt, CompileState cstate, int entry_addr)
 		case PLPSM_STMT_REPEAT_UNTIL:
 		case PLPSM_STMT_FOR:
 			if (stmt->name && lookup_object_with_label_in_scope(cstate->current_scope, stmt->name) != NULL)
-				elog(ERROR, "label \"%s\" is defined in current scope", stmt->name);
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("label \"%s\" is defined in current scope", stmt->name),
+							parser_errposition(stmt->location)));
 			new = new_object_for(stmt, cstate->current_scope);
 			new->calls.entry_addr = entry_addr;
 			cstate->current_scope = new;
@@ -562,7 +592,6 @@ lookup_notfound_continue_handler(Plpsm_object *scope)
 	return lookup_notfound_continue_handler(scope->outer);
 }
 
-
 /*
  * Assign info about Object reference to state 
  */
@@ -683,7 +712,7 @@ resolve_column_ref(CompileState cstate, ColumnRef *cref)
  * specified field, then fieldname is filled.
  */
 static Plpsm_object *
-resolve_target(CompileState cstate, List *target, const char **fieldname, int location, int target_type)
+resolve_target(CompileState cstate, Plpsm_positioned_qualid *target, const char **fieldname, int target_type)
 {
 	const char *name1;
 	const char *name2 = NULL;
@@ -705,19 +734,17 @@ resolve_target(CompileState cstate, List *target, const char **fieldname, int lo
 			break;
 	}
 
-	switch (list_length(target))
+	switch (list_length(target->qualId))
 	{
 		case 1:
 			{
-				Node	*field1 = (Node *) linitial(target);
-				Assert(IsA(field1, String));
-				name1 = strVal(field1);
+				name1 = (const char *) linitial(target->qualId);
 				var = lookup_var(cstate->current_scope, name1);
 				if (var == NULL)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("a %s \"%s\" is undefined", objectclass, name1),
-							 parser_errposition(location)));
+							 parser_errposition(target->location)));
 				return var;
 			}
 		case 2:
@@ -727,46 +754,45 @@ resolve_target(CompileState cstate, List *target, const char **fieldname, int lo
 				 * then we have to raise a error, because there are not
 				 * clean what situation is: label.var or record.field
 				 */
-				Node	*field1 = (Node *) linitial(target);
-				Node	*field2 = (Node *) lsecond(target);
-				Assert(IsA(field1, String));
-				name1 = strVal(field1);
-				Assert(IsA(field2, String));
-				name2 = strVal(field2);
+				name1 = (const char *) linitial(target->qualId);
+				name2 = (const char *) lsecond(target->qualId);
 
 				var = lookup_qualified_var(cstate->current_scope, name1, name2);
 				if (var != NULL)
 				{
 					if (lookup_var(cstate->current_scope, name1))
-						elog(ERROR, "there is conflict between compound statement label and composite variable");
+						ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("there is conflict between compound statement label and composite variable"),
+							 parser_errposition(target->location)));
 					return var;
 				}
 				else
 				{
 					var = lookup_var(cstate->current_scope, name1);
 					if (var == NULL)
-						elog(ERROR, "%s \"%s\" is undefined", objectclass, name1);
+						ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("%s \"%s\" is undefined", objectclass, name1),
+							 parser_errposition(target->location)));
 					*fieldname = name2;
 					return var;
 				}
 			}
 		case 3:
 			{
-				Node	*field1 = (Node *) linitial(target);
-				Node	*field2 = (Node *) lsecond(target);
-				Node	*field3 = (Node *) lthird(target);
 				const char *name3;
 
-				Assert(IsA(field1, String));
-				name1 = strVal(field1);
-				Assert(IsA(field2, String));
-				name2 = strVal(field2);
-				Assert(IsA(field3, String));
-				name3 = strVal(field3);
+				name1 = (const char *) linitial(target->qualId); 
+				name2 = (const char *) lsecond(target->qualId);
+				name3 = (const char *) lthird(target->qualId);
 
 				var = lookup_qualified_var(cstate->current_scope, name1, name2);
 				if (var == NULL)
-					elog(ERROR, "%s \"%s\" with label \"%s\" is undefined", objectclass, name2, name1);
+					ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("%s \"%s\" with label \"%s\" is undefined", objectclass, name2, name1),
+						 parser_errposition(target->location)));
 				*fieldname = name3;
 			}
 	}
@@ -1100,7 +1126,10 @@ compile_leave_iterate(CompileState cstate,
 					if (stmt->typ == PLPSM_STMT_ITERATE)
 					{
 						if (scope->typ == PLPSM_STMT_COMPOUND_STATEMENT)
-							elog(ERROR, "label of iterate statement is related to compound statement");
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("label of iterate statement is related to compound statement"),
+											parser_errposition(stmt->location)));
 						EMIT_JMP(scope->calls.entry_addr);
 					}
 					else
@@ -1433,7 +1462,7 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, Plpsm_ESQL *from_cl
 		Plpsm_object *var;
 		Plpsm_ESQL *esql;
 
-		var = resolve_target(cstate, (List *) lfirst(l1), &fieldname, stmt->location, PLPSM_STMT_DECLARE_VARIABLE);
+		var = resolve_target(cstate, (Plpsm_positioned_qualid *) lfirst(l1), &fieldname, PLPSM_STMT_DECLARE_VARIABLE);
 		esql = (Plpsm_ESQL *) lfirst(l2);
 
 		if (!isfirst)
@@ -1536,7 +1565,7 @@ compile_usage_clause(CompileState cstate, Plpsm_stmt *stmt, int *params)
 
 	initStringInfo(&ds);
 
-	PARAMBUILDER1(INIT, dataidx, nargs, list_length(stmt->var_list));
+	PARAMBUILDER1(INIT, dataidx, nargs, list_length(stmt->variables));
 
 	addr1 = PC(m);
 	SET_OPVAL(expr.data, cstate->stack.ndata++);
@@ -1544,7 +1573,7 @@ compile_usage_clause(CompileState cstate, Plpsm_stmt *stmt, int *params)
 	EMIT_OPCODE(PCODE_EXEC_EXPR);
 	appendStringInfoString(&ds, "SELECT ");
 
-	foreach (l, stmt->var_list)
+	foreach (l, stmt->variables)
 	{
 		Plpsm_object *var;
 		const char *fieldname;
@@ -1554,7 +1583,7 @@ compile_usage_clause(CompileState cstate, Plpsm_stmt *stmt, int *params)
 		else
 			isFirst = false;
 
-		var = resolve_target(cstate, (List *) lfirst(l), &fieldname, stmt->location, PLPSM_STMT_DECLARE_VARIABLE);
+		var = resolve_target(cstate, (Plpsm_positioned_qualid *) lfirst(l), &fieldname, PLPSM_STMT_DECLARE_VARIABLE);
 		if (fieldname == NULL)
 			appendStringInfo(&ds, "$%d", var->offset + 1);
 		else
@@ -1721,7 +1750,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 					decl_cur->typ = PLPSM_STMT_DECLARE_CURSOR;
 					cursor_name = stmt->stmtfor.cursor_name ? stmt->stmtfor.cursor_name : "";
-					cursor = create_variable_for(decl_cur, cstate, cursor_name, PLPSM_VARIABLE);
+					cursor = create_variable_for(decl_cur, cstate, NULL, cursor_name, PLPSM_VARIABLE);
 
 					cursor->cursor.data_addr = PC(m);
 					cursor->cursor.is_dynamic = false;
@@ -1746,7 +1775,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						Plpsm_object *var;
 
 						decl_stmt->typ = PLPSM_STMT_DECLARE_VARIABLE;
-						decl_stmt->target = list_make1(pstrdup(NameStr(att->attname)));
+						decl_stmt->target = new_qualid(list_make1(pstrdup(NameStr(att->attname))), -1);
 						typoid = att->atttypid;
 						get_typlenbyval(typoid, &typlen, &typbyval);
 
@@ -1757,7 +1786,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						decl_stmt->datum.typbyval = typbyval;
 
 						/* append implicit name to scope */
-						var = create_variable_for(decl_stmt, cstate, pstrdup(NameStr(att->attname)), PLPSM_VARIABLE);
+						var = create_variable_for(decl_stmt, cstate, NULL, pstrdup(NameStr(att->attname)), PLPSM_VARIABLE);
 						vars[i] = var;
 					}
 
@@ -1865,8 +1894,9 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 					foreach(l, stmt->compound_target)
 					{
-						char *name = strVal(lfirst(l));
-						var = create_variable_for(stmt, cstate, name, PLPSM_VARIABLE);
+						Plpsm_positioned_qualid *qualid = (Plpsm_positioned_qualid *) lfirst(l);
+
+						var = create_variable_for(stmt, cstate, qualid, NULL, PLPSM_VARIABLE);
 
 						if (stmt->esql != NULL)
 						{
@@ -1884,9 +1914,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 			case PLPSM_STMT_DECLARE_CURSOR:
 				{
-					char *name = strVal(linitial(stmt->target)) ;
-
-					var = create_variable_for(stmt, cstate, name, PLPSM_VARIABLE);
+					var = create_variable_for(stmt, cstate, stmt->target, NULL, PLPSM_VARIABLE);
 					if (stmt->esql != NULL)
 					{
 						Oid	*argtypes;
@@ -1919,17 +1947,26 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					const char *fieldname;
 					int	params = -1;
 
-					var = resolve_target(cstate, stmt->target,  &fieldname, stmt->location, PLPSM_STMT_DECLARE_CURSOR);
+					var = resolve_target(cstate, stmt->target, &fieldname, PLPSM_STMT_DECLARE_CURSOR);
 					if (var->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
-						elog(ERROR, "variable \"%s\" isn't cursor", var->name);
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("variable \"%s\" isn't cursor", var->name),
+									parser_errposition(stmt->target->location)));
 					if (var->cursor.is_for_stmt_cursor)
-						elog(ERROR, "cannot to open a cursor used in FOR statement");
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot to open a cursor used in FOR statement"),
+									parser_errposition(stmt->location)));
 
-					if (stmt->var_list != NIL)
+					if (stmt->variables != NIL)
 					{
 						if (!var->cursor.is_dynamic)
-							elog(ERROR, "using a USAGE clause in static cursor \"%s\"", 
-														var->name);
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("using a USAGE clause in static cursor \"%s\"", 
+														var->name),
+									parser_errposition(stmt->location)));
 						compile_usage_clause(cstate, stmt, &params);
 					}
 
@@ -1960,11 +1997,17 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					ListCell *l;
 					int	i = 1;
 
-					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location, PLPSM_STMT_DECLARE_CURSOR);
+					obj = resolve_target(cstate, stmt->target,  &fieldname, PLPSM_STMT_DECLARE_CURSOR);
 					if (obj->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
-						elog(ERROR, "variable \"%s\" isn't cursor", obj->name);
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("variable \"%s\" isn't cursor", obj->name),
+									parser_errposition(stmt->target->location)));
 					if (obj->cursor.is_for_stmt_cursor)
-						elog(ERROR, "cannot to open a cursor used in FOR statement");
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot to fetch from cursor related to FOR statement"),
+									parser_errposition(stmt->location)));
 
 					SET_OPVAL(fetch.offset, obj->cursor.offset);
 					SET_OPVAL(fetch.name, obj->name);
@@ -1974,9 +2017,8 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 					foreach (l, stmt->compound_target)
 					{
-						Plpsm_object	*var = resolve_target(cstate, (List *) lfirst(l),
+						Plpsm_object	*var = resolve_target(cstate, (Plpsm_positioned_qualid *) lfirst(l),
 													    &fieldname,
-														stmt->location,
 														    PLPSM_STMT_DECLARE_VARIABLE);
 
 						if (fieldname != NULL)
@@ -2020,11 +2062,17 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					const char *fieldname;
 
-					obj = resolve_target(cstate, stmt->target,  &fieldname, stmt->location, PLPSM_STMT_DECLARE_VARIABLE);
+					obj = resolve_target(cstate, stmt->target,  &fieldname, PLPSM_STMT_DECLARE_VARIABLE);
 					if (obj->stmt->typ != PLPSM_STMT_DECLARE_CURSOR)
-						elog(ERROR, "variable \"%s\" isn't cursor", obj->name);
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("variable \"%s\" isn't cursor", obj->name),
+									parser_errposition(stmt->target->location)));
 					if (obj->cursor.is_for_stmt_cursor)
-						elog(ERROR, "cannot to open a cursor used in FOR statement");
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot to open a cursor used in FOR statement"),
+									parser_errposition(stmt->location)));
 
 					SET_OPVAL(cursor.addr, obj->cursor.data_addr);
 					SET_OPVAL(cursor.offset, obj->cursor.offset);
@@ -2157,9 +2205,9 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					const char *fieldname;
 
-					if (stmt->target != NIL)
+					if (stmt->target != NULL)
 					{
-						var = resolve_target(cstate, stmt->target,  &fieldname, stmt->location, PLPSM_STMT_DECLARE_VARIABLE);
+						var = resolve_target(cstate, stmt->target,  &fieldname, PLPSM_STMT_DECLARE_VARIABLE);
 
 						if (fieldname != NULL)
 						{
@@ -2198,7 +2246,10 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 			case PLPSM_STMT_LEAVE:
 				{
 					if (strcmp(cstate->finfo.name, stmt->name) == 0)
-						elog(ERROR, "cannot leave function by LEAVE statement");
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot leave function by LEAVE statement"),
+									parser_errposition(stmt->location)));
 					compile_leave_iterate(cstate, cstate->current_scope, stmt);
 					break;
 				}
@@ -2210,7 +2261,10 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 					{
 						if (cstate->finfo.return_expr != NULL && 
 							stmt->esql != NULL)
-							elog(ERROR, "using RETURN expr in function with OUT arguments");
+							ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("using RETURN expr in function with OUT arguments"),
+									parser_errposition(stmt->location)));
 
 						if (stmt->esql != NULL)
 							compile_expr(cstate, stmt->esql, NULL, cstate->finfo.result.datum.typoid, -1);
@@ -2258,7 +2312,7 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					int dataidx = -1;
 				
-					if (stmt->var_list != NIL)
+					if (stmt->variables != NIL)
 					{
 						compile_usage_clause(cstate, stmt, &dataidx);
 						SET_OPVAL(execute.params, dataidx);
@@ -2282,9 +2336,8 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 						EMIT_OPCODE(PCODE_CHECK_DATA);
 						foreach (l, stmt->compound_target)
 						{
-							Plpsm_object	*var = resolve_target(cstate, (List *) lfirst(l),
+							Plpsm_object	*var = resolve_target(cstate, (Plpsm_positioned_qualid *) lfirst(l),
 														    &fieldname,
-																stmt->location,
 																    PLPSM_STMT_DECLARE_VARIABLE);
 							SET_OPVALS_DATUM_INFO(saveto_field, var);
 							SET_OPVAL(saveto_field.data, cstate->stack.ndata++);
@@ -2410,7 +2463,7 @@ plpsm_compile(Oid funcOid, bool forValidator)
 
 		/* append a fake statements for parameter variable */
 		decl_stmt = plpsm_new_stmt(PLPSM_STMT_DECLARE_VARIABLE, -1);
-		decl_stmt->target = list_make1(makeString(pstrdup(buf)));
+		decl_stmt->target = new_qualid(list_make1(pstrdup(buf)), -1);
 		get_typlenbyval(argtypid, &typlen, &typbyval);
 
 		decl_stmt->datum.typoid = argtypid;
@@ -2420,11 +2473,11 @@ plpsm_compile(Oid funcOid, bool forValidator)
 		decl_stmt->datum.typbyval = typbyval;
 
 		/* append implicit name to scope */
-		var = create_variable_for(decl_stmt, &cstate, pstrdup(buf), PLPSM_VARIABLE);
+		var = create_variable_for(decl_stmt, &cstate, decl_stmt->target, NULL, PLPSM_VARIABLE);
 		/* append explicit name to scope */
 		if (argnames && argnames[i][0] != '\0')
 		{
-			alias = create_variable_for(decl_stmt, &cstate, pstrdup(argnames[i]), PLPSM_REFERENCE);
+			alias = create_variable_for(decl_stmt, &cstate, NULL, pstrdup(argnames[i]), PLPSM_REFERENCE);
 			alias->offset = var->offset; 
 		}
 

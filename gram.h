@@ -112,7 +112,7 @@ typedef union YYSTYPE
 {
 
 /* Line 1676 of yacc.c  */
-#line 89 "gram.y"
+#line 70 "gram.y"
 
 		core_YYSTYPE		core_yystype;
 		/* these fields must match core_YYSTYPE */
@@ -125,12 +125,14 @@ typedef union YYSTYPE
 		void			*ptr;
 		List				*list;
 		Plpsm_stmt			*stmt;
+		Plpsm_ESQL			*esql;
+		Plpsm_positioned_qualid		*qualid;
 		Node		*node;
 
 
 
 /* Line 1676 of yacc.c  */
-#line 134 "gram.h"
+#line 136 "gram.h"
 } YYSTYPE;
 # define YYSTYPE_IS_TRIVIAL 1
 # define yystype YYSTYPE /* obsolescent; will be withdrawn */

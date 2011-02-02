@@ -88,7 +88,7 @@ typedef struct
 typedef struct
 {							/* used for variable identifiers */
 	int		lineno;
-	int		loc;
+	int		location;
 	List	*qualId;
 } Plpsm_positioned_qualid;
 
@@ -107,8 +107,9 @@ typedef struct Plpsm_stmt
 	int		location;
 	int		lineno;
 	char *name;
-	List *target;
+	Plpsm_positioned_qualid *target;
 	List 	*compound_target;
+	List	*variables;		/* list of quals used almost in USAGE clause */
 	union
 	{
 		void *data;
@@ -132,14 +133,7 @@ typedef struct Plpsm_stmt
 	
 	Plpsm_ESQL	*esql;				/* used when we working with single expr or query */
 	List		*esql_list;			/* used when we working with list of expressions */
-	
-	//char	*query;
-	//char	*expr;
-	union
-	{
-		//List		*expr_list;
-		List		*var_list;
-	};
+
 	struct Plpsm_stmt *next;
 	struct Plpsm_stmt *last;
 	struct Plpsm_stmt *inner_left;
@@ -371,6 +365,7 @@ extern Plpsm_pcode_module *plpsm_compile(Oid funcOid, bool forValidator);
 extern Datum plpsm_func_execute(Plpsm_pcode_module *module, FunctionCallInfo fcinfo);
 
 extern Plpsm_stmt *plpsm_new_stmt(Plpsm_stmt_type typ, int location);
+extern Plpsm_positioned_qualid *new_qualid(List *qualId, int location);
 
 extern void plpsm_sql_error_callback(void *arg);
 

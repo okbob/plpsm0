@@ -56,6 +56,9 @@ static const char *parser_stmt_name(Plpsm_stmt_type typ);
 static void stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level);
 static void elog_stmt(int level, Plpsm_stmt *stmt);
 
+static void pqualid_out(StringInfo ds, Plpsm_positioned_qualid *qualid);
+static void pqualid_list_out(StringInfo ds, List *list);
+
 static Plpsm_stmt *make_stmt_sql(int location);
 
 %}
@@ -77,6 +80,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 		List				*list;
 		Plpsm_stmt			*stmt;
 		Plpsm_ESQL			*esql;
+		Plpsm_positioned_qualid		*qualid;
 		Node		*node;
 }
 
@@ -87,7 +91,8 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %type <stmt>	stmt_print stmt_return
 %type <stmt>	declaration declarations declare_prefetch
 %type <stmt>	stmt_if stmt_else
-%type <list>	qual_identif_list qual_identif
+%type <list>	qual_identif_list 
+%type <qualid>	qual_identif
 %type <esql>	expr_until_semi_or_coma expr_until_semi expr_until_do expr_until_end
 %type <esql>	expr_until_semi_into_using expr_until_then
 %type <str>	opt_label opt_end_label
@@ -635,18 +640,24 @@ qual_identif_list:
 qual_identif:
 			WORD
 				{
-					$$ = list_make1(makeString($1.ident));
+					$$ = new_qualid(list_make1($1.ident), @1);
 				}
 			| CWORD
 				{
-					$$ = $1.idents;
+					ListCell	*l;
+					List	*idents = NIL;
+					foreach (l, $1.idents)
+					{
+						idents = lappend(idents, strVal(lfirst(l)));
+					}
+					$$ = new_qualid(idents, @1);
 				}
 			| PARAM
 				{
 					/* ToDo: Plpsm_object should be a param type too */
 					char buf[32];
 					snprintf(buf, sizeof(buf), "$%d", $1);
-					$$ = list_make1(makeString(pstrdup(buf)));
+					$$ = $$ = new_qualid(list_make1(pstrdup(buf)), @1);
 				}
 		;
 
@@ -810,14 +821,14 @@ stmt_execute:
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE, @1);
 					new->name = $2.ident;
 					new->compound_target = $4;
-					new->var_list = $6;
+					new->variables = $6;
 					$$ = new;
 				}
 			| EXECUTE WORD USING qual_identif_list
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE, @1);
 					new->name = $2.ident;
-					new->var_list = $4;
+					new->variables = $4;
 					$$ = new;
 				}
 		;
@@ -855,7 +866,7 @@ stmt_open:
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_OPEN, @1);
 					new->target = $2;
-					new->var_list = $4;
+					new->variables = $4;
 					$$ = new;
 				}
 		;
@@ -1167,6 +1178,16 @@ typedef enum
 	EXPECTED_CURSOR = 6
 } DeclareParsingState;
 
+Plpsm_positioned_qualid *
+new_qualid(List *qualId, int location)
+{
+	Plpsm_positioned_qualid *new = palloc(sizeof(Plpsm_positioned_qualid));
+	new->lineno = plpsm_location_to_lineno(location);
+	new->location = location;
+	new->qualId = qualId;
+	return new;
+}
+
 /*
  * Because I would to see a parser by the most simply, then
  * a parsing of declaratin part is handy written. This section needs
@@ -1230,7 +1251,8 @@ declare_prefetch(void)
 			Assert(tok == CURSOR);
 
 			result->typ = PLPSM_STMT_DECLARE_CURSOR;
-			result->target = varnames;
+			
+			result->target = linitial(varnames);
 			result->option = option;
 
 			plpsm_push_back_token(tok);
@@ -1245,7 +1267,7 @@ declare_prefetch(void)
 			if (tok == WORD)
 			{
 				/* store identifier */
-				varnames = list_make1(makeString(yylval.word.ident));
+				varnames = list_make1(new_qualid(list_make1(yylval.word.ident), yylloc));
 				state = Unknown;
 				continue;
 			}
@@ -1281,14 +1303,14 @@ declare_prefetch(void)
 				{
 					/* store identifier */
 					plpsm_push_back_token(tok1);
-					varnames = list_make1(makeString(pstrdup(varname)));
+					varnames = list_make1(new_qualid(list_make1(pstrdup(varname)), yylloc));
 					state = Unknown;
 					continue;
 				}
 			}
 			else if (is_unreserved_keyword(tok))
 			{
-				varnames = list_make1(makeString(yylval.word.ident));
+				varnames = list_make1(new_qualid(list_make1(yylval.word.ident), yylloc));
 				state = Unknown;
 				continue;
 			}
@@ -1387,7 +1409,7 @@ declare_prefetch(void)
 		
 			if (tok != WORD && !is_unreserved_keyword(tok))
 				yyerror("missing a variable identifier");
-			varnames = lappend(varnames, makeString(yylval.word.ident));
+			varnames = lappend(varnames, new_qualid(list_make1(yylval.word.ident), yylloc));
 			state = COMPLETE_LIST_OF_VARIABLES;
 			continue;
 		}
@@ -1518,6 +1540,10 @@ parser_stmt_name(Plpsm_stmt_type typ)
 	}
 }
 
+/*----
+ * Debug out routines 
+ *
+ */
 static void
 esql_out(StringInfo ds, Plpsm_ESQL *esql)
 {
@@ -1551,6 +1577,38 @@ esql_list_out(StringInfo ds, List *list)
 	}
 }
 
+static void
+pqualid_out(StringInfo ds, Plpsm_positioned_qualid *qualid)
+{
+	bool	isFirst = true;
+	ListCell	*l;
+
+	foreach(l, qualid->qualId)
+	{
+		if (!isFirst)
+			appendStringInfoChar(ds, '.');
+		else
+			isFirst = false;
+		appendStringInfoString(ds, (char *) lfirst(l));
+	}
+}
+
+static void
+pqualid_list_out(StringInfo ds, List *list)
+{
+	bool isFirst = true;
+	ListCell	*l;
+
+	foreach (l, list)
+	{
+		if (!isFirst)
+			appendStringInfoChar(ds, ',');
+		else
+			isFirst = false;
+		pqualid_out(ds, (Plpsm_positioned_qualid *) lfirst(l));
+	}
+}
+
 /*
  * helper routines to debug output of parser stage
  */
@@ -1567,8 +1625,15 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 	appendStringInfo(ds, "%s| debug for <<%s>>\n", ident, parser_stmt_name(stmt->typ));
 	appendStringInfo(ds, "%s+--------------------------------------------------\n", ident);
 	appendStringInfo(ds, "%s| Name: %s\n", ident, stmt->name);
-	appendStringInfo(ds, "%s| Target: %s\n", ident, nodeToString(stmt->target));
-	appendStringInfo(ds, "%s| Compound target: %s\n", ident, nodeToString(stmt->compound_target));
+	appendStringInfo(ds, "%s| Target: ", ident);
+	pqualid_out(ds, stmt->target);
+	appendStringInfoChar(ds, '\n');
+	appendStringInfo(ds, "%s| Compound target: ", ident);
+	pqualid_list_out(ds,stmt->compound_target);
+	appendStringInfoChar(ds,'\n');
+	appendStringInfo(ds, "%s| Variables: ", ident);
+	pqualid_list_out(ds, stmt->variables);
+	appendStringInfoChar(ds, '\n');
 	//appendStringInfo(ds, "%s| Data: %s\n", ident, nodeToString(stmt->data));
 	appendStringInfo(ds, "%s| Option: %d\n", ident, stmt->option);
 	appendStringInfo(ds, "%s| ESQL: ", ident);
@@ -1793,6 +1858,10 @@ read_embeded_sql(int until1,
 	esql->location = startlocation;
 	esql->lineno = plpsm_location_to_lineno(startlocation);
 	esql->sqlstr = ds.data;
+
+	/* try to truncate from right a returned string */
+	while (isspace(ds.data[ds.len - 1]))
+		ds.data[--ds.len] = '\0';
 
 	/* semicolon is usually returned back */
 	if (tok == ';' || tok == ',')
