@@ -168,7 +168,6 @@ next_op:
 						MemoryContextSwitchTo(oldctx);
 					}
 
-
 					oldctx = MemoryContextSwitchTo(exec_ctx);
 					rc = SPI_execute_plan(plan, values, nulls, is_read_only, 2);
 					MemoryContextSwitchTo(oldctx);
