@@ -1401,7 +1401,9 @@ replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs, Tupl
  * returns necessary informations about field of composite type
  */
 static int
-resolve_composite_field(Oid rowoid, int16 rowtypmod, const char *fieldname, Oid *typoid, int16 *typmod)
+resolve_composite_field(Oid rowoid, int16 rowtypmod, const char *fieldname, 
+								Oid *typoid, int16 *typmod, 
+											    int location)
 {
 	TupleDesc tupdesc = lookup_rowtype_tupdesc(rowoid, rowtypmod);
 	int		i;
@@ -1421,8 +1423,11 @@ resolve_composite_field(Oid rowoid, int16 rowtypmod, const char *fieldname, Oid 
 		}
 	}
 
-	elog(ERROR, "there are no field \"%s\" in type \"%s\"", fieldname,
-				format_type_with_typemod(rowoid, rowtypmod));
+	ereport(ERROR,
+		    (errcode(ERRCODE_SYNTAX_ERROR),
+		     errmsg("there are no field \"%s\" in type \"%s\"", fieldname,
+						    format_type_with_typemod(rowoid, rowtypmod)),
+					parser_errposition(location)));
 	return -1;		/* be compiler quiete */
 }
 
@@ -1461,8 +1466,9 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, Plpsm_ESQL *from_cl
 		const char *fieldname;
 		Plpsm_object *var;
 		Plpsm_ESQL *esql;
+		Plpsm_positioned_qualid *qualid = (Plpsm_positioned_qualid *) lfirst(l1);
 
-		var = resolve_target(cstate, (Plpsm_positioned_qualid *) lfirst(l1), &fieldname, PLPSM_STMT_DECLARE_VARIABLE);
+		var = resolve_target(cstate, qualid, &fieldname, PLPSM_STMT_DECLARE_VARIABLE);
 		esql = (Plpsm_ESQL *) lfirst(l2);
 
 		if (!isfirst)
@@ -1478,7 +1484,8 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, Plpsm_ESQL *from_cl
 
 			fno = resolve_composite_field(var->stmt->datum.typoid, var->stmt->datum.typmod, fieldname,
 														    &typoid,
-														    &typmod);
+														    &typmod,
+															qualid->location);
 			appendStringInfo(&ds, "(%s)::%s", esql->sqlstr, format_type_with_typemod(typoid, typmod));
 			SET_OPVAL(update_field.fno, fno);
 			SET_OPVAL(update_field.typoid, var->stmt->datum.typoid);
@@ -2017,7 +2024,10 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 					foreach (l, stmt->compound_target)
 					{
-						Plpsm_object	*var = resolve_target(cstate, (Plpsm_positioned_qualid *) lfirst(l),
+						Plpsm_positioned_qualid *qualid = (Plpsm_positioned_qualid *) lfirst(l);
+						Plpsm_object	*var;
+
+						var = resolve_target(cstate, qualid,
 													    &fieldname,
 														    PLPSM_STMT_DECLARE_VARIABLE);
 
@@ -2029,7 +2039,8 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 							fno = resolve_composite_field(var->stmt->datum.typoid, var->stmt->datum.typmod, fieldname,
 																		    &typoid,
-																		    &typmod);
+																		    &typmod,
+																			    qualid->location);
 
 							SET_OPVAL(update_field.fno, fno);
 							SET_OPVAL(update_field.typoid, var->stmt->datum.typoid);
@@ -2217,7 +2228,8 @@ compile(CompileState cstate, Plpsm_stmt *stmt)
 
 							fno = resolve_composite_field(var->stmt->datum.typoid, var->stmt->datum.typmod, fieldname,
 																		    &typoid,
-																		    &typmod);
+																		    &typmod,
+																			    stmt->target->location);
 
 							compile_expr(cstate, stmt->esql, NULL, typoid, typmod);
 							SET_OPVAL(update_field.fno, fno);
