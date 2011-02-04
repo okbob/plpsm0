@@ -628,7 +628,7 @@ collect_vars_info(StringInfo ds, int *nvars, Plpsm_object *scope)
 			appendStringInfo(ds, "%d\t%d\t%s\t%s\t%s\n", iterator->offset, 
 											InvalidOid,
 											scope->name,
-												iterator->name,
+												strcmp(iterator->name,"") == 0 ? NULL : iterator->name,
 												iterator->typ == PLPSM_STMT_DECLARE_VARIABLE ? "variable" : "cursor");
 			(*nvars)++;
 		}

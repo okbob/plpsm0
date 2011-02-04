@@ -346,6 +346,9 @@ next_op:
 				{
 					char *str = text_to_cstring(DatumGetTextP(result));
 					
+					if (dinfo != NULL)
+						dinfo->is_signal = true;
+
 					elog(NOTICE, "%s", str);
 					pfree(str);
 				}
@@ -864,6 +867,8 @@ next_op:
 						 * generate a necesary informations for later variables output,
 						 * It's little bit more complex, because in error handler we
 						 * can't to look to pg_proc.
+						 *
+						 * ToDo: better to do via direct access to objects
 						 */
 						char *def = pcode->frame_info.data;
 						int	oid;
@@ -884,23 +889,29 @@ next_op:
 						{
 							Oid	typOutput;
 							bool	typisvarlena;
-
 							FrameFieldDesc *fdesc = &dinfo->frame_fields[i++];
 
 							fdesc->offset = offset;
 							fdesc->schema = pstrdup(schema);
 							fdesc->name = pstrdup(name);
 							fdesc->is_cursor = (strcmp(typ,"cursor") == 0);
-							fdesc->typename = format_type_be(oid);
 
-							getTypeOutputInfo(oid, &typOutput, &typisvarlena);
-							fmgr_info(typOutput, &fdesc->flinfo);
+							if (!fdesc->is_cursor)
+							{
+								fdesc->typename = format_type_be(oid);
+								getTypeOutputInfo(oid, &typOutput, &typisvarlena);
+								fmgr_info(typOutput, &fdesc->flinfo);
+							}
+							else 
+							{
+								fdesc->typename = "cursor";
+							}
 
 							def = strstr(def, "\n");
 							if (def == NULL)
 								break;
 							else
-							    def++;
+								def++;
 						}
 					}
 				}
