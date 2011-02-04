@@ -625,7 +625,7 @@ collect_vars_info(StringInfo ds, int *nvars, Plpsm_object *scope)
 		}
 		else if (iterator->typ == PLPSM_STMT_DECLARE_CURSOR)
 		{
-			appendStringInfo(ds, "%d\t%d\t%s\t%s\t%s\n", iterator->offset, 
+			appendStringInfo(ds, "%d\t%d\t%s\t%s\t%s\n", iterator->cursor.offset, 
 											InvalidOid,
 											scope->name,
 												strcmp(iterator->name,"") == 0 ? NULL : iterator->name,

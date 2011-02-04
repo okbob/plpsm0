@@ -892,7 +892,8 @@ next_op:
 							FrameFieldDesc *fdesc = &dinfo->frame_fields[i++];
 
 							fdesc->offset = offset;
-							fdesc->schema = pstrdup(schema);
+
+							fdesc->schema = strcmp(schema,"(null)") == 0 ? "" : pstrdup(schema);
 							fdesc->name = pstrdup(name);
 							fdesc->is_cursor = (strcmp(typ,"cursor") == 0);
 
