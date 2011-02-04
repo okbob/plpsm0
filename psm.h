@@ -205,7 +205,10 @@ typedef enum
 	PCODE_CHECK_DATA,
 	PCODE_EXECUTE_IMMEDIATE,
 	PCODE_PREPARE,
-	PCODE_PARAMBUILDER
+	PCODE_PARAMBUILDER,
+	PCODE_DEBUG_LINENO,
+	PCODE_DEBUG_SOURCE_CODE,
+	PCODE_DEBUG_FRAME_DESC
 } Plpsm_pcode_type;
 
 typedef enum
@@ -318,8 +321,14 @@ typedef struct
 				int	fnumber;
 			};
 		} parambuilder;
+		struct
+		{
+			int	nvars;
+			char *data;
+		} frame_info;
 		int	size;
 		int16	ncolumns;
+		int	lineno;
 	};
 } Plpsm_pcode;
 
@@ -372,6 +381,7 @@ extern Plpsm_object *plpsm_parser_objects;
 
 extern bool plpsm_debug_parser;
 extern bool plpsm_debug_compiler;
+extern bool plpsm_debug_info;
 
 extern MemoryContext plpsm_compile_tmp_cxt;
 

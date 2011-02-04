@@ -16,15 +16,13 @@ The main differnce between PLPSM and PL/pgSQL is:
 
 * PLPMS has simpler expression executor than PL/pgSQL has:
 
-    Some procedures that uses a lot of expressions can be two times slower. Updating a field
+    Some procedures that uses a lot of expressions can be two-five times slower. Updating a field
     of composite type is slower than in PL/pgSQL. On second hand - using a composite values
-    can be faster, execution of embeded SQL can be faster in PLPSM. PLPSM isn't too optimized
-    like PL/pgSQL is - the target area of PLPSM isn't too wide. PLPSM isn't designed as
-    universal language like PL/pgSQL is it now. It is designed for implementation of 
-    bussnes logic in stored procedures environment. It's glue for embeded SQL. A expression
-    evaluator can be optimized in next versions. There is only one reason, whe execution
-    is slower. We wouldn't to duplicate all PL/pgSQL code. As outside project a PLPSM
-    should be hard maintaining with same code, that PL/pgSQL has.
+    can be faster, execution of embeded SQL can be faster in PLPSM. PLPSM uses only common 
+    SPI interface, that doesn't allow a execution of "simple" queries. That is significantly
+    faster - 2-5x. So PLPSM in this moment isn't language for high NOT SQL calculations. Use
+    PL/pgSQL, PLPerl, PLPython or C instead. For typical stored procedures - based on embeded
+    SQL the execution speed is same.
 
 * PLPSM is based on compilation to simple virtual machine, PL/pgSQL is based on interpretation of
   semantic tree. 
@@ -45,9 +43,15 @@ The main differnce between PLPSM and PL/pgSQL is:
 
 * PLPSM doesn't use a prepared plans for cursors.
 
-    PLPGSQL uses a cached plans for cursors, queries and expressions. PLPSM uses
+    PL/pgSQL uses a cached plans for cursors, queries and expressions. PLPSM uses
     cache only for expressions and queries. It's mean, so inner loops over cursors
     can be slower, but there less possibility of using a slow plan. 
+
+* PLPSM has more detailed exception report.
+
+    PL/pgSQL shows only statement name and line with broken statement. PLPSM shows a
+    variables, their types and content, shows a function parameters and line. You can
+    see a complete stack.
 
 What is same between PLPSM and PL/pgSQL:
 

@@ -20,6 +20,7 @@
 
 Plpsm_stmt *plpsm_parser_tree;
 bool	plpsm_debug_compiler = false;
+bool	plpsm_debug_info = true;
 
 /* a context for short-term alloc during compilation */
 MemoryContext plpsm_compile_tmp_cxt;
@@ -599,6 +600,47 @@ lookup_var(Plpsm_object *scope, const char *name)
 }
 
 /*
+ * collect a variables info
+ */
+static void
+collect_vars_info(StringInfo ds, int *nvars, Plpsm_object *scope)
+{
+	Plpsm_object *iterator;
+
+	if (scope == NULL)
+		return;
+
+	iterator = scope->inner;
+
+	while (iterator != NULL)
+	{
+		if (iterator->typ == PLPSM_STMT_DECLARE_VARIABLE)
+		{
+			appendStringInfo(ds, "%d\t%d\t%s\t%s\t%s\n", iterator->offset, 
+											iterator->stmt->datum.typoid,
+											scope->name,
+												iterator->name,
+												iterator->typ == PLPSM_STMT_DECLARE_VARIABLE ? "variable" : "cursor");
+			(*nvars)++;
+		}
+		else if (iterator->typ == PLPSM_STMT_DECLARE_CURSOR)
+		{
+			appendStringInfo(ds, "%d\t%d\t%s\t%s\t%s\n", iterator->offset, 
+											InvalidOid,
+											scope->name,
+												iterator->name,
+												iterator->typ == PLPSM_STMT_DECLARE_VARIABLE ? "variable" : "cursor");
+			(*nvars)++;
+		}
+		else if (iterator->typ == PLPSM_STMT_COMPOUND_STATEMENT || iterator->typ == PLPSM_STMT_SCHEMA)
+		{
+			collect_vars_info(ds, nvars, iterator);
+		}
+		iterator = iterator->next;
+	}
+}
+
+/*
  * lookup a not found continue handler
  */
 static Plpsm_object *
@@ -1030,6 +1072,15 @@ list(Plpsm_pcode_module *m)
 				appendStringInfo(&ds, "Execute sqlstr[%d] params[%d]", VALUE(execute.sqlstr), 
 											VALUE(execute.params));
 				break;
+			case PCODE_DEBUG_LINENO:
+				appendStringInfo(&ds, "Lineno %d", VALUE(lineno));
+				break;
+			case PCODE_DEBUG_FRAME_DESC:
+				appendStringInfo(&ds, "FrameDesc %d\n%s", VALUE(frame_info.nvars), VALUE(frame_info.data));
+				break;
+			case PCODE_DEBUG_SOURCE_CODE:
+				appendStringInfo(&ds, "Source code attached");
+				break;
 		}
 		appendStringInfoChar(&ds, '\n');
 	}
@@ -1102,6 +1153,11 @@ check_module_size(Plpsm_pcode_module *m)
 						SET_OPVAL(strbuilder.p, v); \
 						EMIT_OPCODE(PCODE_STRBUILDER); \
 					} while (0)
+#define EMIT_LINENO(n)			do { \
+						SET_OPVAL(lineno, n); \
+						EMIT_OPCODE(PCODE_DEBUG_LINENO); \
+					} while (0)
+
 
 static void
 compile_release_cursors(CompileState cstate)
@@ -1727,6 +1783,9 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 
 	while (stmt != NULL)
 	{
+		if (plpsm_debug_info)
+			EMIT_LINENO(stmt->lineno);
+
 		switch (stmt->typ)
 		{
 			case PLPSM_STMT_LOOP:
@@ -2506,6 +2565,8 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	ErrorContextCallback	plerrcontext;
 	MemoryContext	func_cxt;
 	Plpsm_pcode_module *m;
+	int	frame_info_addr = -1;
+	StringInfoData		frame_info;
 
 	procStruct = (Form_pg_proc) GETSTRUCT(procTup);
 
@@ -2543,6 +2604,14 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	m->is_read_only = (procStruct->provolatile != PROVOLATILE_VOLATILE);
 
 	proc_source = TextDatumGetCString(prosrcdatum);
+
+	if (plpsm_debug_info)
+	{
+		SET_OPVAL(str, pstrdup(proc_source));
+		EMIT_OPCODE(PCODE_DEBUG_SOURCE_CODE);
+		frame_info_addr = PC(m);
+		EMIT_OPCODE(PCODE_DEBUG_FRAME_DESC);
+	}
 
 	plerrcontext.callback = plpsm_compile_error_callback;
 	plerrcontext.arg = forValidator ? proc_source : NULL;
@@ -2674,6 +2743,16 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	_compile(&cstate, plpsm_parser_tree);
 	compile_done(&cstate);
 
+	if (plpsm_debug_info)
+	{
+		int	nvars = 0;
+		/* append frame info */
+		initStringInfo(&frame_info);
+		collect_vars_info(&frame_info, &nvars, cstate.top_scope);
+		SET_OPVAL_ADDR(frame_info_addr, frame_info.nvars, nvars);
+		SET_OPVAL_ADDR(frame_info_addr, frame_info.data, frame_info.data);
+	}
+
 	m->ndatums = cstate.stack.ndatums;
 	m->ndata = cstate.stack.ndata;
 
@@ -2696,7 +2775,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	MemoryContextSwitchTo(plpsm_compile_tmp_cxt);
 	plpsm_compile_tmp_cxt = NULL;
 
-	return module		;
+	return module;
 }
 
 /*

@@ -24,8 +24,35 @@ typedef struct
 	int16	*typlen;
 } Params;
 
-Datum
-plpsm_func_execute(Plpsm_module *mod, FunctionCallInfo fcinfo)
+typedef struct
+{
+	int16		offset;
+	const char    *schema;
+	const char    *name;
+	const char    *typename;
+	bool	is_cursor;
+	FmgrInfo flinfo;
+} FrameFieldDesc;
+
+typedef struct
+{
+	Plpsm_module *module;
+	Datum		*values;
+	char		*nulls;
+	int		*PC;
+	int		*lineno;
+	char		**src;
+	bool		is_signal;
+	FrameFieldDesc	*frame_fields;
+	int16		nvars;
+} DebugInfoData;
+
+typedef DebugInfoData *DebugInfo;
+
+static void plpsm_exec_error_callback(void *arg);
+
+static Datum
+execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 {
 	Datum	*values = NULL;
 	char	*nulls = NULL;
@@ -42,6 +69,8 @@ plpsm_func_execute(Plpsm_module *mod, FunctionCallInfo fcinfo)
 	int	rc;
 	Plpsm_pcode_module *module = mod->code;
 	bool		is_read_only = module->is_read_only;
+	int	lineno = -1;
+	char	*src = NULL;
 
 	MemoryContext	exec_ctx;
 	MemoryContext	oldctx;
@@ -62,6 +91,19 @@ plpsm_func_execute(Plpsm_module *mod, FunctionCallInfo fcinfo)
 	{
 		values = palloc(module->ndatums * sizeof(Datum));
 		nulls = palloc(module->ndatums * sizeof(char));
+	}
+
+	if (dinfo != NULL)
+	{
+		dinfo->module = mod;
+		dinfo->values = values;
+		dinfo->nulls = nulls;
+		dinfo->PC = &PC;
+		dinfo->lineno = &lineno;
+		dinfo->src = &src;
+		dinfo->is_signal = false;
+		dinfo->nvars = 0;
+		dinfo->frame_fields = NULL;
 	}
 
 	while (PC < module->length)
@@ -802,6 +844,68 @@ next_op:
 				/* do nothing */
 				break;
 
+			case PCODE_DEBUG_LINENO:
+				{
+					lineno = pcode->lineno;
+				}
+				break;
+
+			case PCODE_DEBUG_SOURCE_CODE:
+				{
+					src = pcode->str;
+				}
+				break;
+
+			case PCODE_DEBUG_FRAME_DESC:
+				{
+					if (dinfo != NULL)
+					{
+						/* 
+						 * generate a necesary informations for later variables output,
+						 * It's little bit more complex, because in error handler we
+						 * can't to look to pg_proc.
+						 */
+						char *def = pcode->frame_info.data;
+						int	oid;
+						int	offset;
+						char	*name;
+						char	*schema;
+						char	typ[20];
+						int		i = 0;
+
+						name = palloc(strlen(def));
+						schema = palloc(strlen(def));
+
+						dinfo->nvars = pcode->frame_info.nvars;
+						dinfo->frame_fields = palloc(pcode->frame_info.nvars * sizeof(FrameFieldDesc));
+
+						while (sscanf(def, "%d\t\%d\t%[^\t]\t%[^\t]\t%s\n",
+										&offset, &oid, schema, name, typ) != EOF)
+						{
+							Oid	typOutput;
+							bool	typisvarlena;
+
+							FrameFieldDesc *fdesc = &dinfo->frame_fields[i++];
+
+							fdesc->offset = offset;
+							fdesc->schema = pstrdup(schema);
+							fdesc->name = pstrdup(name);
+							fdesc->is_cursor = (strcmp(typ,"cursor") == 0);
+							fdesc->typename = format_type_be(oid);
+
+							getTypeOutputInfo(oid, &typOutput, &typisvarlena);
+							fmgr_info(typOutput, &fdesc->flinfo);
+
+							def = strstr(def, "\n");
+							if (def == NULL)
+								break;
+							else
+							    def++;
+						}
+					}
+				}
+				break;
+
 			default:
 				elog(ERROR, "unknown pcode %d %d", pcode->typ, PC);
 		}
@@ -829,4 +933,128 @@ leave_process:
 	}
 
 	return (Datum) result;
+}
+
+/*
+ * Set a ErrorCallback and exeute a module
+ */
+Datum
+plpsm_func_execute(Plpsm_module *mod, FunctionCallInfo fcinfo)
+{
+	ErrorContextCallback plerrcontext;
+	DebugInfoData	dinfo;
+	Datum	result;
+
+	plerrcontext.callback = plpsm_exec_error_callback;
+	plerrcontext.arg = &dinfo;
+	plerrcontext.previous = error_context_stack;
+	error_context_stack = &plerrcontext;
+
+	result = execute_module(mod, fcinfo, &dinfo);
+
+	error_context_stack = plerrcontext.previous;
+
+	return result;
+}
+
+/*
+ * set a context to let us supply a call-stack traceback
+ */
+static void
+plpsm_exec_error_callback(void *arg)
+{
+	DebugInfo dinfo = (DebugInfo) arg;
+
+	if (dinfo->is_signal)
+		return;
+
+	if (*dinfo->lineno != -1 && *dinfo->src != NULL)
+	{
+		StringInfoData	ds;
+		int	lineno = *dinfo->lineno;
+		char	*src = *dinfo->src;
+		int	curline = 0;
+		
+		int maxl = 0;
+		
+
+		initStringInfo(&ds);
+		appendStringInfo(&ds, "PLPSM function \"%s\"  Oid %d line %d\n\n", dinfo->module->code->name, 
+											    dinfo->module->oid,
+											    *dinfo->lineno); 
+
+		while (*src != '\0')
+		{
+			if (maxl++ == 100)
+				break;
+			if (curline < lineno - 3)
+			{
+				/* skip line */
+				while (*src != '\0')
+					if (*src++ == '\n')
+						break;
+			}
+			else if (curline < lineno + 2)
+			{
+				appendStringInfo(&ds, "%4d\t", curline + 1);
+				while (*src != '\0')
+				{
+					appendStringInfoChar(&ds, *src);
+					if (*src++ == '\n')
+						break;
+				}
+			}
+			else
+				break;
+			curline++;
+		}
+
+		if (dinfo->frame_fields != NULL)
+		{
+			int	i;
+
+			appendStringInfo(&ds, "\nLocal variables:\n\n");
+			for (i = 0; i < dinfo->nvars; i++)
+			{
+				FrameFieldDesc *fdesc = &dinfo->frame_fields[i];
+
+				if (fdesc->is_cursor)
+				{
+					appendStringInfo(&ds, "%4d\t%s.%s\t\t", fdesc->offset,
+											fdesc->schema,
+											fdesc->name);
+					if (dinfo->nulls[fdesc->offset] == 'n')
+						appendStringInfoString(&ds, "closed cursor\n");
+					else
+						appendStringInfoString(&ds, "opened cursor\n");
+				}
+				else
+				{
+					appendStringInfo(&ds, "%4d\t%s.%s\t\t%-20s\t", fdesc->offset,
+											fdesc->schema,
+											fdesc->name,
+											fdesc->typename);
+					if (dinfo->nulls[fdesc->offset] == 'n')
+						appendStringInfoString(&ds, "is <NULL>\n");
+					else
+					{
+						Datum output = FunctionCall1(&fdesc->flinfo, dinfo->values[fdesc->offset]);
+						appendStringInfo(&ds, "= %s\n", DatumGetCString(output));
+					}
+				}
+			}
+		}
+
+		errcontext(ds.data);
+		pfree(ds.data);
+	}
+	else
+	if (*dinfo->lineno != -1)
+	{
+		errcontext("PLPSM function \"%s\"  Oid %d line %d", dinfo->module->code->name, 
+										    dinfo->module->oid,
+										    *dinfo->lineno); 
+	}
+	else
+		errcontext("PLPSM function \"%s\"  Oid %d", dinfo->module->code->name, dinfo->module->oid); 
 }

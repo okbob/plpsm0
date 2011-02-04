@@ -46,6 +46,14 @@ _PG_init(void)
 						PGC_SUSET, 0,
 						NULL, NULL);
 
+	DefineCustomBoolVariable("plpsm.debug_info",
+						"when is true, then debug data is attached",
+						NULL,
+						&plpsm_debug_info,
+						true,
+						PGC_SUSET, 0,
+						NULL, NULL);
+
 	plpsm_HashTableInit();
 
 	inited = true;
