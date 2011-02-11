@@ -1061,6 +1061,31 @@ returns xx as $$
   select 10,20 into x.a, x.b;
 $$ language psm0;
 
+create or replace function test59(in n int)
+returns int as $$
+begin
+  declare i, p, d int;
+  declare s bigint default 0;
+  declare found boolean;
+  set i = 0, p = 2;
+  while i < n do
+nt: loop
+      set p = p + 1, d = p / 2;
+      while d > 1 do
+        if p % d = 0 then
+          iterate nt;
+        end if;
+        set d = d - 1;
+      end while;
+      leave nt;
+    end loop;
+    -- print i, p;
+    set (s, i) = (s + p, i + 1);
+  end while;
+  return s;
+end;
+$$ language psm0;
+
 /*************************************************
  * Assert functions - sure, it is in plgsql :)
  */
@@ -1186,6 +1211,7 @@ begin
   perform assert('test57', -1, test57());
   perform assert('test58', 30, test58());
   perform assert('test58_01', 10, (test58_01()).a);
+  perform assert('test59', 5348, test59(50));
 
   raise notice '******* All tests are ok *******';
 end;

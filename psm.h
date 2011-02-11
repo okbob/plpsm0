@@ -231,6 +231,9 @@ typedef enum
 typedef struct
 {
 	char		typ;
+	int16		lineno;
+	int16		htnum;		/* Handlers' Table Offset */
+	Plpsm_object	*cframe;
 	union
 	{
 		int addr;

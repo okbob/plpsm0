@@ -349,7 +349,12 @@ next_op:
 					if (dinfo != NULL)
 						dinfo->is_signal = true;
 
+fprintf(stderr, "PRINT %d\n", dinfo);
+
+
 					elog(NOTICE, "%s", str);
+
+
 					pfree(str);
 				}
 				break;
@@ -725,7 +730,11 @@ next_op:
 							break;
 						case PLPSM_STRBUILDER_PRINT_FREE:
 							ds = DataPtrs[pcode->strbuilder.data];
+							if (dinfo)
+								dinfo->is_signal = true;
 							ereport(NOTICE, (0, errmsg_internal("%s", ds->data)));
+							if (dinfo)
+								dinfo->is_signal = false;
 							pfree(ds->data);
 							break;
 						case PLPSM_STRBUILDER_FREE:
@@ -976,6 +985,9 @@ static void
 plpsm_exec_error_callback(void *arg)
 {
 	DebugInfo dinfo = (DebugInfo) arg;
+
+fprintf(stderr, "plpsm_exec_error_callback %d\n", dinfo->is_signal);
+	
 
 	if (dinfo->is_signal)
 		return;
