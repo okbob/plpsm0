@@ -104,6 +104,8 @@ typedef struct
 	PreparedStatement *prepared;
 } CompileStateData;
 
+#define CURRENT_SCOPE	(cstate->current_scope)
+
 typedef CompileStateData *CompileState;
 
 static void _compile(CompileState cstate, Plpsm_stmt *stmt);
@@ -599,46 +601,6 @@ lookup_var(Plpsm_object *scope, const char *name)
 	return lookup_var(scope->outer, name);
 }
 
-/*
- * collect a variables info
- */
-static void
-collect_vars_info(StringInfo ds, int *nvars, Plpsm_object *scope)
-{
-	Plpsm_object *iterator;
-
-	if (scope == NULL)
-		return;
-
-	iterator = scope->inner;
-
-	while (iterator != NULL)
-	{
-		if (iterator->typ == PLPSM_STMT_DECLARE_VARIABLE)
-		{
-			appendStringInfo(ds, "%d\t%d\t%s\t%s\t%s\n", iterator->offset, 
-											iterator->stmt->datum.typoid,
-											scope->name,
-												iterator->name,
-												iterator->typ == PLPSM_STMT_DECLARE_VARIABLE ? "variable" : "cursor");
-			(*nvars)++;
-		}
-		else if (iterator->typ == PLPSM_STMT_DECLARE_CURSOR)
-		{
-			appendStringInfo(ds, "%d\t%d\t%s\t%s\t%s\n", iterator->cursor.offset, 
-											InvalidOid,
-											scope->name,
-												strcmp(iterator->name,"") == 0 ? NULL : iterator->name,
-												iterator->typ == PLPSM_STMT_DECLARE_VARIABLE ? "variable" : "cursor");
-			(*nvars)++;
-		}
-		else if (iterator->typ == PLPSM_STMT_COMPOUND_STATEMENT || iterator->typ == PLPSM_STMT_SCHEMA)
-		{
-			collect_vars_info(ds, nvars, iterator);
-		}
-		iterator = iterator->next;
-	}
-}
 
 /*
  * lookup a not found continue handler
@@ -1072,12 +1034,6 @@ list(Plpsm_pcode_module *m)
 				appendStringInfo(&ds, "Execute sqlstr[%d] params[%d]", VALUE(execute.sqlstr), 
 											VALUE(execute.params));
 				break;
-			case PCODE_DEBUG_LINENO:
-				appendStringInfo(&ds, "Lineno %d", VALUE(lineno));
-				break;
-			case PCODE_DEBUG_FRAME_DESC:
-				appendStringInfo(&ds, "FrameDesc %d\n%s", VALUE(frame_info.nvars), VALUE(frame_info.data));
-				break;
 			case PCODE_DEBUG_SOURCE_CODE:
 				appendStringInfo(&ds, "Source code attached");
 				break;
@@ -1106,8 +1062,10 @@ check_module_size(Plpsm_pcode_module *m)
 #define PC(m)				m->length
 
 #define SET_OPVAL(n, v)			m->code[m->length].n = v
-#define EMIT_OPCODE(t)			do { \
-						m->code[m->length++].typ = t; \
+#define EMIT_OPCODE(t, lno)			do { \
+						m->code[m->length].lineno = lno; \
+						m->code[m->length].cframe = plpsm_debug_info ? CURRENT_SCOPE : NULL; \
+						m->code[m->length++].typ = PCODE_ ## t; \
 						m = check_module_size(m); \
 					} while (0)
 #define SET_OPVAL_ADDR(a,n,v)		m->code[a].n = v
@@ -1123,41 +1081,36 @@ check_module_size(Plpsm_pcode_module *m)
 						SET_OPVAL(mi.typlen, var->stmt->datum.typlen); \
 						SET_OPVAL(mi.typbyval, var->stmt->datum.typbyval); \
 					} while (0)
-#define EMIT_JMP(a)			do { \
+#define EMIT_JMP(a, lno)	do { \
 						SET_OPVAL(addr, a); \
-						EMIT_OPCODE(PCODE_JMP); \
+						EMIT_OPCODE(JMP, lno); \
 					} while (0)
-#define EMIT_CALL(a)			do { \
+#define EMIT_CALL(a, lno)	do { \
 						SET_OPVAL(addr, a); \
-						EMIT_OPCODE(PCODE_CALL); \
+						EMIT_OPCODE(CALL, lno); \
 					} while (0)
 #define PARAMBUILDER(o,d)		do { \
 						SET_OPVAL(parambuilder.data, d); \
 						SET_OPVAL(parambuilder.op, PLPSM_PARAMBUILDER_ ## o); \
-						EMIT_OPCODE(PCODE_PARAMBUILDER); \
+						EMIT_OPCODE(PARAMBUILDER, -1); \
 					} while (0)
 #define PARAMBUILDER1(o,d, p,v)		do { \
 						SET_OPVAL(parambuilder.data, d); \
 						SET_OPVAL(parambuilder.op, PLPSM_PARAMBUILDER_ ## o); \
 						SET_OPVAL(parambuilder.p, v); \
-						EMIT_OPCODE(PCODE_PARAMBUILDER); \
+						EMIT_OPCODE(PARAMBUILDER, -1); \
 					} while (0)
 #define STRBUILDER(o,d)		do { \
 						SET_OPVAL(strbuilder.data, d); \
 						SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_ ## o); \
-						EMIT_OPCODE(PCODE_STRBUILDER); \
+						EMIT_OPCODE(STRBUILDER, -1); \
 					} while (0)
 #define STRBUILDER1(o,d, p,v)		do { \
 						SET_OPVAL(strbuilder.data, d); \
 						SET_OPVAL(strbuilder.op, PLPSM_STRBUILDER_ ## o); \
 						SET_OPVAL(strbuilder.p, v); \
-						EMIT_OPCODE(PCODE_STRBUILDER); \
+						EMIT_OPCODE(STRBUILDER, -1); \
 					} while (0)
-#define EMIT_LINENO(n)			do { \
-						SET_OPVAL(lineno, n); \
-						EMIT_OPCODE(PCODE_DEBUG_LINENO); \
-					} while (0)
-
 
 static void
 compile_release_cursors(CompileState cstate)
@@ -1178,7 +1131,7 @@ compile_release_cursors(CompileState cstate)
 			SET_OPVAL(cursor.name, iterator->name);
 			SET_OPVAL(cursor.addr, iterator->cursor.data_addr);
 			SET_OPVAL(cursor.offset, iterator->cursor.offset);
-			EMIT_OPCODE(PCODE_CURSOR_RELEASE);
+			EMIT_OPCODE(CURSOR_RELEASE, -1);
 		}
 		iterator = iterator->next;
 	}
@@ -1216,7 +1169,7 @@ compile_leave_iterate(CompileState cstate,
 									(errcode(ERRCODE_SYNTAX_ERROR),
 									 errmsg("label of iterate statement is related to compound statement"),
 											parser_errposition(stmt->location)));
-						EMIT_JMP(scope->calls.entry_addr);
+						EMIT_JMP(scope->calls.entry_addr, stmt->lineno);
 					}
 					else
 					{
@@ -1224,12 +1177,12 @@ compile_leave_iterate(CompileState cstate,
 						{
 							scope->calls.release_calls = lappend(scope->calls.release_calls, 
 														makeInteger(PC(m)));
-							EMIT_OPCODE(PCODE_CALL);
+							EMIT_OPCODE(CALL, stmt->lineno);
 						}
 						
 						scope->calls.leave_jmps = lappend(scope->calls.leave_jmps,
 													    makeInteger(PC(m)));
-						EMIT_OPCODE(PCODE_JMP);
+						EMIT_OPCODE(JMP, stmt->lineno);
 					}
 				}
 				else
@@ -1238,7 +1191,7 @@ compile_leave_iterate(CompileState cstate,
 					{
 						scope->calls.release_calls = lappend(scope->calls.release_calls,
 													    makeInteger(PC(m)));
-						EMIT_OPCODE(PCODE_CALL);
+						EMIT_OPCODE(CALL, stmt->lineno);
 					}
 				}
 				compile_leave_iterate(cstate, scope->outer, stmt);
@@ -1254,7 +1207,7 @@ compile_leave_iterate(CompileState cstate,
 				{
 					scope->calls.release_calls = lappend(scope->calls.release_calls, 
 													makeInteger(PC(m)));
-					EMIT_OPCODE(PCODE_CALL);
+					EMIT_OPCODE(CALL, stmt->lineno);
 				}
 				compile_leave_iterate(cstate, scope->outer, stmt);
 			}
@@ -1282,16 +1235,16 @@ compile_done(CompileState cstate)
 						cstate->finfo.result.datum.typoid, -1);
 		SET_OPVAL(target.typlen, cstate->finfo.result.datum.typlen);
 		SET_OPVAL(target.typbyval, cstate->finfo.result.datum.typbyval);
-		EMIT_OPCODE(PCODE_RETURN);
+		EMIT_OPCODE(RETURN, -1);
 	}
 	else if (cstate->finfo.result.datum.typoid != VOIDOID)
 	{
 		SET_OPVAL(str,"function doesn't return data");
-		EMIT_OPCODE(PCODE_SIGNAL_NODATA);
+		EMIT_OPCODE(SIGNAL_NODATA, -1);
 	}
 	else
 	{
-		EMIT_OPCODE(PCODE_RETURN_VOID);
+		EMIT_OPCODE(RETURN_VOID, -1);
 	}
 }
 
@@ -1548,7 +1501,7 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, Plpsm_ESQL *from_cl
 	addr = PC(m);
 	SET_OPVAL(expr.data, cstate->stack.ndata++);
 	SET_OPVAL(expr.is_multicol, true);
-	EMIT_OPCODE(PCODE_EXEC_EXPR);
+	EMIT_OPCODE(EXEC_EXPR, stmt->lineno);
 	appendStringInfoString(&ds, "SELECT ");
 
 	forboth (l1, stmt->compound_target, l2, stmt->esql_list)
@@ -1582,7 +1535,7 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, Plpsm_ESQL *from_cl
 			SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
 			SET_OPVAL(update_field.offset, var->offset);
 			SET_OPVAL(update_field.fnumber, i++);
-			EMIT_OPCODE(PCODE_UPDATE_FIELD);
+			EMIT_OPCODE(UPDATE_FIELD, stmt->lineno);
 		}
 		else
 		{
@@ -1590,7 +1543,7 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, Plpsm_ESQL *from_cl
 							format_type_with_typemod(var->stmt->datum.typoid, var->stmt->datum.typmod));
 			SET_OPVALS_DATUM_INFO(saveto_field, var);
 			SET_OPVAL(saveto_field.fnumber, i++);
-			EMIT_OPCODE(PCODE_SAVETO_FIELD);
+			EMIT_OPCODE(SAVETO_FIELD, stmt->lineno);
 		}
 	}
 
@@ -1614,10 +1567,12 @@ compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid target
 	Oid	*argtypes;
 	Plpsm_sql_error_callback_arg 		cbarg;
 	ErrorContextCallback  			syntax_errcontext;
+	int	lineno = -1;
 
 	if (esql != NULL)
 	{
 		expr = esql->sqlstr;
+		lineno = esql->lineno;
 
 		cbarg.location = esql->location;
 		cbarg.leaderlen = strlen("SELECT (");
@@ -1635,7 +1590,7 @@ compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid target
 	SET_OPVAL(expr.typoids, argtypes);
 	SET_OPVAL(expr.data, cstate->stack.ndata++);
 	SET_OPVAL(expr.is_multicol, false);
-	EMIT_OPCODE(PCODE_EXEC_EXPR);
+	EMIT_OPCODE(EXEC_EXPR, lineno);
 
 	if (esql != NULL)
 	{
@@ -1667,7 +1622,7 @@ compile_usage_clause(CompileState cstate, Plpsm_stmt *stmt, int *params)
 	addr1 = PC(m);
 	SET_OPVAL(expr.data, cstate->stack.ndata++);
 	SET_OPVAL(expr.is_multicol, true);
-	EMIT_OPCODE(PCODE_EXEC_EXPR);
+	EMIT_OPCODE(EXEC_EXPR, stmt->lineno);
 	appendStringInfoString(&ds, "SELECT ");
 
 	foreach (l, stmt->variables)
@@ -1713,7 +1668,7 @@ compile_refresh_basic_diagnostic(CompileState cstate)
 		Plpsm_object *var = lookup_var(cstate->current_scope, "sqlstate");
 		Assert(var != NULL);
 		SET_OPVALS_DATUM_COPY(target, var);
-		EMIT_OPCODE(PCODE_SQLSTATE_REFRESH);
+		EMIT_OPCODE(SQLSTATE_REFRESH, -1);
 	}
 
 	if (cstate->stack.has_sqlcode)
@@ -1721,14 +1676,14 @@ compile_refresh_basic_diagnostic(CompileState cstate)
 		Plpsm_object *var = lookup_var(cstate->current_scope, "sqlcode");
 		Assert(var != NULL);
 		SET_OPVALS_DATUM_COPY(target, var);
-		EMIT_OPCODE(PCODE_SQLCODE_REFRESH);
+		EMIT_OPCODE(SQLCODE_REFRESH, -1);
 	}
 
 	if (cstate->stack.has_notfound_continue_handler)
 	{
 		Plpsm_object *notfound_handler = lookup_notfound_continue_handler(cstate->current_scope);
 		SET_OPVAL(addr, notfound_handler->calls.entry_addr);
-		EMIT_OPCODE(PCODE_CALL_NOT_FOUND);
+		EMIT_OPCODE(CALL_NOT_FOUND, -1);
 	}
 }
 
@@ -1747,12 +1702,12 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
 		{
 			int release_addr;
 			/* generate a release block as subrotine */
-			EMIT_CALL(PC(m) + 2);
+			EMIT_CALL(PC(m) + 2, -1);
 			addr1 = PC(m);
-			EMIT_OPCODE(PCODE_JMP);
+			EMIT_OPCODE(JMP, -1);
 			release_addr = PC(m);
 			compile_release_cursors(cstate);
-			EMIT_OPCODE(PCODE_RET_SUBR);
+			EMIT_OPCODE(RET_SUBR, -1);
 			SET_OPVAL_ADDR(addr1, addr, PC(m));
 			cstate->current_scope = release_psm_object(cstate, obj, release_addr, PC(m));
 		}
@@ -1783,9 +1738,6 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 
 	while (stmt != NULL)
 	{
-		if (plpsm_debug_info)
-			EMIT_LINENO(stmt->lineno);
-
 		switch (stmt->typ)
 		{
 			case PLPSM_STMT_LOOP:
@@ -1793,7 +1745,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					addr1 = PC(m);
 					_compile(cstate, stmt->inner_left);
-					EMIT_JMP(addr1);
+					EMIT_JMP(addr1, stmt->lineno);
 					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));\
 				}
 				break;
@@ -1804,9 +1756,9 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					addr1 = PC(m);
 					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					addr2 = PC(m);
-					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
+					EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
 					_compile(cstate, stmt->inner_left);
-					EMIT_JMP(addr1);
+					EMIT_JMP(addr1, stmt->lineno);
 					SET_OPVAL_ADDR(addr2, addr, PC(m));
 					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
 				}
@@ -1819,7 +1771,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					_compile(cstate, stmt->inner_left);
 					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					SET_OPVAL(addr, addr1);
-					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
+					EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
 					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
 				}
 				break;
@@ -1861,7 +1813,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					SET_OPVAL(expr.data, cstate->stack.ndata++);
 					SET_OPVAL(expr.is_multicol, true);
 
-					EMIT_OPCODE(PCODE_DATA_QUERY);
+					EMIT_OPCODE(DATA_QUERY, stmt->lineno);
 
 					vars = (Plpsm_object **) palloc(tupdesc->natts * sizeof(Plpsm_object *));
 
@@ -1893,7 +1845,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					SET_OPVAL(cursor.addr, cursor->cursor.data_addr);
 					SET_OPVAL(cursor.offset, cursor->cursor.offset);
 					SET_OPVAL(cursor.name, cursor->name);
-					EMIT_OPCODE(PCODE_CURSOR_OPEN);
+					EMIT_OPCODE(CURSOR_OPEN, stmt->lineno);
 
 					/* generate innerate loop */
 					for_obj = new_psm_object_for(stmt, cstate, PC(m));
@@ -1905,22 +1857,22 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					SET_OPVAL(fetch.name, cursor->name);
 					SET_OPVAL(fetch.nvars, 1);
 					SET_OPVAL(fetch.count, 1);
-					EMIT_OPCODE(PCODE_CURSOR_FETCH);
+					EMIT_OPCODE(CURSOR_FETCH, stmt->lineno);
 
 					addr1 = PC(m);
-					EMIT_OPCODE(PCODE_JMP_NOT_FOUND);
+					EMIT_OPCODE(JMP_NOT_FOUND, stmt->lineno);
 
 					for (i = 0; i < tupdesc->natts; i++)
 					{
 						/* we are sure so datum doesn't need a cast */
 						SET_OPVALS_DATUM_INFO(saveto_field, vars[i]);
 						SET_OPVAL(saveto_field.fnumber, i + 1);
-						EMIT_OPCODE(PCODE_SAVETO_FIELD);
+						EMIT_OPCODE(SAVETO_FIELD, stmt->lineno);
 					}
 					pfree(vars);
 
 					_compile(cstate, stmt->inner_left);
-					EMIT_JMP(addr2);
+					EMIT_JMP(addr2, stmt->lineno);
 					SET_OPVAL_ADDR(addr1, addr, PC(m));
 
 					/* release inner compose loop stmt */
@@ -1966,7 +1918,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					 * In this moment, only continue not found handlers are supported
 					 */
 					addr1 = PC(m);
-					EMIT_OPCODE(PCODE_JMP);
+					EMIT_OPCODE(JMP, stmt->lineno);
 					addr2 = PC(m);
 
 					obj = create_handler_for(stmt, cstate, PC(m));
@@ -1977,7 +1929,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					 */
 					cstate->stack.has_notfound_continue_handler = false;
 					_compile(cstate, stmt->inner_left);
-					EMIT_OPCODE(PCODE_RET_SUBR);
+					EMIT_OPCODE(RET_SUBR, stmt->lineno);
 					SET_OPVAL_ADDR(addr1, addr, PC(m));
 
 					cstate->stack.has_notfound_continue_handler = true;
@@ -2001,12 +1953,12 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 						if (stmt->esql != NULL)
 						{
 							SET_OPVALS_DATUM_COPY(target, var);
-							EMIT_OPCODE(PCODE_SAVETO);
+							EMIT_OPCODE(SAVETO, stmt->lineno);
 						}
 						else
 						{
 							SET_OPVAL(target.offset, var->offset);
-							EMIT_OPCODE(PCODE_SET_NULL);
+							EMIT_OPCODE(SET_NULL, stmt->lineno);
 						}
 					}
 				}
@@ -2029,7 +1981,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 						SET_OPVAL(expr.data, cstate->stack.ndata++);
 						SET_OPVAL(expr.is_multicol, true);
 
-						EMIT_OPCODE(PCODE_DATA_QUERY);
+						EMIT_OPCODE(DATA_QUERY, stmt->lineno);
 					}
 					else
 					{
@@ -2075,7 +2027,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 						SET_OPVAL(cursor.addr, var->cursor.data_addr);
 						SET_OPVAL(cursor.offset, var->cursor.offset);
 						SET_OPVAL(cursor.name, var->name);
-						EMIT_OPCODE(PCODE_CURSOR_OPEN);
+						EMIT_OPCODE(CURSOR_OPEN, stmt->lineno);
 					}
 					else
 					{
@@ -2084,7 +2036,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 						SET_OPVAL(cursor.name, var->name);
 						SET_OPVAL(cursor.params, params);
 						SET_OPVAL(cursor.prepname, var->cursor.prepname);
-						EMIT_OPCODE(PCODE_CURSOR_OPEN_DYNAMIC);
+						EMIT_OPCODE(CURSOR_OPEN_DYNAMIC, stmt->lineno);
 						if (params != -1)
 							PARAMBUILDER(FREE, params);
 					}
@@ -2113,7 +2065,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					SET_OPVAL(fetch.name, obj->name);
 					SET_OPVAL(fetch.nvars, list_length(stmt->compound_target));
 					SET_OPVAL(fetch.count, 1);
-					EMIT_OPCODE(PCODE_CURSOR_FETCH);
+					EMIT_OPCODE(CURSOR_FETCH, stmt->lineno);
 
 					foreach (l, stmt->compound_target)
 					{
@@ -2140,14 +2092,14 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 							SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
 							SET_OPVAL(update_field.offset, var->offset);
 							SET_OPVAL(update_field.fnumber, i++);
-							EMIT_OPCODE(PCODE_UPDATE_FIELD);
+							EMIT_OPCODE(UPDATE_FIELD, stmt->lineno);
 						}
 						else
 						{
 							SET_OPVALS_DATUM_INFO(saveto_field, var);
 							SET_OPVAL(saveto_field.data, cstate->stack.ndata++);
 							SET_OPVAL(saveto_field.fnumber, i++);
-							EMIT_OPCODE(PCODE_SAVETO_FIELD);
+							EMIT_OPCODE(SAVETO_FIELD, stmt->lineno);
 						}
 					}
 
@@ -2181,7 +2133,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					SET_OPVAL(cursor.addr, obj->cursor.data_addr);
 					SET_OPVAL(cursor.offset, obj->cursor.offset);
 					SET_OPVAL(cursor.name, obj->name);
-					EMIT_OPCODE(PCODE_CURSOR_CLOSE);
+					EMIT_OPCODE(CURSOR_CLOSE, stmt->lineno);
 				}
 				break;
 
@@ -2189,12 +2141,12 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					addr1 = PC(m);
-					EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
+					EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
 					_compile(cstate, stmt->inner_left);
 					if (stmt->inner_right)
 					{
 						addr2 = PC(m);
-						EMIT_OPCODE(PCODE_JMP);
+						EMIT_OPCODE(JMP, stmt->lineno);
 						SET_OPVAL_ADDR(addr1, addr, PC(m));
 						_compile(cstate, stmt->inner_right);
 						SET_OPVAL_ADDR(addr2, addr, PC(m));
@@ -2228,10 +2180,10 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 
 						compile_expr(cstate, NULL, expr, BOOLOID, -1);
 						addr1 = PC(m);
-						EMIT_OPCODE(PCODE_JMP_FALSE_UNKNOWN);
+						EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
 						_compile(cstate, cond->inner_left);
 						final_jmps = lappend(final_jmps, makeInteger(PC(m)));
-						EMIT_OPCODE(PCODE_JMP);
+						EMIT_OPCODE(JMP, stmt->lineno);
 						SET_OPVAL_ADDR(addr1, addr, PC(m));
 						cond = cond->next;
 					}
@@ -2240,7 +2192,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					if (outer_case->inner_right == NULL)
 					{
 						SET_OPVAL(str, "case doesn't match any value");
-						EMIT_OPCODE(PCODE_SIGNAL_NODATA);
+						EMIT_OPCODE(SIGNAL_NODATA, stmt->lineno);
 					}
 					else
 						_compile(cstate, outer_case->inner_right);
@@ -2273,7 +2225,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 						addr1 = PC(m);
 						SET_OPVAL(expr.data, cstate->stack.ndata++);
 						SET_OPVAL(expr.is_multicol, true);
-						EMIT_OPCODE(PCODE_EXEC_EXPR);
+						EMIT_OPCODE(EXEC_EXPR, stmt->lineno);
 						appendStringInfoString(&ds, "SELECT ");
 
 						foreach (l, stmt->esql_list)
@@ -2300,7 +2252,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					else
 					{
 						compile_expr(cstate, linitial(stmt->esql_list), NULL, TEXTOID, -1);
-						EMIT_OPCODE(PCODE_PRINT);
+						EMIT_OPCODE(PRINT, stmt->lineno);
 					}
 				}
 				break;
@@ -2330,13 +2282,13 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 							SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
 							SET_OPVAL(update_field.offset, var->offset);
 							SET_OPVAL(update_field.fnumber, 1);
-							EMIT_OPCODE(PCODE_UPDATE_FIELD);
+							EMIT_OPCODE(UPDATE_FIELD, stmt->lineno);
 						}
 						else
 						{
 							compile_expr(cstate, stmt->esql, NULL, var->stmt->datum.typoid, var->stmt->datum.typmod);
 							SET_OPVALS_DATUM_COPY(target, var);
-							EMIT_OPCODE(PCODE_SAVETO);
+							EMIT_OPCODE(SAVETO, stmt->lineno);
 						}
 					}
 					else
@@ -2379,14 +2331,14 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 
 						SET_OPVAL(target.typlen, cstate->finfo.result.datum.typlen);
 						SET_OPVAL(target.typbyval, cstate->finfo.result.datum.typbyval);
-						EMIT_OPCODE(PCODE_RETURN);
+						EMIT_OPCODE(RETURN, stmt->lineno);
 					}
 					else
 					{
 						Assert(cstate->finfo.return_expr == NULL);
 						if (stmt->esql != NULL)
 							elog(ERROR, "returned a value in VOID function");
-						EMIT_OPCODE(PCODE_RETURN_VOID);
+						EMIT_OPCODE(RETURN_VOID, stmt->lineno);
 					}
 				}
 				break;
@@ -2394,7 +2346,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 			case PLPSM_STMT_EXECUTE_IMMEDIATE:
 				{
 					compile_expr(cstate, stmt->esql, NULL, TEXTOID, -1);
-					EMIT_OPCODE(PCODE_EXECUTE_IMMEDIATE);
+					EMIT_OPCODE(EXECUTE_IMMEDIATE, stmt->lineno);
 					compile_refresh_basic_diagnostic(cstate);
 				}
 				break;
@@ -2408,7 +2360,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					SET_OPVAL(expr.nparams, nargs);
 					SET_OPVAL(expr.typoids, argtypes);
 					SET_OPVAL(expr.data, cstate->stack.ndata++);
-					EMIT_OPCODE(PCODE_EXEC_QUERY);
+					EMIT_OPCODE(EXEC_QUERY, stmt->lineno);
 					compile_refresh_basic_diagnostic(cstate);
 				}
 				break;
@@ -2427,7 +2379,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 
 					SET_OPVAL(execute.name, stmt->name);
 					SET_OPVAL(execute.sqlstr, fetchPrepared(cstate, stmt->name));
-					EMIT_OPCODE(PCODE_EXECUTE);
+					EMIT_OPCODE(EXECUTE, stmt->lineno);
 
 					if (dataidx != -1)
 						PARAMBUILDER(FREE, dataidx);
@@ -2438,7 +2390,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 						int	i = 1;
 						ListCell *l;
 
-						EMIT_OPCODE(PCODE_CHECK_DATA);
+						EMIT_OPCODE(CHECK_DATA, stmt->lineno);
 						foreach (l, stmt->compound_target)
 						{
 							Plpsm_object	*var = resolve_target(cstate, (Plpsm_positioned_qualid *) lfirst(l),
@@ -2447,7 +2399,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 							SET_OPVALS_DATUM_INFO(saveto_field, var);
 							SET_OPVAL(saveto_field.data, cstate->stack.ndata++);
 							SET_OPVAL(saveto_field.fnumber, i++);
-							EMIT_OPCODE(PCODE_SAVETO_FIELD);
+							EMIT_OPCODE(SAVETO_FIELD, stmt->lineno);
 						}
 					}
 					compile_refresh_basic_diagnostic(cstate);
@@ -2460,7 +2412,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					compile_expr(cstate, stmt->esql, NULL, TEXTOID, -1);
 					SET_OPVAL(prepare.name, stmt->name);
 					SET_OPVAL(prepare.data, prepnum);
-					EMIT_OPCODE(PCODE_PREPARE);
+					EMIT_OPCODE(PREPARE, stmt->lineno);
 				}
 				break;
 
@@ -2552,7 +2504,8 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	char	*proc_source;
 	Datum	prosrcdatum;
 	bool		isnull;
-	CompileStateData cstate;
+	CompileStateData cstated;
+	CompileState	cstate;
 	Plpsm_object outer_scope;
 	int			numargs;
 	Oid		   *argtypes;
@@ -2565,8 +2518,6 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	ErrorContextCallback	plerrcontext;
 	MemoryContext	func_cxt;
 	Plpsm_pcode_module *m;
-	int	frame_info_addr = -1;
-	StringInfoData		frame_info;
 
 	procStruct = (Form_pg_proc) GETSTRUCT(procTup);
 
@@ -2599,7 +2550,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	module->cxt = func_cxt;
 
 	m = init_module();
-	cstate.module = m;
+	cstated.module = m;
 	m->name = pstrdup(NameStr(procStruct->proname));
 	m->is_read_only = (procStruct->provolatile != PROVOLATILE_VOLATILE);
 
@@ -2608,9 +2559,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	if (plpsm_debug_info)
 	{
 		SET_OPVAL(str, pstrdup(proc_source));
-		EMIT_OPCODE(PCODE_DEBUG_SOURCE_CODE);
-		frame_info_addr = PC(m);
-		EMIT_OPCODE(PCODE_DEBUG_FRAME_DESC);
+		EMIT_OPCODE(DEBUG_SOURCE_CODE, -1);
 	}
 
 	plerrcontext.callback = plpsm_compile_error_callback;
@@ -2629,20 +2578,22 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	outer_scope.typ = PLPSM_STMT_COMPOUND_STATEMENT;
 	outer_scope.name = pstrdup(NameStr(procStruct->proname));
 
-	cstate.top_scope = &outer_scope;
-	cstate.top_scope->name = outer_scope.name;
-	cstate.current_scope = cstate.top_scope;
-	cstate.stack.ndata = 0;
-	cstate.stack.ndatums = 0;
-	cstate.stack.oids.size = 128;
-	cstate.stack.oids.data = (Oid *) palloc(cstate.stack.oids.size * sizeof(Oid));
-	cstate.stack.has_sqlstate = false;
-	cstate.stack.has_sqlcode = false;
-	cstate.stack.has_notfound_continue_handler = false;
-	cstate.prepared = NULL;
+	cstate = &cstated;
 
-	cstate.finfo.result.datum.typoid = procStruct->prorettype;
-	get_typlenbyval(cstate.finfo.result.datum.typoid, &cstate.finfo.result.datum.typlen, &cstate.finfo.result.datum.typbyval);
+	cstated.top_scope = &outer_scope;
+	cstated.top_scope->name = outer_scope.name;
+	cstated.current_scope = cstated.top_scope;
+	cstated.stack.ndata = 0;
+	cstated.stack.ndatums = 0;
+	cstated.stack.oids.size = 128;
+	cstated.stack.oids.data = (Oid *) palloc(cstated.stack.oids.size * sizeof(Oid));
+	cstated.stack.has_sqlstate = false;
+	cstated.stack.has_sqlcode = false;
+	cstated.stack.has_notfound_continue_handler = false;
+	cstated.prepared = NULL;
+
+	cstated.finfo.result.datum.typoid = procStruct->prorettype;
+	get_typlenbyval(cstated.finfo.result.datum.typoid, &cstated.finfo.result.datum.typlen, &cstated.finfo.result.datum.typbyval);
 
 	/* 
 	 * append to scope a variables for parameters, and store 
@@ -2650,9 +2601,9 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	 */
 	numargs = get_func_arg_info(procTup,
 						&argtypes, &argnames, &argmodes);
-	cstate.finfo.nargs = numargs;
-	cstate.finfo.name = m->name;
-	cstate.finfo.source = proc_source;
+	cstated.finfo.nargs = numargs;
+	cstated.finfo.name = m->name;
+	cstated.finfo.source = proc_source;
 
 	for (i = 0; i < numargs; i++)
 	{
@@ -2678,11 +2629,11 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 		decl_stmt->datum.typbyval = typbyval;
 
 		/* append implicit name to scope */
-		var = create_variable_for(decl_stmt, &cstate, decl_stmt->target, NULL, PLPSM_VARIABLE);
+		var = create_variable_for(decl_stmt, &cstated, decl_stmt->target, NULL, PLPSM_VARIABLE);
 		/* append explicit name to scope */
 		if (argnames && argnames[i][0] != '\0')
 		{
-			alias = create_variable_for(decl_stmt, &cstate, NULL, pstrdup(argnames[i]), PLPSM_REFERENCE);
+			alias = create_variable_for(decl_stmt, &cstated, NULL, pstrdup(argnames[i]), PLPSM_REFERENCE);
 			alias->offset = var->offset; 
 		}
 
@@ -2699,13 +2650,13 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 			SET_OPVAL(copyto.dest, var->offset);
 			SET_OPVAL(copyto.typlen, var->stmt->datum.typlen);
 			SET_OPVAL(copyto.typbyval, var->stmt->datum.typbyval);
-			EMIT_OPCODE(PCODE_COPY_PARAM);
+			EMIT_OPCODE(COPY_PARAM, -1);
 		}
 		else
 		{
 			/* initialize OUT variables to NULL */
 			SET_OPVAL(target.offset, var->offset);
-			EMIT_OPCODE(PCODE_SET_NULL);
+			EMIT_OPCODE(SET_NULL, -1);
 		}
 	}
 
@@ -2733,28 +2684,18 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 		}
 		else
 			appendStringInfo(&ds, "$%d", bms_singleton_member(outargs) + 1);
-		cstate.finfo.return_expr = ds.data;
+		cstated.finfo.return_expr = ds.data;
 
 		bms_free(outargs);
 	}
 	else
-		cstate.finfo.return_expr = NULL;
+		cstated.finfo.return_expr = NULL;
 
-	_compile(&cstate, plpsm_parser_tree);
-	compile_done(&cstate);
+	_compile(&cstated, plpsm_parser_tree);
+	compile_done(&cstated);
 
-	if (plpsm_debug_info)
-	{
-		int	nvars = 0;
-		/* append frame info */
-		initStringInfo(&frame_info);
-		collect_vars_info(&frame_info, &nvars, cstate.top_scope);
-		SET_OPVAL_ADDR(frame_info_addr, frame_info.nvars, nvars);
-		SET_OPVAL_ADDR(frame_info_addr, frame_info.data, frame_info.data);
-	}
-
-	m->ndatums = cstate.stack.ndatums;
-	m->ndata = cstate.stack.ndata;
+	m->ndatums = cstated.stack.ndatums;
+	m->ndata = cstated.stack.ndata;
 
 	module->code = m;
 
