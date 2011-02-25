@@ -369,6 +369,7 @@ typedef struct
 	bool		is_read_only;
 	Plpsm_pcode_module *code;
 	void	**DataPtrs;			/* Pointer to persistent allocated pointers */
+	bool	with_cframe_debug;		/* true, when statements contains a pointer to current frame */
 } Plpsm_module; 
 
 typedef struct
@@ -405,6 +406,8 @@ extern void plpsm_push_back_token(int token);
 extern void plpsm_append_source_text(StringInfo buf, int startlocation, int endlocation);
 
 extern Plpsm_module *plpsm_compile(FunctionCallInfo fcinfo, bool forValidator);
+
+extern void init_out_funcs(Plpsm_object *scope, FmgrInfo *out_flinfos);
 
 extern Datum plpsm_func_execute(Plpsm_module *module, FunctionCallInfo fcinfo);
 

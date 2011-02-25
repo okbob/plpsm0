@@ -32,6 +32,7 @@ typedef struct
 	int		*PC;
 	char		**src;
 	bool		is_signal;
+	FmgrInfo		*out_funcs;
 } DebugInfoData;
 
 typedef DebugInfoData *DebugInfo;
@@ -57,12 +58,21 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	Plpsm_pcode_module *module = mod->code;
 	bool		is_read_only = module->is_read_only;
 	char	*src = NULL;
+	FmgrInfo	*out_funcs = NULL;
 
 	MemoryContext	exec_ctx;
 	MemoryContext	oldctx;
 	MemoryContext	func_cxt = mod->cxt;
 
 	DataPtrs = mod->DataPtrs;
+
+	/* 
+	 * Output functions for types used in variables are not searchable in 
+	 * exception time - because it needs a disabled access to system tables.
+	 * So it's necessary to prepare this table now.
+	 */
+	if (mod->with_cframe_debug)
+		out_funcs = palloc0(module->ndatums * sizeof(FmgrInfo));
 
 	/*
 	 * The temp context is a child of current context
@@ -87,7 +97,12 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 		dinfo->PC = &PC;
 		dinfo->src = &src;
 		dinfo->is_signal = false;
+		dinfo->out_funcs = out_funcs;
 	}
+
+	if (mod->with_cframe_debug)
+		init_out_funcs(mod->code->code[1].cframe, out_funcs);
+
 
 	while (PC < module->length)
 	{
@@ -868,6 +883,11 @@ leave_process:
 		pfree(values);
 	}
 
+	if (out_funcs)
+	{
+		pfree(out_funcs);
+	}
+
 	return (Datum) result;
 }
 
@@ -897,7 +917,7 @@ plpsm_func_execute(Plpsm_module *mod, FunctionCallInfo fcinfo)
  * collect a variables info
  */
 static void
-collect_vars_info(StringInfo ds, Plpsm_object *scope)
+collect_vars_info(StringInfo ds, Plpsm_object *scope, FmgrInfo *flinfo, Datum *values, char *nulls)
 {
 	Plpsm_object *iterator;
 
@@ -906,30 +926,33 @@ collect_vars_info(StringInfo ds, Plpsm_object *scope)
 
 	iterator = scope->inner;
 
+	appendStringInfo(ds, "\n  ==== %s: frame ====\n", scope->name != NULL ? scope->name : "unnamed");
+
 	while (iterator != NULL)
 	{
 		if (iterator->typ == PLPSM_STMT_DECLARE_VARIABLE)
 		{
-			appendStringInfo(ds, "%d\t%d\t%s\t%s\t%s\n", iterator->offset, 
-											iterator->stmt->datum.typoid,
-											scope->name,
+			char *value;
+
+			if (nulls[iterator->offset] != 'n')
+				value = OutputFunctionCall(&flinfo[iterator->offset], values[iterator->offset]);
+			else
+				value = "NULL";
+
+			if (iterator->typ == PLPSM_STMT_DECLARE_VARIABLE)
+				appendStringInfo(ds, "  %3d\t%s = %s\n", iterator->offset, 
 												iterator->name,
-												iterator->typ == PLPSM_STMT_DECLARE_VARIABLE ? "variable" : "cursor");
+												value);
 		}
 		else if (iterator->typ == PLPSM_STMT_DECLARE_CURSOR)
 		{
-			appendStringInfo(ds, "%d\t%d\t%s\t%s\t%s\n", iterator->cursor.offset, 
-											InvalidOid,
-											scope->name,
-												strcmp(iterator->name,"") == 0 ? NULL : iterator->name,
-												iterator->typ == PLPSM_STMT_DECLARE_VARIABLE ? "variable" : "cursor");
-		}
-		else if (iterator->typ == PLPSM_STMT_COMPOUND_STATEMENT || iterator->typ == PLPSM_STMT_SCHEMA)
-		{
-			collect_vars_info(ds,  iterator);
+				appendStringInfo(ds, "  %3d\t%s cursor\n", iterator->offset, 
+												iterator->name);
 		}
 		iterator = iterator->next;
 	}
+
+	collect_vars_info(ds, scope->outer, flinfo, values, nulls);
 }
 
 /*
@@ -998,7 +1021,7 @@ plpsm_exec_error_callback(void *arg)
 
 	if (pcode->cframe != NULL)
 	{
-		collect_vars_info(&ds, pcode->cframe);
+		collect_vars_info(&ds, pcode->cframe, dinfo->out_funcs, dinfo->values, dinfo->nulls);
 	}
 
 	errcontext(ds.data);

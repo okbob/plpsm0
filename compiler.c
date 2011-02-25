@@ -130,6 +130,39 @@ static void plpsm_HashTableInsert(Plpsm_module *module,
 static void plpsm_HashTableDelete(Plpsm_module *module);
 
 /*
+ * fill a array with output functions' flinfo structures
+ * Array must be declared before,
+ */
+void 
+init_out_funcs(Plpsm_object *scope, FmgrInfo *out_flinfos)
+{
+	Plpsm_object *iterator;
+
+	if (scope == NULL)
+		return;
+
+	iterator = scope->inner;
+
+	while (iterator != NULL)
+	{
+		if (iterator->typ == PLPSM_STMT_COMPOUND_STATEMENT || scope->typ == PLPSM_STMT_SCHEMA)
+			init_out_funcs(iterator, out_flinfos);
+		if (iterator->typ == PLPSM_STMT_DECLARE_VARIABLE)
+		{
+			Oid typoid = iterator->stmt->datum.typoid;
+			int16	offset = iterator->offset;
+			Oid		output_func;
+			bool		is_varlena;
+
+			getTypeOutputInfo(typoid, &output_func, &is_varlena);
+			fmgr_info(output_func, &out_flinfos[offset]);
+		}
+
+		iterator = iterator->next;
+	}
+}
+
+/*
  * Returns a offset of prepared statement, reserves a new offset
  * when prepered statement with the name isn't registered yet.
  */
@@ -2506,7 +2539,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	bool		isnull;
 	CompileStateData cstated;
 	CompileState	cstate;
-	Plpsm_object outer_scope;
+	Plpsm_object *outer_scope;
 	int			numargs;
 	Oid		   *argtypes;
 	char	  **argnames;
@@ -2544,10 +2577,13 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 							    ALLOCSET_DEFAULT_MAXSIZE);
 	plpsm_compile_tmp_cxt = MemoryContextSwitchTo(func_cxt);
 
+	outer_scope = palloc0(sizeof(Plpsm_object));
+
 	module->oid = fcinfo->flinfo->fn_oid;
 	module->xmin = HeapTupleHeaderGetXmin(procTup->t_data);
 	module->tid = procTup->t_self;
 	module->cxt = func_cxt;
+	module->with_cframe_debug = plpsm_debug_info;
 
 	m = init_module();
 	cstated.module = m;
@@ -2555,12 +2591,6 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	m->is_read_only = (procStruct->provolatile != PROVOLATILE_VOLATILE);
 
 	proc_source = TextDatumGetCString(prosrcdatum);
-
-	if (plpsm_debug_info)
-	{
-		SET_OPVAL(str, pstrdup(proc_source));
-		EMIT_OPCODE(DEBUG_SOURCE_CODE, -1);
-	}
 
 	plerrcontext.callback = plpsm_compile_error_callback;
 	plerrcontext.arg = forValidator ? proc_source : NULL;
@@ -2574,14 +2604,13 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	if (parse_rc != 0)
 		elog(ERROR, "plpsm parser returned %d", parse_rc);
 
-	memset(&outer_scope, 0, sizeof(Plpsm_object));
-	outer_scope.typ = PLPSM_STMT_COMPOUND_STATEMENT;
-	outer_scope.name = pstrdup(NameStr(procStruct->proname));
+	outer_scope->typ = PLPSM_STMT_COMPOUND_STATEMENT;
+	outer_scope->name = pstrdup(NameStr(procStruct->proname));
 
 	cstate = &cstated;
 
-	cstated.top_scope = &outer_scope;
-	cstated.top_scope->name = outer_scope.name;
+	cstated.top_scope = outer_scope;
+	cstated.top_scope->name = outer_scope->name;
 	cstated.current_scope = cstated.top_scope;
 	cstated.stack.ndata = 0;
 	cstated.stack.ndatums = 0;
@@ -2594,6 +2623,12 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 
 	cstated.finfo.result.datum.typoid = procStruct->prorettype;
 	get_typlenbyval(cstated.finfo.result.datum.typoid, &cstated.finfo.result.datum.typlen, &cstated.finfo.result.datum.typbyval);
+
+	if (plpsm_debug_info)
+	{
+		SET_OPVAL(str, pstrdup(proc_source));
+		EMIT_OPCODE(DEBUG_SOURCE_CODE, -1);
+	}
 
 	/* 
 	 * append to scope a variables for parameters, and store 
