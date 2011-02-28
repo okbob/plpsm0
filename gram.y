@@ -82,6 +82,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 		Plpsm_stmt			*stmt;
 		Plpsm_ESQL			*esql;
 		Plpsm_positioned_qualid		*qualid;
+		Plpsm_condition_value		*condition;
 		Node		*node;
 }
 
@@ -97,13 +98,14 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %type <esql>	expr_until_semi_or_coma expr_until_semi expr_until_do expr_until_end
 %type <esql>	expr_until_semi_into_using expr_until_then
 %type <str>	opt_label opt_end_label
-%type <node>	condition sqlstate opt_sqlstate
-%type <list>	condition_list expr_list expr_list_into
+%type <condition>	condition condition_list opt_sqlstate
+%type <list>	expr_list expr_list_into
 %type <stmt>	stmt_prepare stmt_execute stmt_execute_immediate
 %type <stmt>	stmt_open stmt_fetch stmt_close stmt_for for_prefetch
 %type <stmt>	stmt_case case_when_list case_when opt_case_else
 %type <esql>	opt_expr_until_when expr_until_semi_or_coma_or_parent
 %type <stmt>	stmt_sql stmt_select_into
+%type <ival>	sqlstate
 
 /*
  * Basic non-keyword token types.  These are hard-wired into the core lexer.
@@ -414,18 +416,22 @@ declare_prefetch:
 condition_list:
 			condition
 				{
-					$$ = list_make1($1);
+					$$ = $1;
 				}
 			| condition_list ',' condition
 				{
-					$$ = lappend($1, $3);
+					$$ = $1;
+					$$->next = $3;
 				}
 		;
 
 opt_sqlstate:
 			FOR SQLSTATE opt_value sqlstate
 				{
-					$$ = $4;
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->typ = PLPSM_SQLSTATE;
+					new->sqlstate = $4;
+					$$ = new;
 				}
 			|	{
 					$$ = NULL;
@@ -435,32 +441,41 @@ opt_sqlstate:
 condition:
 			SQLSTATE opt_value sqlstate
 				{
-					$$ = (Node *) list_make2(
-						makeString(pstrdup("IN")), $3);
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->location = @1;
+					new->typ = PLPSM_SQLSTATE;
+					new->sqlstate = $3;
+					$$ = new;
 				}
 			| NOT FOUND
 				{
-					$$ = (Node *) list_make2(
-						makeString(pstrdup("IN")),
-						makeInteger(MAKE_SQLSTATE('0','2','0','0','0')));
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->location = @1;
+					new->typ = PLPSM_SQLSTATE;
+					new->sqlstate = MAKE_SQLSTATE('0','2','0','0','0');
+					$$ = new;
 				}
 			| SQLWARNING
 				{
-					$$ = (Node *) list_make3(
-						makeString(pstrdup("IN")),
-						makeInteger(MAKE_SQLSTATE('0','1','0','0','0')),
-						makeInteger(MAKE_SQLSTATE('0','2','0','0','0')));
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->location = @1;
+					new->typ = PLPSM_SQLWARNING;
+					$$ = new;
 				}
 			| SQLEXCEPTION
 				{
-					$$ = (Node *) list_make3(
-						makeString(pstrdup("NOT_IN")),
-						makeInteger(MAKE_SQLSTATE('0','1','0','0','0')),
-						makeInteger(MAKE_SQLSTATE('0','2','0','0','0')));
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->location = @1;
+					new->typ = PLPSM_SQLEXCEPTION;
+					$$ = new;
 				}
 			| WORD
 				{
-					$$ = (Node *) makeString($1.ident);
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->location = @1;
+					new->typ = PLPSM_CONDITION_NAME;
+					new->condition_name = $1.ident;
+					$$ = new;
 				}
 		;
 
@@ -475,11 +490,11 @@ sqlstate:		SCONST
 					if (strspn(sqlstatestr, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") != 5)
 						yyerror("invalid SQLSTATE code");
 
-					$$ = (Node *) makeInteger(MAKE_SQLSTATE(sqlstatestr[0],
-												  sqlstatestr[1],
-												  sqlstatestr[2],
-												  sqlstatestr[3],
-												  sqlstatestr[4]));
+					$$ = MAKE_SQLSTATE(sqlstatestr[0],
+										  sqlstatestr[1],
+										  sqlstatestr[2],
+										  sqlstatestr[3],
+										  sqlstatestr[4]);
 				}
 		;
 
@@ -1286,7 +1301,7 @@ declare_prefetch(void)
 				{
 					plpsm_push_back_token(tok1);
 					result->typ = PLPSM_STMT_DECLARE_HANDLER;
-					switch (tok1)
+					switch (tok)
 					{
 						case CONTINUE:
 							result->option = PLPSM_HANDLER_CONTINUE;
@@ -1548,6 +1563,9 @@ parser_stmt_name(Plpsm_stmt_type typ)
 static void
 esql_out(StringInfo ds, Plpsm_ESQL *esql)
 {
+	if (esql == NULL)
+		return;
+
 	switch (esql->typ)
 	{
 		case PLPSM_ESQL_EXPR:
@@ -1583,6 +1601,9 @@ pqualid_out(StringInfo ds, Plpsm_positioned_qualid *qualid)
 {
 	bool	isFirst = true;
 	ListCell	*l;
+
+	if (qualid == NULL)
+		return;
 
 	foreach(l, qualid->qualId)
 	{
@@ -1635,7 +1656,6 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 	appendStringInfo(ds, "%s| Variables: ", ident);
 	pqualid_list_out(ds, stmt->variables);
 	appendStringInfoChar(ds, '\n');
-	//appendStringInfo(ds, "%s| Data: %s\n", ident, nodeToString(stmt->data));
 	appendStringInfo(ds, "%s| Option: %d\n", ident, stmt->option);
 	appendStringInfo(ds, "%s| ESQL: ", ident);
 	esql_out(ds, stmt->esql);
@@ -1643,7 +1663,7 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 	appendStringInfo(ds, "%s| ESQL list: ", ident);
 	esql_list_out(ds, stmt->esql_list);
 	appendStringInfoChar(ds, '\n');
-	
+
 	switch (stmt->typ)
 	{
 		case PLPSM_STMT_FOR:
@@ -1653,6 +1673,33 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 										stmt->stmtfor.cursor_name);
 			}
 			break;
+		case PLPSM_STMT_DECLARE_HANDLER:
+			{
+				Plpsm_condition_value *condition = (Plpsm_condition_value *) stmt->data;
+
+				appendStringInfo(ds, "%s| condtions:", ident);
+				while (condition != NULL)
+				{
+					switch (condition->typ)
+					{
+						case PLPSM_SQLSTATE:
+							appendStringInfo(ds, " %s", unpack_sql_state(condition->sqlstate));
+							break;
+						case PLPSM_SQLEXCEPTION:
+							appendStringInfoString(ds, " SQLEXCEPTION");
+							break;
+						case PLPSM_SQLWARNING:
+							appendStringInfoString(ds, " SQLWARNING");
+							break;
+						case PLPSM_CONDITION_NAME:
+							appendStringInfo(ds, " %s", condition->condition_name);
+							break;
+					}
+					condition = condition->next;
+				}
+				appendStringInfoChar(ds, '\n');
+				break;
+			}
 		default:
 			/* do nothing */ ;
 	}

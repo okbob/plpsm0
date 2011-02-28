@@ -102,6 +102,26 @@ typedef struct
 	int16	typlen;
 } Plpsm_type_descriptor;
 
+typedef enum
+{
+	PLPSM_SQLSTATE,
+	PLPSM_SQLEXCEPTION,
+	PLPSM_SQLWARNING,
+	PLPSM_CONDITION_NAME
+} Plpsm_condition_value_type;
+
+typedef struct Plpsm_condition_value
+{
+	Plpsm_condition_value_type typ;
+	int		location;
+	union
+	{
+		int	sqlstate;
+		char	*condition_name;
+	};
+	struct Plpsm_condition_value *next;
+} Plpsm_condition_value;
+
 typedef struct Plpsm_stmt
 {
 	Plpsm_stmt_type		typ;
@@ -207,6 +227,8 @@ typedef enum
 	PCODE_PREPARE,
 	PCODE_PARAMBUILDER,
 	PCODE_DEBUG_SOURCE_CODE,
+	PCODE_STORE_SP,
+	PCODE_LOAD_SP
 } Plpsm_pcode_type;
 
 typedef enum

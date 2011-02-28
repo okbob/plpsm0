@@ -441,7 +441,6 @@ begin
 end;
 $$ language psm0;
 
-
 create or replace function test32()
 returns int as $$
 begin
@@ -1086,6 +1085,100 @@ nt: loop
 end;
 $$ language psm0;
 
+-- check a exit handler
+create or replace function test60(out s int)
+as $$
+begin
+  declare aux int;
+  declare c1 cursor for select a from footab;
+  declare exit handler for not found begin end;
+  set s = 0;
+  open c1;
+  fetch c1 into aux;
+  loop
+    set s = s + aux;
+    fetch c1 into aux;
+  end loop;
+end;
+$$ language psm0;
+
+create or replace function test60_1(out s int)
+as $$
+begin
+  declare aux int;
+  declare c1 cursor for select a from footab;
+  declare exit handler for sqlwarning begin end;
+  set s = 0;
+  open c1;
+  fetch c1 into aux;
+  loop
+    set s = s + aux;
+    fetch c1 into aux;
+  end loop;
+end;
+$$ language psm0;
+
+create or replace function test60_2(out s int)
+as $$
+begin
+  declare aux int;
+  declare c1 cursor for select a from footab;
+  declare exit handler for sqlwarning begin end;
+  begin
+    set s = 0;
+    open c1;
+    fetch c1 into aux;
+    loop
+      set s = s + aux;
+      fetch c1 into aux; -- we leave a block where exit handler is defined, not this
+    end loop;
+  end;
+  set s = -10; -- must not executed
+end;
+$$ language psm0;
+
+create or replace function test60_3(out s int)
+as $$
+begin
+  declare aux int;
+  declare c1 cursor for select a from footab;
+  declare exit handler for sqlwarning set s = s * 100;
+  declare exit handler for not found set s = s * 10; -- prefered handler
+  begin
+    set s = 0;
+    open c1;
+    fetch c1 into aux;
+    loop
+      set s = s + aux;
+      fetch c1 into aux; -- we leave a block where exit handler is defined, not this
+    end loop;
+  end;
+end;
+$$ language psm0;
+
+create or replace function test60_4(out s int)
+as $$
+begin
+  declare aux int;
+  declare c1 cursor for select a from footab;
+  declare exit handler for not found set s = s * 10; -- prefered handler
+  declare exit handler for sqlwarning set s = s * 100; -- order isn't important
+  begin
+    set s = 0;
+    open c1;
+    fetch c1 into aux;
+    loop
+      set s = s + aux;
+      fetch c1 into aux; -- we leave a block where exit handler is defined, not this
+    end loop;
+  end;
+end;
+$$ language psm0;
+
+
+
+  
+
 /*************************************************
  * Assert functions - sure, it is in plgsql :)
  */
@@ -1212,6 +1305,20 @@ begin
   perform assert('test58', 30, test58());
   perform assert('test58_01', 10, (test58_01()).a);
   perform assert('test59', 5348, test59(50));
+
+  insert into footab values(1),(2),(3),(4);
+
+  perform assert('test60', 10, test60());
+  perform assert('test60_1', 10, test60_1());
+  perform assert('test60_2', 10, test60_2());
+  perform assert('test60_3', 100, test60_3());
+  perform assert('test60_4', 100, test60_4());
+
+  perform assert('test60', 10, test60());
+  perform assert('test60_1', 10, test60_1());
+  perform assert('test60_2', 10, test60_2());
+  perform assert('test60_3', 100, test60_3());
+  perform assert('test60_4', 100, test60_4());
 
   raise notice '******* All tests are ok *******';
 end;

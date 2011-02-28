@@ -285,16 +285,117 @@ lookup_object_with_label_in_scope(Plpsm_object *scope, char *name)
 	return lookup_object_with_label_in_scope(scope->outer, name);
 }
 
-static Plpsm_object *
-create_handler_for(Plpsm_stmt *handler_def, CompileState cstate, int handler_addr)
+static void
+verify_condition_list(Plpsm_condition_value *condition, bool *isnotfound, Plpsm_handler_type handler_typ)
 {
-	Plpsm_object *handler = new_object_for(handler_def, cstate->current_scope);
+	while (condition != NULL)
+	{
+		Plpsm_condition_value *iterator = condition->next;
 
-	if (handler_def->option != PLPSM_HANDLER_CONTINUE)
-		elog(ERROR, "Only continue not found handler is suported");
+		if (*isnotfound == false && (condition->typ == PLPSM_SQLWARNING || (condition->typ == PLPSM_SQLSTATE && 
+				ERRCODE_TO_CATEGORY(condition->sqlstate) == MAKE_SQLSTATE('0','2','0','0','0'))))
+				*isnotfound = true;
 
+		while (iterator != NULL)
+		{
+			if (condition->typ == iterator->typ && (condition->typ == PLPSM_SQLEXCEPTION || condition->typ == PLPSM_SQLWARNING))
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("condition handling is ambigonuous"),
+						 parser_errposition(condition->location)));
+			if (iterator->typ == condition->typ && condition->typ == PLPSM_SQLSTATE && condition->sqlstate == iterator->sqlstate)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("condition handling is ambigonuous"),
+						 parser_errposition(condition->location)));
+			iterator = iterator->next;
+		}
+
+		/* we enable only exit or continue handlers for warnings and undo handlers for errors */
+		if (condition->typ == PLPSM_SQLWARNING || 
+			(condition->typ == PLPSM_SQLSTATE && 
+				(ERRCODE_TO_CATEGORY(condition->sqlstate) == MAKE_SQLSTATE('0','2','0','0','0') ||
+				 ERRCODE_TO_CATEGORY(condition->sqlstate) == MAKE_SQLSTATE('0','1','0','0','0'))))
+		{
+			if (handler_typ != PLPSM_HANDLER_CONTINUE && handler_typ != PLPSM_HANDLER_EXIT)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("Warnings should be processed by CONTINUE or EXIT handlers only"),
+						 parser_errposition(condition->location)));
+		}
+		else
+		{
+			if (handler_typ != PLPSM_HANDLER_UNDO)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("SQLEXCEPTION should be processed only UNDO handlers only"),
+						 parser_errposition(condition->location)));
+		}
+
+		condition = condition->next;
+	}
+}
+
+/*
+ * Ensure only one sqlstate handler in compound statement
+ */
+static void
+verify_condition_value(Plpsm_object *scope, Plpsm_condition_value *condition)
+{
+	Plpsm_object *iterator = scope->inner;
+
+	while (iterator != NULL)
+	{
+		if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
+		{
+			Plpsm_condition_value *prev_condition = (Plpsm_condition_value *) iterator->stmt->data;
+			Plpsm_condition_value *c = condition;
+
+			while (c != NULL)
+			{
+				Plpsm_condition_value *p = prev_condition;
+				while (p != NULL)
+				{
+
+					if (p->typ == c->typ && (c->typ == PLPSM_SQLEXCEPTION || c->typ == PLPSM_SQLWARNING))
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("condition handling is ambigonuous"),
+								 parser_errposition(c->location)));
+					if (p->typ == c->typ && c->typ == PLPSM_SQLSTATE && c->sqlstate == p->sqlstate)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("condition handling is ambigonuous"),
+								 parser_errposition(c->location)));
+					p = p->next;
+
+
+				}
+				c = c->next;
+			}
+		}
+
+		iterator = iterator->next;
+	}
+
+	/* search outer compound statement */
+	if (scope->typ != PLPSM_STMT_COMPOUND_STATEMENT)
+		verify_condition_value(scope->outer, condition);
+}
+
+static Plpsm_object *
+create_handler_for(Plpsm_stmt *handler_def, CompileState cstate, int handler_addr, bool *isnotfound)
+{
+	Plpsm_object *handler;
+	Plpsm_condition_value *condition = (Plpsm_condition_value *) handler_def->data;
+
+	verify_condition_list(condition, isnotfound, (Plpsm_handler_type) handler_def->option);
+	verify_condition_value(cstate->current_scope, condition);
+
+	handler = new_object_for(handler_def, cstate->current_scope);
 	handler->calls.entry_addr = handler_addr;
 	cstate->current_scope = handler;
+
 	return handler;
 }
 
@@ -598,7 +699,7 @@ lookup_qualified_var(Plpsm_object *scope, const char *label, const char *name)
 		iterator = scope->inner;
 		while (iterator != NULL)
 		{
-			if ((iterator->typ == PLPSM_STMT_DECLARE_VARIABLE ||
+    			if ((iterator->typ == PLPSM_STMT_DECLARE_VARIABLE ||
 				iterator->typ == PLPSM_STMT_DECLARE_CURSOR) && 
 				strcmp(iterator->name, name) == 0)
 				return iterator;
@@ -635,28 +736,103 @@ lookup_var(Plpsm_object *scope, const char *name)
 }
 
 
+static Plpsm_object *
+lookup_handler(Plpsm_object *scope, Plpsm_condition_value *condition)
+{
+	Plpsm_object *iterator;
+	Plpsm_condition_value *c;
+
+	Assert(condition->typ == PLPSM_SQLSTATE);
+
+	if (scope == NULL)
+		return NULL;
+
+	/* if current scope is handler, go up two outer scopes */
+	if (scope->typ == PLPSM_STMT_DECLARE_HANDLER)
+		return lookup_handler(scope->outer->outer, condition);
+
+	if (scope->typ == PLPSM_STMT_COMPOUND_STATEMENT)
+	{
+		iterator = scope->inner;
+		while (iterator != NULL)
+		{
+			if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
+			{
+				c = (Plpsm_condition_value *) iterator->stmt->data;
+
+				/* search a exact match */
+				while (c != NULL)
+				{
+					if (c->typ == PLPSM_SQLSTATE && condition->sqlstate == c->sqlstate)
+						return iterator;
+					c = c->next;
+				}
+			}
+			iterator = iterator->next;
+		}
+
+		iterator = scope->inner;
+		while (iterator != NULL)
+		{
+			if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
+			{
+				/* search a category match */
+				c = (Plpsm_condition_value *) iterator->stmt->data;
+				while (c != NULL)
+				{
+					if (c->typ == PLPSM_SQLSTATE && ERRCODE_IS_CATEGORY(c->sqlstate) &&
+						ERRCODE_TO_CATEGORY(condition->sqlstate) == c->sqlstate)
+						return iterator;
+					c = c->next;
+				}
+			}
+			iterator = iterator->next;
+		}
+
+		iterator = scope->inner;
+		while (iterator != NULL)
+		{
+			if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
+			{
+				/* search a generic match */
+				c = (Plpsm_condition_value *) iterator->stmt->data;
+				while (c != NULL)
+				{
+					if (c->typ == PLPSM_SQLWARNING && 
+						(ERRCODE_TO_CATEGORY(condition->sqlstate) == MAKE_SQLSTATE('0','2','0','0','0') ||
+						 ERRCODE_TO_CATEGORY(condition->sqlstate) == MAKE_SQLSTATE('0','1','0','0','0')))
+						 return iterator;
+
+					if (c->typ == PLPSM_SQLEXCEPTION &&
+						ERRCODE_TO_CATEGORY(condition->sqlstate) != MAKE_SQLSTATE('0','2','0','0','0') &&
+						ERRCODE_TO_CATEGORY(condition->sqlstate) != MAKE_SQLSTATE('0','1','0','0','0') &&
+						ERRCODE_TO_CATEGORY(condition->sqlstate) != MAKE_SQLSTATE('0','0','0','0','0'))
+						return iterator;
+					c = c->next;
+				}
+			}
+			iterator = iterator->next;
+		}
+	}
+
+	return lookup_handler(scope->outer, condition);
+}
+
 /*
  * lookup a not found continue handler
  */
 static Plpsm_object *
 lookup_notfound_continue_handler(Plpsm_object *scope)
 {
-	Plpsm_object  *iterator;
+	Plpsm_condition_value condition;
 
 	if (scope == NULL)
 		return NULL;
 
-	iterator = scope->inner;
-	
-	while (iterator != NULL)
-	{
-		if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
-			return iterator;
-		iterator = iterator->next;
-	}
+	condition.typ = PLPSM_SQLSTATE;
+	condition.sqlstate = MAKE_SQLSTATE('0','2','0','0','0');
 
-	/* return handler in outer scope */
-	return lookup_notfound_continue_handler(scope->outer);
+	return lookup_handler(scope, &condition);
 }
 
 /*
@@ -1070,6 +1246,12 @@ list(Plpsm_pcode_module *m)
 			case PCODE_DEBUG_SOURCE_CODE:
 				appendStringInfo(&ds, "Source code attached");
 				break;
+			case PCODE_STORE_SP:
+				appendStringInfo(&ds, "StoreSP @%d", VALUE(target.offset));
+				break;
+			case PCODE_LOAD_SP:
+				appendStringInfo(&ds, "LoadSP @%d", VALUE(target.offset));
+				break;
 		}
 		appendStringInfoChar(&ds, '\n');
 	}
@@ -1168,6 +1350,34 @@ compile_release_cursors(CompileState cstate)
 		}
 		iterator = iterator->next;
 	}
+}
+
+/*
+ * Helps with exit or undo handler calls 
+ */
+static void
+compile_leave_target_block(CompileState cstate, Plpsm_object *scope, Plpsm_object *target_scope)
+{
+	Plpsm_pcode_module *m = cstate->module;
+
+	if (scope == NULL)
+		return;
+
+	if (scope->calls.has_release_call)
+	{
+		scope->calls.release_calls = lappend(scope->calls.release_calls,
+										    makeInteger(PC(m)));
+		EMIT_OPCODE(CALL, -1);
+	}
+
+	if (scope == target_scope)
+	{
+		scope->calls.leave_jmps = lappend(scope->calls.leave_jmps,
+										    makeInteger(PC(m)));
+		EMIT_OPCODE(JMP, -1);
+	}
+	else
+		compile_leave_target_block(cstate, scope->outer, target_scope);
 }
 
 /*
@@ -1714,9 +1924,34 @@ compile_refresh_basic_diagnostic(CompileState cstate)
 
 	if (cstate->stack.has_notfound_continue_handler)
 	{
+		/* recheck not found handler */
 		Plpsm_object *notfound_handler = lookup_notfound_continue_handler(cstate->current_scope);
-		SET_OPVAL(addr, notfound_handler->calls.entry_addr);
-		EMIT_OPCODE(CALL_NOT_FOUND, -1);
+		if (notfound_handler != NULL)
+		{
+			if (notfound_handler->stmt->option == PLPSM_HANDLER_CONTINUE)
+			{
+				SET_OPVAL(addr, notfound_handler->calls.entry_addr);
+				EMIT_OPCODE(CALL_NOT_FOUND, -1);
+			}
+			else
+			{
+				/* call a handler and leave to outers' handler block */
+				int	addr1 = PC(m);
+				int	addr2;
+
+				Assert(notfound_handler->stmt->option == PLPSM_HANDLER_EXIT);
+
+				EMIT_OPCODE(JMP_NOT_FOUND, -1);
+				addr2 = PC(m);
+				EMIT_OPCODE(JMP, -1);
+				SET_OPVAL_ADDR(addr1, addr, PC(m));
+				SET_OPVAL(addr, notfound_handler->calls.entry_addr);
+				EMIT_OPCODE(CALL, -1);
+				/* leave a current compound statement */
+				compile_leave_target_block(cstate, cstate->current_scope, notfound_handler->outer);
+				SET_OPVAL_ADDR(addr2, addr, PC(m));
+			}
+		}
 	}
 }
 
@@ -1779,7 +2014,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					addr1 = PC(m);
 					_compile(cstate, stmt->inner_left);
 					EMIT_JMP(addr1, stmt->lineno);
-					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));\
+					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
 				}
 				break;
 
@@ -1932,6 +2167,43 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					bool	has_sqlstate = cstate->stack.has_sqlstate;
 					bool	has_sqlcode = cstate->stack.has_sqlcode;
 					bool	has_notfound_continue_handler = cstate->stack.has_notfound_continue_handler;
+					bool	has_undo_handler = false;
+					bool	has_exit_handler = false;
+					Plpsm_stmt *inner_stmt;
+					int16	offset;
+
+					/* 
+					 * Store PC when compound statement contains a exit or undo handler.
+					 * Stored value will be used after end of block.
+					 */
+					inner_stmt = stmt->inner_left;
+					while (inner_stmt != NULL)
+					{
+						if (inner_stmt->typ == PLPSM_STMT_DECLARE_HANDLER)
+						{
+							if (inner_stmt->option == PLPSM_HANDLER_EXIT)
+								has_exit_handler = true;
+							if (inner_stmt->option == PLPSM_HANDLER_UNDO)
+								has_undo_handler = true;
+						}
+						inner_stmt = inner_stmt->next;
+					}
+
+					if (has_undo_handler || has_exit_handler)
+					{
+						offset = cstate->stack.ndatums++;
+
+						if (offset >= cstate->stack.oids.size)
+						{
+							cstate->stack.oids.size += 128;
+				    			cstate->stack.oids.data = repalloc(cstate->stack.oids.data, cstate->stack.oids.size * sizeof(Oid));
+						}
+
+						cstate->stack.oids.data[offset] = INT4OID;
+
+						SET_OPVAL(target.offset, offset);
+						EMIT_OPCODE(STORE_SP, stmt->lineno);
+					}
 
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					_compile(cstate, stmt->inner_left);
@@ -1942,6 +2214,12 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 
 					/* generate release block */
 					finalize_block(cstate, obj);
+
+					if (has_undo_handler || has_exit_handler)
+					{
+						SET_OPVAL(target.offset, offset);
+						EMIT_OPCODE(LOAD_SP, stmt->lineno);
+					}
 				}
 				break;
 
@@ -1950,22 +2228,26 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					/*
 					 * In this moment, only continue not found handlers are supported
 					 */
+					bool	isnotfound = false;
+
 					addr1 = PC(m);
 					EMIT_OPCODE(JMP, stmt->lineno);
 					addr2 = PC(m);
 
-					obj = create_handler_for(stmt, cstate, PC(m));
+					obj = create_handler_for(stmt, cstate, PC(m), &isnotfound);
 
 					/* 
 					 * handler object is used as barier against to lookup
 					 * labels outside a handler body.
+					 * has_notfound_continue_handler can be mistaken, there
+					 * is necessary do recheck.
 					 */
-					cstate->stack.has_notfound_continue_handler = false;
+					 
+					cstate->stack.has_notfound_continue_handler = isnotfound;
 					_compile(cstate, stmt->inner_left);
 					EMIT_OPCODE(RET_SUBR, stmt->lineno);
 					SET_OPVAL_ADDR(addr1, addr, PC(m));
 
-					cstate->stack.has_notfound_continue_handler = true;
 					cstate->current_scope = obj->outer;
 				}
 				break;

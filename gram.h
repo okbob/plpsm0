@@ -127,12 +127,13 @@ typedef union YYSTYPE
 		Plpsm_stmt			*stmt;
 		Plpsm_ESQL			*esql;
 		Plpsm_positioned_qualid		*qualid;
+		Plpsm_condition_value		*condition;
 		Node		*node;
 
 
 
 /* Line 1676 of yacc.c  */
-#line 136 "gram.h"
+#line 137 "gram.h"
 } YYSTYPE;
 # define YYSTYPE_IS_TRIVIAL 1
 # define yystype YYSTYPE /* obsolescent; will be withdrawn */

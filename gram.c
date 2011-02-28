@@ -259,12 +259,13 @@ typedef union YYSTYPE
 		Plpsm_stmt			*stmt;
 		Plpsm_ESQL			*esql;
 		Plpsm_positioned_qualid		*qualid;
+		Plpsm_condition_value		*condition;
 		Node		*node;
 
 
 
 /* Line 214 of yacc.c  */
-#line 268 "gram.c"
+#line 269 "gram.c"
 } YYSTYPE;
 # define YYSTYPE_IS_TRIVIAL 1
 # define yystype YYSTYPE /* obsolescent; will be withdrawn */
@@ -289,7 +290,7 @@ typedef struct YYLTYPE
 
 
 /* Line 264 of yacc.c  */
-#line 293 "gram.c"
+#line 294 "gram.c"
 
 #ifdef short
 # undef short
@@ -624,18 +625,18 @@ static const yytype_int8 yyrhs[] =
 /* YYRLINE[YYN] -- source line where rule number YYN was defined.  */
 static const yytype_uint16 yyrline[] =
 {
-       0,   181,   181,   190,   194,   199,   203,   214,   221,   222,
-     223,   224,   225,   226,   227,   228,   229,   230,   231,   232,
-     233,   234,   235,   236,   237,   238,   239,   240,   256,   264,
-     272,   283,   297,   307,   313,   318,   324,   329,   365,   372,
-     380,   397,   409,   415,   419,   426,   430,   436,   441,   447,
-     454,   461,   467,   487,   490,   499,   510,   513,   521,   533,
-     544,   549,   555,   566,   569,   585,   590,   600,   605,   613,
-     622,   631,   635,   642,   646,   656,   672,   687,   710,   726,
-     743,   760,   775,   790,   807,   813,   820,   828,   844,   860,
-     866,   881,   897,   912,   929,   997,   998,   999,  1003,  1016,
-    1035,  1055,  1061,  1065,  1072,  1082,  1092,  1102,  1112,  1125,
-    1139
+       0,   183,   183,   192,   196,   201,   205,   216,   223,   224,
+     225,   226,   227,   228,   229,   230,   231,   232,   233,   234,
+     235,   236,   237,   238,   239,   240,   241,   242,   258,   266,
+     274,   285,   299,   309,   315,   320,   326,   331,   367,   374,
+     382,   399,   411,   417,   421,   429,   436,   442,   450,   458,
+     465,   472,   482,   502,   505,   514,   525,   528,   536,   548,
+     559,   564,   570,   581,   584,   600,   605,   615,   620,   628,
+     637,   646,   650,   657,   661,   671,   687,   702,   725,   741,
+     758,   775,   790,   805,   822,   828,   835,   843,   859,   875,
+     881,   896,   912,   927,   944,  1012,  1013,  1014,  1018,  1031,
+    1050,  1070,  1076,  1080,  1087,  1097,  1107,  1117,  1127,  1140,
+    1154
 };
 #endif
 
@@ -1815,7 +1816,7 @@ yyreduce:
         case 2:
 
 /* Line 1455 of yacc.c  */
-#line 182 "gram.y"
+#line 184 "gram.y"
     {
 					plpsm_parser_tree = (yyvsp[(1) - (2)].stmt);
 					if (plpsm_debug_parser)
@@ -1826,7 +1827,7 @@ yyreduce:
   case 3:
 
 /* Line 1455 of yacc.c  */
-#line 191 "gram.y"
+#line 193 "gram.y"
     {
 				;}
     break;
@@ -1834,7 +1835,7 @@ yyreduce:
   case 4:
 
 /* Line 1455 of yacc.c  */
-#line 194 "gram.y"
+#line 196 "gram.y"
     {
 				;}
     break;
@@ -1842,7 +1843,7 @@ yyreduce:
   case 5:
 
 /* Line 1455 of yacc.c  */
-#line 200 "gram.y"
+#line 202 "gram.y"
     {
 					(yyval.stmt) = (yyvsp[(1) - (1)].stmt);
 				;}
@@ -1851,7 +1852,7 @@ yyreduce:
   case 6:
 
 /* Line 1455 of yacc.c  */
-#line 204 "gram.y"
+#line 206 "gram.y"
     {
 					(yyvsp[(1) - (3)].stmt)->last->next = (yyvsp[(3) - (3)].stmt);
 					(yyvsp[(1) - (3)].stmt)->last = (yyvsp[(3) - (3)].stmt)->last;
@@ -1862,7 +1863,7 @@ yyreduce:
   case 7:
 
 /* Line 1455 of yacc.c  */
-#line 215 "gram.y"
+#line 217 "gram.y"
     {
 					if (!(yyvsp[(1) - (1)].stmt)->last)
 						(yyvsp[(1) - (1)].stmt)->last = (yyvsp[(1) - (1)].stmt);
@@ -1872,147 +1873,147 @@ yyreduce:
   case 8:
 
 /* Line 1455 of yacc.c  */
-#line 221 "gram.y"
+#line 223 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 9:
 
 /* Line 1455 of yacc.c  */
-#line 222 "gram.y"
+#line 224 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 10:
 
 /* Line 1455 of yacc.c  */
-#line 223 "gram.y"
+#line 225 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 11:
 
 /* Line 1455 of yacc.c  */
-#line 224 "gram.y"
+#line 226 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 12:
 
 /* Line 1455 of yacc.c  */
-#line 225 "gram.y"
+#line 227 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 13:
 
 /* Line 1455 of yacc.c  */
-#line 226 "gram.y"
+#line 228 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 14:
 
 /* Line 1455 of yacc.c  */
-#line 227 "gram.y"
+#line 229 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 15:
 
 /* Line 1455 of yacc.c  */
-#line 228 "gram.y"
+#line 230 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 16:
 
 /* Line 1455 of yacc.c  */
-#line 229 "gram.y"
+#line 231 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 17:
 
 /* Line 1455 of yacc.c  */
-#line 230 "gram.y"
+#line 232 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 18:
 
 /* Line 1455 of yacc.c  */
-#line 231 "gram.y"
+#line 233 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 19:
 
 /* Line 1455 of yacc.c  */
-#line 232 "gram.y"
+#line 234 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 20:
 
 /* Line 1455 of yacc.c  */
-#line 233 "gram.y"
+#line 235 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 21:
 
 /* Line 1455 of yacc.c  */
-#line 234 "gram.y"
+#line 236 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 22:
 
 /* Line 1455 of yacc.c  */
-#line 235 "gram.y"
+#line 237 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 23:
 
 /* Line 1455 of yacc.c  */
-#line 236 "gram.y"
+#line 238 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 24:
 
 /* Line 1455 of yacc.c  */
-#line 237 "gram.y"
+#line 239 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 25:
 
 /* Line 1455 of yacc.c  */
-#line 238 "gram.y"
+#line 240 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 26:
 
 /* Line 1455 of yacc.c  */
-#line 239 "gram.y"
+#line 241 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 27:
 
 /* Line 1455 of yacc.c  */
-#line 240 "gram.y"
+#line 242 "gram.y"
     { (yyval.stmt) = (yyvsp[(1) - (1)].stmt); ;}
     break;
 
   case 28:
 
 /* Line 1455 of yacc.c  */
-#line 257 "gram.y"
+#line 259 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, (yyvsp[(1) - (6)].str) ? (yylsp[(1) - (6)]): (yylsp[(2) - (6)]));
 					new->name = (yyvsp[(1) - (6)].str);
@@ -2025,7 +2026,7 @@ yyreduce:
   case 29:
 
 /* Line 1455 of yacc.c  */
-#line 265 "gram.y"
+#line 267 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, (yyvsp[(1) - (6)].str) ? (yylsp[(1) - (6)]): (yylsp[(2) - (6)]));
 					new->name = (yyvsp[(1) - (6)].str);
@@ -2038,7 +2039,7 @@ yyreduce:
   case 30:
 
 /* Line 1455 of yacc.c  */
-#line 273 "gram.y"
+#line 275 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, (yyvsp[(1) - (8)].str) ? (yylsp[(1) - (8)]): (yylsp[(2) - (8)]));
 					new->name = (yyvsp[(1) - (8)].str);
@@ -2054,7 +2055,7 @@ yyreduce:
   case 31:
 
 /* Line 1455 of yacc.c  */
-#line 284 "gram.y"
+#line 286 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, (yyvsp[(1) - (4)].str) ? (yylsp[(1) - (4)]): (yylsp[(2) - (4)]));
 					new->name = (yyvsp[(1) - (4)].str);
@@ -2066,7 +2067,7 @@ yyreduce:
   case 32:
 
 /* Line 1455 of yacc.c  */
-#line 298 "gram.y"
+#line 300 "gram.y"
     {
 					(yyval.str) = (yyvsp[(1) - (1)].word).ident;
 					if (yylex() != ':')
@@ -2080,7 +2081,7 @@ yyreduce:
   case 33:
 
 /* Line 1455 of yacc.c  */
-#line 307 "gram.y"
+#line 309 "gram.y"
     {
 					(yyval.str) = NULL;
 				;}
@@ -2089,7 +2090,7 @@ yyreduce:
   case 34:
 
 /* Line 1455 of yacc.c  */
-#line 314 "gram.y"
+#line 316 "gram.y"
     {
 					(yyval.str) = (yyvsp[(1) - (1)].word).ident;
 				;}
@@ -2098,7 +2099,7 @@ yyreduce:
   case 35:
 
 /* Line 1455 of yacc.c  */
-#line 318 "gram.y"
+#line 320 "gram.y"
     {
 					(yyval.str) = NULL;
 				;}
@@ -2107,7 +2108,7 @@ yyreduce:
   case 36:
 
 /* Line 1455 of yacc.c  */
-#line 325 "gram.y"
+#line 327 "gram.y"
     {
 					(yyval.stmt) = (yyvsp[(1) - (1)].stmt);
 					(yyvsp[(1) - (1)].stmt)->last = (yyvsp[(1) - (1)].stmt);
@@ -2117,7 +2118,7 @@ yyreduce:
   case 37:
 
 /* Line 1455 of yacc.c  */
-#line 330 "gram.y"
+#line 332 "gram.y"
     {
 					/*
 					 * we have to check order of declarations,
@@ -2155,7 +2156,7 @@ yyreduce:
   case 38:
 
 /* Line 1455 of yacc.c  */
-#line 366 "gram.y"
+#line 368 "gram.y"
     {
 					if ((yyvsp[(2) - (2)].stmt)->typ != PLPSM_STMT_DECLARE_VARIABLE)
 						yyerror("syntax error");
@@ -2167,11 +2168,11 @@ yyreduce:
   case 39:
 
 /* Line 1455 of yacc.c  */
-#line 373 "gram.y"
+#line 375 "gram.y"
     {
 					if ((yyvsp[(2) - (4)].stmt)->typ != PLPSM_STMT_DECLARE_CONDITION)
 						yyerror("syntax error");
-					(yyvsp[(2) - (4)].stmt)->data = (yyvsp[(4) - (4)].node);
+					(yyvsp[(2) - (4)].stmt)->data = (yyvsp[(4) - (4)].condition);
 					(yyvsp[(2) - (4)].stmt)->lineno = plpsm_location_to_lineno((yylsp[(1) - (4)]));
 					(yyval.stmt) = (yyvsp[(2) - (4)].stmt);
 				;}
@@ -2180,7 +2181,7 @@ yyreduce:
   case 40:
 
 /* Line 1455 of yacc.c  */
-#line 381 "gram.y"
+#line 383 "gram.y"
     {
 					int	tok;
 					if ((yyvsp[(2) - (4)].stmt)->typ != PLPSM_STMT_DECLARE_CURSOR)
@@ -2202,12 +2203,12 @@ yyreduce:
   case 41:
 
 /* Line 1455 of yacc.c  */
-#line 398 "gram.y"
+#line 400 "gram.y"
     {
 					if ((yyvsp[(2) - (6)].stmt)->typ != PLPSM_STMT_DECLARE_HANDLER)
 						yyerror("syntax error");
 					(yyvsp[(2) - (6)].stmt)->inner_left = (yyvsp[(6) - (6)].stmt);
-					(yyvsp[(2) - (6)].stmt)->data = (yyvsp[(5) - (6)].list);
+					(yyvsp[(2) - (6)].stmt)->data = (yyvsp[(5) - (6)].condition);
 					(yyvsp[(2) - (6)].stmt)->lineno = plpsm_location_to_lineno((yylsp[(1) - (6)]));
 					(yyval.stmt) = (yyvsp[(2) - (6)].stmt);
 				;}
@@ -2216,7 +2217,7 @@ yyreduce:
   case 42:
 
 /* Line 1455 of yacc.c  */
-#line 409 "gram.y"
+#line 411 "gram.y"
     {
 					(yyval.stmt) = declare_prefetch();
 				;}
@@ -2225,97 +2226,110 @@ yyreduce:
   case 43:
 
 /* Line 1455 of yacc.c  */
-#line 416 "gram.y"
+#line 418 "gram.y"
     {
-					(yyval.list) = list_make1((yyvsp[(1) - (1)].node));
+					(yyval.condition) = (yyvsp[(1) - (1)].condition);
 				;}
     break;
 
   case 44:
 
 /* Line 1455 of yacc.c  */
-#line 420 "gram.y"
+#line 422 "gram.y"
     {
-					(yyval.list) = lappend((yyvsp[(1) - (3)].list), (yyvsp[(3) - (3)].node));
+					(yyval.condition) = (yyvsp[(1) - (3)].condition);
+					(yyval.condition)->next = (yyvsp[(3) - (3)].condition);
 				;}
     break;
 
   case 45:
 
 /* Line 1455 of yacc.c  */
-#line 427 "gram.y"
+#line 430 "gram.y"
     {
-					(yyval.node) = (yyvsp[(4) - (4)].node);
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->typ = PLPSM_SQLSTATE;
+					new->sqlstate = (yyvsp[(4) - (4)].ival);
+					(yyval.condition) = new;
 				;}
     break;
 
   case 46:
 
 /* Line 1455 of yacc.c  */
-#line 430 "gram.y"
+#line 436 "gram.y"
     {
-					(yyval.node) = NULL;
+					(yyval.condition) = NULL;
 				;}
     break;
 
   case 47:
 
 /* Line 1455 of yacc.c  */
-#line 437 "gram.y"
+#line 443 "gram.y"
     {
-					(yyval.node) = (Node *) list_make2(
-						makeString(pstrdup("IN")), (yyvsp[(3) - (3)].node));
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->location = (yylsp[(1) - (3)]);
+					new->typ = PLPSM_SQLSTATE;
+					new->sqlstate = (yyvsp[(3) - (3)].ival);
+					(yyval.condition) = new;
 				;}
     break;
 
   case 48:
 
 /* Line 1455 of yacc.c  */
-#line 442 "gram.y"
+#line 451 "gram.y"
     {
-					(yyval.node) = (Node *) list_make2(
-						makeString(pstrdup("IN")),
-						makeInteger(MAKE_SQLSTATE('0','2','0','0','0')));
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->location = (yylsp[(1) - (2)]);
+					new->typ = PLPSM_SQLSTATE;
+					new->sqlstate = MAKE_SQLSTATE('0','2','0','0','0');
+					(yyval.condition) = new;
 				;}
     break;
 
   case 49:
 
 /* Line 1455 of yacc.c  */
-#line 448 "gram.y"
+#line 459 "gram.y"
     {
-					(yyval.node) = (Node *) list_make3(
-						makeString(pstrdup("IN")),
-						makeInteger(MAKE_SQLSTATE('0','1','0','0','0')),
-						makeInteger(MAKE_SQLSTATE('0','2','0','0','0')));
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->location = (yylsp[(1) - (1)]);
+					new->typ = PLPSM_SQLWARNING;
+					(yyval.condition) = new;
 				;}
     break;
 
   case 50:
 
 /* Line 1455 of yacc.c  */
-#line 455 "gram.y"
+#line 466 "gram.y"
     {
-					(yyval.node) = (Node *) list_make3(
-						makeString(pstrdup("NOT_IN")),
-						makeInteger(MAKE_SQLSTATE('0','1','0','0','0')),
-						makeInteger(MAKE_SQLSTATE('0','2','0','0','0')));
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->location = (yylsp[(1) - (1)]);
+					new->typ = PLPSM_SQLEXCEPTION;
+					(yyval.condition) = new;
 				;}
     break;
 
   case 51:
 
 /* Line 1455 of yacc.c  */
-#line 462 "gram.y"
+#line 473 "gram.y"
     {
-					(yyval.node) = (Node *) makeString((yyvsp[(1) - (1)].word).ident);
+					Plpsm_condition_value *new = palloc0(sizeof(Plpsm_condition_value));
+					new->location = (yylsp[(1) - (1)]);
+					new->typ = PLPSM_CONDITION_NAME;
+					new->condition_name = (yyvsp[(1) - (1)].word).ident;
+					(yyval.condition) = new;
 				;}
     break;
 
   case 52:
 
 /* Line 1455 of yacc.c  */
-#line 468 "gram.y"
+#line 483 "gram.y"
     {
 					char   *sqlstatestr;
 
@@ -2326,18 +2340,18 @@ yyreduce:
 					if (strspn(sqlstatestr, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") != 5)
 						yyerror("invalid SQLSTATE code");
 
-					(yyval.node) = (Node *) makeInteger(MAKE_SQLSTATE(sqlstatestr[0],
-												  sqlstatestr[1],
-												  sqlstatestr[2],
-												  sqlstatestr[3],
-												  sqlstatestr[4]));
+					(yyval.ival) = MAKE_SQLSTATE(sqlstatestr[0],
+										  sqlstatestr[1],
+										  sqlstatestr[2],
+										  sqlstatestr[3],
+										  sqlstatestr[4]);
 				;}
     break;
 
   case 53:
 
 /* Line 1455 of yacc.c  */
-#line 488 "gram.y"
+#line 503 "gram.y"
     {
 				;}
     break;
@@ -2345,7 +2359,7 @@ yyreduce:
   case 54:
 
 /* Line 1455 of yacc.c  */
-#line 490 "gram.y"
+#line 505 "gram.y"
     {
 				;}
     break;
@@ -2353,7 +2367,7 @@ yyreduce:
   case 55:
 
 /* Line 1455 of yacc.c  */
-#line 500 "gram.y"
+#line 515 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_IF, (yylsp[(1) - (7)]));
 					new->esql = (yyvsp[(2) - (7)].esql);
@@ -2366,7 +2380,7 @@ yyreduce:
   case 56:
 
 /* Line 1455 of yacc.c  */
-#line 510 "gram.y"
+#line 525 "gram.y"
     {
 					(yyval.stmt) = NULL;
 				;}
@@ -2375,7 +2389,7 @@ yyreduce:
   case 57:
 
 /* Line 1455 of yacc.c  */
-#line 514 "gram.y"
+#line 529 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_IF, (yylsp[(1) - (5)]));
 					new->esql = (yyvsp[(2) - (5)].esql);
@@ -2388,7 +2402,7 @@ yyreduce:
   case 58:
 
 /* Line 1455 of yacc.c  */
-#line 522 "gram.y"
+#line 537 "gram.y"
     {
 					(yyval.stmt) = (yyvsp[(2) - (3)].stmt);
 				;}
@@ -2397,7 +2411,7 @@ yyreduce:
   case 59:
 
 /* Line 1455 of yacc.c  */
-#line 534 "gram.y"
+#line 549 "gram.y"
     {
 						Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_CASE, (yylsp[(1) - (6)]));
 						new->esql = (yyvsp[(2) - (6)].esql);
@@ -2410,7 +2424,7 @@ yyreduce:
   case 60:
 
 /* Line 1455 of yacc.c  */
-#line 545 "gram.y"
+#line 560 "gram.y"
     {
 					(yyvsp[(1) - (2)].stmt)->last->next = (yyvsp[(2) - (2)].stmt);
 					(yyvsp[(1) - (2)].stmt)->last = (yyvsp[(2) - (2)].stmt);
@@ -2420,7 +2434,7 @@ yyreduce:
   case 61:
 
 /* Line 1455 of yacc.c  */
-#line 550 "gram.y"
+#line 565 "gram.y"
     {
 					(yyval.stmt) = (yyvsp[(1) - (1)].stmt);
 				;}
@@ -2429,7 +2443,7 @@ yyreduce:
   case 62:
 
 /* Line 1455 of yacc.c  */
-#line 556 "gram.y"
+#line 571 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_CASE, (yylsp[(1) - (4)]));
 					new->esql = (yyvsp[(2) - (4)].esql);
@@ -2442,7 +2456,7 @@ yyreduce:
   case 63:
 
 /* Line 1455 of yacc.c  */
-#line 566 "gram.y"
+#line 581 "gram.y"
     {
 					(yyval.stmt) = NULL;
 				;}
@@ -2451,7 +2465,7 @@ yyreduce:
   case 64:
 
 /* Line 1455 of yacc.c  */
-#line 570 "gram.y"
+#line 585 "gram.y"
     {
 					(yyval.stmt) = (yyvsp[(2) - (3)].stmt);
 				;}
@@ -2460,7 +2474,7 @@ yyreduce:
   case 65:
 
 /* Line 1455 of yacc.c  */
-#line 586 "gram.y"
+#line 601 "gram.y"
     {
 					(yyval.stmt) = (yyvsp[(2) - (2)].stmt);
 					(yyval.stmt)->location = (yylsp[(1) - (2)]);
@@ -2470,7 +2484,7 @@ yyreduce:
   case 66:
 
 /* Line 1455 of yacc.c  */
-#line 591 "gram.y"
+#line 606 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SET, (yylsp[(1) - (8)]));
 					new->compound_target = (yyvsp[(3) - (8)].list);
@@ -2482,7 +2496,7 @@ yyreduce:
   case 67:
 
 /* Line 1455 of yacc.c  */
-#line 601 "gram.y"
+#line 616 "gram.y"
     {
 					(yyval.stmt) = (yyvsp[(1) - (1)].stmt);
 					(yyvsp[(1) - (1)].stmt)->last = (yyvsp[(1) - (1)].stmt);
@@ -2492,7 +2506,7 @@ yyreduce:
   case 68:
 
 /* Line 1455 of yacc.c  */
-#line 606 "gram.y"
+#line 621 "gram.y"
     {
 					/* expected just very short list */
 					(yyvsp[(1) - (3)].stmt)->last->next = (yyvsp[(3) - (3)].stmt);
@@ -2504,7 +2518,7 @@ yyreduce:
   case 69:
 
 /* Line 1455 of yacc.c  */
-#line 614 "gram.y"
+#line 629 "gram.y"
     {
 					(yyvsp[(1) - (3)].stmt)->typ = PLPSM_STMT_SET;
 					(yyvsp[(1) - (3)].stmt)->esql = (yyvsp[(3) - (3)].esql);
@@ -2515,7 +2529,7 @@ yyreduce:
   case 70:
 
 /* Line 1455 of yacc.c  */
-#line 623 "gram.y"
+#line 638 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_UNKNOWN, (yylsp[(1) - (1)]));
 					new->target = (yyvsp[(1) - (1)].qualid);
@@ -2526,7 +2540,7 @@ yyreduce:
   case 71:
 
 /* Line 1455 of yacc.c  */
-#line 632 "gram.y"
+#line 647 "gram.y"
     {
 					(yyval.list) = list_make1((yyvsp[(1) - (1)].qualid));
 				;}
@@ -2535,7 +2549,7 @@ yyreduce:
   case 72:
 
 /* Line 1455 of yacc.c  */
-#line 636 "gram.y"
+#line 651 "gram.y"
     {
 					(yyval.list) = lappend((yyvsp[(1) - (3)].list), (yyvsp[(3) - (3)].qualid));
 				;}
@@ -2544,7 +2558,7 @@ yyreduce:
   case 73:
 
 /* Line 1455 of yacc.c  */
-#line 643 "gram.y"
+#line 658 "gram.y"
     {
 					(yyval.qualid) = new_qualid(list_make1((yyvsp[(1) - (1)].word).ident), (yylsp[(1) - (1)]));
 				;}
@@ -2553,7 +2567,7 @@ yyreduce:
   case 74:
 
 /* Line 1455 of yacc.c  */
-#line 647 "gram.y"
+#line 662 "gram.y"
     {
 					ListCell	*l;
 					List	*idents = NIL;
@@ -2568,7 +2582,7 @@ yyreduce:
   case 75:
 
 /* Line 1455 of yacc.c  */
-#line 657 "gram.y"
+#line 672 "gram.y"
     {
 					/* ToDo: Plpsm_object should be a param type too */
 					char buf[32];
@@ -2580,7 +2594,7 @@ yyreduce:
   case 76:
 
 /* Line 1455 of yacc.c  */
-#line 673 "gram.y"
+#line 688 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_PRINT, (yylsp[(1) - (2)]));
 					new->esql_list = (yyvsp[(2) - (2)].list);
@@ -2591,7 +2605,7 @@ yyreduce:
   case 77:
 
 /* Line 1455 of yacc.c  */
-#line 688 "gram.y"
+#line 703 "gram.y"
     {
 					int tok = yylex();
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RETURN, (yylsp[(1) - (1)]));
@@ -2611,7 +2625,7 @@ yyreduce:
   case 78:
 
 /* Line 1455 of yacc.c  */
-#line 711 "gram.y"
+#line 726 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_LOOP, (yyvsp[(1) - (7)].str) ? (yylsp[(1) - (7)]) : (yylsp[(2) - (7)]));
 					new->name = (yyvsp[(1) - (7)].str);
@@ -2624,7 +2638,7 @@ yyreduce:
   case 79:
 
 /* Line 1455 of yacc.c  */
-#line 727 "gram.y"
+#line 742 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_WHILE, (yyvsp[(1) - (8)].str) ? (yylsp[(1) - (8)]) : (yylsp[(2) - (8)]));
 					new->name = (yyvsp[(1) - (8)].str);
@@ -2638,7 +2652,7 @@ yyreduce:
   case 80:
 
 /* Line 1455 of yacc.c  */
-#line 744 "gram.y"
+#line 759 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_REPEAT_UNTIL, (yyvsp[(1) - (8)].str) ? (yylsp[(1) - (8)]) : (yylsp[(2) - (8)]));
 					new->name = (yyvsp[(1) - (8)].str);
@@ -2652,7 +2666,7 @@ yyreduce:
   case 81:
 
 /* Line 1455 of yacc.c  */
-#line 761 "gram.y"
+#line 776 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_ITERATE, (yylsp[(1) - (2)]));
 					new->name = (yyvsp[(2) - (2)].word).ident;
@@ -2663,7 +2677,7 @@ yyreduce:
   case 82:
 
 /* Line 1455 of yacc.c  */
-#line 776 "gram.y"
+#line 791 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_LEAVE, (yylsp[(1) - (2)]));
 					new->name = (yyvsp[(2) - (2)].word).ident;
@@ -2674,7 +2688,7 @@ yyreduce:
   case 83:
 
 /* Line 1455 of yacc.c  */
-#line 791 "gram.y"
+#line 806 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_PREPARE, (yylsp[(1) - (4)]));
 					new->name = (yyvsp[(2) - (4)].word).ident;
@@ -2686,7 +2700,7 @@ yyreduce:
   case 84:
 
 /* Line 1455 of yacc.c  */
-#line 808 "gram.y"
+#line 823 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE, (yylsp[(1) - (2)]));
 					new->name = (yyvsp[(2) - (2)].word).ident;
@@ -2697,7 +2711,7 @@ yyreduce:
   case 85:
 
 /* Line 1455 of yacc.c  */
-#line 814 "gram.y"
+#line 829 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE, (yylsp[(1) - (4)]));
 					new->name = (yyvsp[(2) - (4)].word).ident;
@@ -2709,7 +2723,7 @@ yyreduce:
   case 86:
 
 /* Line 1455 of yacc.c  */
-#line 821 "gram.y"
+#line 836 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE, (yylsp[(1) - (6)]));
 					new->name = (yyvsp[(2) - (6)].word).ident;
@@ -2722,7 +2736,7 @@ yyreduce:
   case 87:
 
 /* Line 1455 of yacc.c  */
-#line 829 "gram.y"
+#line 844 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE, (yylsp[(1) - (4)]));
 					new->name = (yyvsp[(2) - (4)].word).ident;
@@ -2734,7 +2748,7 @@ yyreduce:
   case 88:
 
 /* Line 1455 of yacc.c  */
-#line 845 "gram.y"
+#line 860 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_EXECUTE_IMMEDIATE, (yylsp[(1) - (3)]));
 					new->esql = (yyvsp[(3) - (3)].esql);
@@ -2745,7 +2759,7 @@ yyreduce:
   case 89:
 
 /* Line 1455 of yacc.c  */
-#line 861 "gram.y"
+#line 876 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_OPEN, (yylsp[(1) - (2)]));
 					new->target = (yyvsp[(2) - (2)].qualid);
@@ -2756,7 +2770,7 @@ yyreduce:
   case 90:
 
 /* Line 1455 of yacc.c  */
-#line 867 "gram.y"
+#line 882 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_OPEN, (yylsp[(1) - (4)]));
 					new->target = (yyvsp[(2) - (4)].qualid);
@@ -2768,7 +2782,7 @@ yyreduce:
   case 91:
 
 /* Line 1455 of yacc.c  */
-#line 882 "gram.y"
+#line 897 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_FETCH, (yylsp[(1) - (4)]));
 					new->target = (yyvsp[(2) - (4)].qualid);
@@ -2781,7 +2795,7 @@ yyreduce:
   case 92:
 
 /* Line 1455 of yacc.c  */
-#line 898 "gram.y"
+#line 913 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_CLOSE, (yylsp[(1) - (2)]));
 					new->target = (yyvsp[(2) - (2)].qualid);
@@ -2792,7 +2806,7 @@ yyreduce:
   case 93:
 
 /* Line 1455 of yacc.c  */
-#line 913 "gram.y"
+#line 928 "gram.y"
     {
 					Plpsm_stmt *new = (yyvsp[(3) - (8)].stmt);
 					new->location = (yyvsp[(1) - (8)].str) ? (yylsp[(1) - (8)]) : (yylsp[(2) - (8)]);
@@ -2807,7 +2821,7 @@ yyreduce:
   case 94:
 
 /* Line 1455 of yacc.c  */
-#line 929 "gram.y"
+#line 944 "gram.y"
     {
 					char *loopvar_name = NULL;
 					char *cursor_name = NULL;
@@ -2878,28 +2892,28 @@ yyreduce:
   case 95:
 
 /* Line 1455 of yacc.c  */
-#line 997 "gram.y"
+#line 1012 "gram.y"
     { (yyval.stmt) = make_stmt_sql((yylsp[(1) - (1)])); ;}
     break;
 
   case 96:
 
 /* Line 1455 of yacc.c  */
-#line 998 "gram.y"
+#line 1013 "gram.y"
     { (yyval.stmt) = make_stmt_sql((yylsp[(1) - (1)])); ;}
     break;
 
   case 97:
 
 /* Line 1455 of yacc.c  */
-#line 999 "gram.y"
+#line 1014 "gram.y"
     { (yyval.stmt) = make_stmt_sql((yylsp[(1) - (1)])); ;}
     break;
 
   case 98:
 
 /* Line 1455 of yacc.c  */
-#line 1004 "gram.y"
+#line 1019 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SELECT_INTO, (yylsp[(1) - (3)]));
 					new->esql_list = (yyvsp[(2) - (3)].list);
@@ -2917,7 +2931,7 @@ yyreduce:
   case 99:
 
 /* Line 1455 of yacc.c  */
-#line 1017 "gram.y"
+#line 1032 "gram.y"
     {
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SELECT_INTO, (yylsp[(1) - (4)]));
 					new->esql_list = (yyvsp[(2) - (4)].list);
@@ -2938,7 +2952,7 @@ yyreduce:
   case 100:
 
 /* Line 1455 of yacc.c  */
-#line 1035 "gram.y"
+#line 1050 "gram.y"
     {
 					int endtok;
 					List	*esql_list = NIL;
@@ -2961,7 +2975,7 @@ yyreduce:
   case 101:
 
 /* Line 1455 of yacc.c  */
-#line 1055 "gram.y"
+#line 1070 "gram.y"
     {
 					(yyval.esql) = read_expr_until_semi();
 				;}
@@ -2970,7 +2984,7 @@ yyreduce:
   case 102:
 
 /* Line 1455 of yacc.c  */
-#line 1062 "gram.y"
+#line 1077 "gram.y"
     {
 					(yyval.list) = list_make1((yyvsp[(1) - (1)].esql));
 				;}
@@ -2979,7 +2993,7 @@ yyreduce:
   case 103:
 
 /* Line 1455 of yacc.c  */
-#line 1066 "gram.y"
+#line 1081 "gram.y"
     {
 					(yyval.list) = lappend((yyvsp[(1) - (3)].list), (yyvsp[(3) - (3)].esql));
 				;}
@@ -2988,7 +3002,7 @@ yyreduce:
   case 104:
 
 /* Line 1455 of yacc.c  */
-#line 1072 "gram.y"
+#line 1087 "gram.y"
     {
 					Plpsm_ESQL *esql = read_embeded_sql(';',',', 0, "; or ,", 
 												PLPSM_ESQL_EXPR, true, 
@@ -3001,7 +3015,7 @@ yyreduce:
   case 105:
 
 /* Line 1455 of yacc.c  */
-#line 1082 "gram.y"
+#line 1097 "gram.y"
     {
 					Plpsm_ESQL *esql = read_embeded_sql(DO, -1, -1, "DO", 
 												PLPSM_ESQL_EXPR, true, 
@@ -3014,7 +3028,7 @@ yyreduce:
   case 106:
 
 /* Line 1455 of yacc.c  */
-#line 1092 "gram.y"
+#line 1107 "gram.y"
     {
 					Plpsm_ESQL *esql = read_embeded_sql(THEN, -1, -1, "THEN", 
 												PLPSM_ESQL_EXPR, true, 
@@ -3027,7 +3041,7 @@ yyreduce:
   case 107:
 
 /* Line 1455 of yacc.c  */
-#line 1102 "gram.y"
+#line 1117 "gram.y"
     {
 					Plpsm_ESQL *esql = read_embeded_sql(END, -1, -1, "END", 
 												PLPSM_ESQL_EXPR, true, 
@@ -3040,7 +3054,7 @@ yyreduce:
   case 108:
 
 /* Line 1455 of yacc.c  */
-#line 1112 "gram.y"
+#line 1127 "gram.y"
     {
 					int endtok;
 					Plpsm_ESQL *esql = read_embeded_sql(';',INTO, USING, "; or INTO or USING", 
@@ -3056,7 +3070,7 @@ yyreduce:
   case 109:
 
 /* Line 1455 of yacc.c  */
-#line 1125 "gram.y"
+#line 1140 "gram.y"
     {
 					int endtok;
 					Plpsm_ESQL *esql = read_embeded_sql(';',',', ')', "; or , or )", 
@@ -3073,7 +3087,7 @@ yyreduce:
   case 110:
 
 /* Line 1455 of yacc.c  */
-#line 1139 "gram.y"
+#line 1154 "gram.y"
     {
 					Plpsm_ESQL *esql = NULL;
 					int	tok = yylex();
@@ -3093,7 +3107,7 @@ yyreduce:
 
 
 /* Line 1455 of yacc.c  */
-#line 3097 "gram.c"
+#line 3111 "gram.c"
       default: break;
     }
   YY_SYMBOL_PRINT ("-> $$ =", yyr1[yyn], &yyval, &yyloc);
@@ -3312,7 +3326,7 @@ yyreturn:
 
 
 /* Line 1675 of yacc.c  */
-#line 1155 "gram.y"
+#line 1170 "gram.y"
 
 
 static Plpsm_stmt *
@@ -3447,7 +3461,7 @@ declare_prefetch(void)
 				{
 					plpsm_push_back_token(tok1);
 					result->typ = PLPSM_STMT_DECLARE_HANDLER;
-					switch (tok1)
+					switch (tok)
 					{
 						case CONTINUE:
 							result->option = PLPSM_HANDLER_CONTINUE;
@@ -3709,6 +3723,9 @@ parser_stmt_name(Plpsm_stmt_type typ)
 static void
 esql_out(StringInfo ds, Plpsm_ESQL *esql)
 {
+	if (esql == NULL)
+		return;
+
 	switch (esql->typ)
 	{
 		case PLPSM_ESQL_EXPR:
@@ -3744,6 +3761,9 @@ pqualid_out(StringInfo ds, Plpsm_positioned_qualid *qualid)
 {
 	bool	isFirst = true;
 	ListCell	*l;
+
+	if (qualid == NULL)
+		return;
 
 	foreach(l, qualid->qualId)
 	{
@@ -3796,7 +3816,6 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 	appendStringInfo(ds, "%s| Variables: ", ident);
 	pqualid_list_out(ds, stmt->variables);
 	appendStringInfoChar(ds, '\n');
-	//appendStringInfo(ds, "%s| Data: %s\n", ident, nodeToString(stmt->data));
 	appendStringInfo(ds, "%s| Option: %d\n", ident, stmt->option);
 	appendStringInfo(ds, "%s| ESQL: ", ident);
 	esql_out(ds, stmt->esql);
@@ -3804,7 +3823,7 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 	appendStringInfo(ds, "%s| ESQL list: ", ident);
 	esql_list_out(ds, stmt->esql_list);
 	appendStringInfoChar(ds, '\n');
-	
+
 	switch (stmt->typ)
 	{
 		case PLPSM_STMT_FOR:
@@ -3814,6 +3833,33 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 										stmt->stmtfor.cursor_name);
 			}
 			break;
+		case PLPSM_STMT_DECLARE_HANDLER:
+			{
+				Plpsm_condition_value *condition = (Plpsm_condition_value *) stmt->data;
+
+				appendStringInfo(ds, "%s| condtions:", ident);
+				while (condition != NULL)
+				{
+					switch (condition->typ)
+					{
+						case PLPSM_SQLSTATE:
+							appendStringInfo(ds, " %s", unpack_sql_state(condition->sqlstate));
+							break;
+						case PLPSM_SQLEXCEPTION:
+							appendStringInfoString(ds, " SQLEXCEPTION");
+							break;
+						case PLPSM_SQLWARNING:
+							appendStringInfoString(ds, " SQLWARNING");
+							break;
+						case PLPSM_CONDITION_NAME:
+							appendStringInfo(ds, " %s", condition->condition_name);
+							break;
+					}
+					condition = condition->next;
+				}
+				appendStringInfoChar(ds, '\n');
+				break;
+			}
 		default:
 			/* do nothing */ ;
 	}

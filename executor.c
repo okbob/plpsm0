@@ -348,6 +348,8 @@ next_op:
 						dinfo->is_signal = true;
 
 					elog(NOTICE, "%s", str);
+					if (dinfo != NULL)
+						dinfo->is_signal = false;
 
 					pfree(str);
 				}
@@ -494,6 +496,20 @@ next_op:
 					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
 				}
 				break;
+
+			case PCODE_STORE_SP:
+				{
+					int offset = pcode->target.offset;
+					values[offset] = SP;
+					break;
+				}
+
+			case PCODE_LOAD_SP:
+				{
+					int offset = pcode->target.offset;
+					SP = values[offset];
+					break;
+				}
 
 			case PCODE_UPDATE_FIELD:
 				{
@@ -920,13 +936,17 @@ static void
 collect_vars_info(StringInfo ds, Plpsm_object *scope, FmgrInfo *flinfo, Datum *values, char *nulls)
 {
 	Plpsm_object *iterator;
+	StringInfoData		lds;
+	bool append = false;
 
 	if (scope == NULL)
 		return;
 
+	initStringInfo(&lds);
+
 	iterator = scope->inner;
 
-	appendStringInfo(ds, "\n  ==== %s: frame ====\n", scope->name != NULL ? scope->name : "unnamed");
+	appendStringInfo(&lds, "\n  ==== %s: frame ====\n", scope->name != NULL ? scope->name : "unnamed");
 
 	while (iterator != NULL)
 	{
@@ -940,17 +960,22 @@ collect_vars_info(StringInfo ds, Plpsm_object *scope, FmgrInfo *flinfo, Datum *v
 				value = "NULL";
 
 			if (iterator->typ == PLPSM_STMT_DECLARE_VARIABLE)
-				appendStringInfo(ds, "  %3d\t%s = %s\n", iterator->offset, 
+				appendStringInfo(&lds, "  %3d\t%s = %s\n", iterator->offset, 
 												iterator->name,
 												value);
+			append = true;
 		}
 		else if (iterator->typ == PLPSM_STMT_DECLARE_CURSOR)
 		{
-				appendStringInfo(ds, "  %3d\t%s cursor\n", iterator->offset, 
+				appendStringInfo(&lds, "  %3d\t%s cursor\n", iterator->offset, 
 												iterator->name);
+				append = true;
 		}
 		iterator = iterator->next;
 	}
+
+	if (append)
+		appendStringInfoString(ds, lds.data);
 
 	collect_vars_info(ds, scope->outer, flinfo, values, nulls);
 }
