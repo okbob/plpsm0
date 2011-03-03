@@ -78,6 +78,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 		PLword			word;
 		PLcword			cword;
 		void			*ptr;
+		bool			boolean;
 		List				*list;
 		Plpsm_stmt			*stmt;
 		Plpsm_ESQL			*esql;
@@ -106,6 +107,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %type <esql>	opt_expr_until_when expr_until_semi_or_coma_or_parent
 %type <stmt>	stmt_sql stmt_select_into
 %type <ival>	sqlstate
+%type <boolean>		opt_atomic
 
 /*
  * Basic non-keyword token types.  These are hard-wired into the core lexer.
@@ -125,6 +127,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %token <word>		WORD
 %token <cword>		CWORD
 
+%token <keyword>	ATOMIC
 %token <keyword>	AS
 %token <keyword>	BEGIN
 %token <keyword>	CASE
@@ -255,31 +258,34 @@ stmt:
  *
  */
 stmt_compound:
-			opt_label BEGIN statements ';' END opt_end_label
+			opt_label BEGIN opt_atomic statements ';' END opt_end_label
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, $1 ? @1: @2);
 					new->name = $1;
-					new->inner_left = $3;
-					check_labels($1, $6);
+					new->option = $3;
+					new->inner_left = $4;
+					check_labels($1, $7);
 					$$ = new;
 				}
-			| opt_label BEGIN declarations ';' END opt_end_label
+			| opt_label BEGIN opt_atomic declarations ';' END opt_end_label
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, $1 ? @1: @2);
 					new->name = $1;
-					new->inner_left = $3;
-					check_labels($1, $6);
+					new->option = $3;
+					new->inner_left = $4;
+					check_labels($1, $7);
 					$$ = new;
 				}
-			| opt_label BEGIN declarations ';' statements ';' END opt_end_label
+			| opt_label BEGIN opt_atomic declarations ';' statements ';' END opt_end_label
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_COMPOUND_STATEMENT, $1 ? @1: @2);
 					new->name = $1;
+					new->option = $3;
 					/* join declarations and statements */
-					$3->last->next = $5;
-					$3->last = $5->last;
-					new->inner_left = $3;
-					check_labels($1, $8);
+					$4->last->next = $6;
+					$4->last = $6->last;
+					new->inner_left = $4;
+					check_labels($1, $9);
 					$$ = new;
 				}
 			| opt_label BEGIN END opt_end_label
@@ -288,6 +294,16 @@ stmt_compound:
 					new->name = $1;
 					check_labels($1, $4);
 					$$ = new;
+				}
+		;
+
+opt_atomic:
+				{
+					$$ = false;
+				}
+			| ATOMIC
+				{
+					$$ = true;
 				}
 		;
 
@@ -1457,6 +1473,7 @@ is_unreserved_keyword(int tok)
 {
 	switch (tok)
 	{
+		case ATOMIC:
 		case AS:
 		case CONTINUE:
 		case EXIT:

@@ -100,6 +100,7 @@ static const int num_reserved_keywords = lengthof(reserved_keywords);
 
 static const ScanKeyword unreserved_keywords[] = {
 	PG_KEYWORD("as", AS, UNRESERVED_KEYWORD)
+	PG_KEYWORD("atomic", ATOMIC, UNRESERVED_KEYWORD)
 	PG_KEYWORD("continue", CONTINUE, UNRESERVED_KEYWORD)
 	PG_KEYWORD("exit", EXIT, UNRESERVED_KEYWORD)
 	PG_KEYWORD("found", FOUND, UNRESERVED_KEYWORD)

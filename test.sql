@@ -1175,9 +1175,44 @@ begin
 end;
 $$ language psm0;
 
+create or replace function test61(a int, out s integer)
+returns int as $$
+xx:begin
+     set s = 0;
+     begin atomic
+       declare c cursor for select * from footab;
+       open c;
+       print 'Hello';
+       set s = 10;
+       if a > 10 then leave xx; end if;
+       print 'World';
+       set s = s + 10;
+     end;
+     print 'Hello World again';
+     set s = s + 10;
+   end xx;
+$$ language psm0;
 
-
-  
+create or replace function test61_a(a int, out s integer)
+returns int as $$
+xx:begin
+     set s = 0;
+     begin atomic
+       declare x int;
+       declare c cursor for select * from footab;
+       declare exit handler for not found begin print 'Ahoj'; end;
+       open c;
+       print 'Hello';
+       set s = 10;
+       fetch c into x;
+       if a > 10 then leave xx; end if;
+       print 'World';
+       set s = s + 10;
+     end;
+     print 'Hello World again';
+     set s = s + 10;
+   end xx;
+$$ language psm0;
 
 /*************************************************
  * Assert functions - sure, it is in plgsql :)
@@ -1319,6 +1354,10 @@ begin
   perform assert('test60_2', 10, test60_2());
   perform assert('test60_3', 100, test60_3());
   perform assert('test60_4', 100, test60_4());
+  perform assert('test61', 10, test61(100));
+  perform assert('test61', 30, test61(10));
+  perform assert('test61_a', 10, test61(100));
+  perform assert('test61_a', 30, test61(10));
 
   raise notice '******* All tests are ok *******';
 end;

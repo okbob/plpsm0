@@ -3,6 +3,7 @@
 #include "postgres.h"
 #include "funcapi.h"
 
+#include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/prepare.h"
 #include "executor/spi.h"
@@ -13,6 +14,7 @@
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
 
 typedef struct
 {
@@ -53,7 +55,6 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	int				CallStack[1024];
 	int	sqlstate = 0;
 	Bitmapset	*acursors = NULL;		/* active cursors */
-	int	offset;
 	int	rc;
 	Plpsm_pcode_module *module = mod->code;
 	bool		is_read_only = module->is_read_only;
@@ -511,6 +512,44 @@ next_op:
 					break;
 				}
 
+			case PCODE_BEGIN_SUBTRANSACTION:
+				{
+					MemoryContext	oldcontext = CurrentMemoryContext;
+					int offset = pcode->target.offset;
+
+					values[offset] = PointerGetDatum(CurrentResourceOwner);
+					BeginInternalSubTransaction(NULL);
+
+					MemoryContextSwitchTo(oldcontext);
+					SPI_restore_connection();
+					break;
+				}
+
+			case PCODE_RELEASE_SUBTRANSACTION:
+				{
+					MemoryContext	oldcontext = CurrentMemoryContext;
+					int offset = pcode->target.offset;
+
+					ReleaseCurrentSubTransaction();
+					MemoryContextSwitchTo(oldcontext);
+					CurrentResourceOwner = (ResourceOwner) DatumGetPointer(values[offset]);
+					SPI_restore_connection();
+					break;
+				}
+
+			case PCODE_ROLLBACK_SUBTRANSACTION:
+				{
+					MemoryContext	oldcontext = CurrentMemoryContext;
+					int offset = pcode->target.offset;
+
+					RollbackAndReleaseCurrentSubTransaction();
+
+					MemoryContextSwitchTo(oldcontext);
+					CurrentResourceOwner = (ResourceOwner) DatumGetPointer(values[offset]);
+					SPI_restore_connection();
+					break;
+				}
+
 			case PCODE_UPDATE_FIELD:
 				{
 					int	fno = pcode->update_field.fno;
@@ -888,22 +927,6 @@ leave_process:
 	fcinfo->isnull = isnull;
 	MemoryContextDelete(exec_ctx);
 
-	/* release a opened cursors */
-	while ((offset = bms_first_member(acursors)) >= 0)
-		SPI_cursor_close((Portal) DatumGetPointer(values[offset]));
-	bms_free(acursors);
-
-	if (values)
-	{
-		pfree(nulls);
-		pfree(values);
-	}
-
-	if (out_funcs)
-	{
-		pfree(out_funcs);
-	}
-
 	return (Datum) result;
 }
 
@@ -1046,7 +1069,7 @@ plpsm_exec_error_callback(void *arg)
 
 	if (pcode->cframe != NULL)
 	{
-		collect_vars_info(&ds, pcode->cframe, dinfo->out_funcs, dinfo->values, dinfo->nulls);
+		//collect_vars_info(&ds, pcode->cframe, dinfo->out_funcs, dinfo->values, dinfo->nulls);
 	}
 
 	errcontext(ds.data);

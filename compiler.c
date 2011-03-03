@@ -108,7 +108,7 @@ typedef struct
 
 typedef CompileStateData *CompileState;
 
-static void _compile(CompileState cstate, Plpsm_stmt *stmt);
+static void _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent);
 static Node *resolve_column_ref(CompileState cstate, ColumnRef *cref);
 void plpsm_parser_setup(struct ParseState *pstate, CompileState cstate);
 static Plpsm_object *lookup_var(Plpsm_object *scope, const char *name);
@@ -312,18 +312,10 @@ verify_condition_list(Plpsm_condition_value *condition, bool *isnotfound, Plpsm_
 		}
 
 		/* we enable only exit or continue handlers for warnings and undo handlers for errors */
-		if (condition->typ == PLPSM_SQLWARNING || 
+		if (!(condition->typ == PLPSM_SQLWARNING || 
 			(condition->typ == PLPSM_SQLSTATE && 
 				(ERRCODE_TO_CATEGORY(condition->sqlstate) == MAKE_SQLSTATE('0','2','0','0','0') ||
-				 ERRCODE_TO_CATEGORY(condition->sqlstate) == MAKE_SQLSTATE('0','1','0','0','0'))))
-		{
-			if (handler_typ != PLPSM_HANDLER_CONTINUE && handler_typ != PLPSM_HANDLER_EXIT)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("Warnings should be processed by CONTINUE or EXIT handlers only"),
-						 parser_errposition(condition->location)));
-		}
-		else
+				 ERRCODE_TO_CATEGORY(condition->sqlstate) == MAKE_SQLSTATE('0','1','0','0','0')))))
 		{
 			if (handler_typ != PLPSM_HANDLER_UNDO)
 				ereport(ERROR,
@@ -1252,6 +1244,15 @@ list(Plpsm_pcode_module *m)
 			case PCODE_LOAD_SP:
 				appendStringInfo(&ds, "LoadSP @%d", VALUE(target.offset));
 				break;
+			case PCODE_BEGIN_SUBTRANSACTION:
+				appendStringInfo(&ds, "BeginSubtransaction @%d", VALUE(target.offset));
+				break;
+			case PCODE_RELEASE_SUBTRANSACTION:
+				appendStringInfo(&ds, "ReleaseSubtransaction @%d", VALUE(target.offset));
+				break;
+			case PCODE_ROLLBACK_SUBTRANSACTION:
+				appendStringInfo(&ds, "RollbackSubtransaction @%d", VALUE(target.offset));
+				break;
 		}
 		appendStringInfoChar(&ds, '\n');
 	}
@@ -1336,7 +1337,7 @@ compile_release_cursors(CompileState cstate)
 
 	/* search all cursors from current compound statement */
 	Assert(scope->typ == PLPSM_STMT_COMPOUND_STATEMENT ||
-	       scope->typ == PLPSM_STMT_SCHEMA);
+		scope->typ == PLPSM_STMT_SCHEMA);
 
 	iterator = scope->inner;
 	while (iterator != NULL)
@@ -1939,8 +1940,6 @@ compile_refresh_basic_diagnostic(CompileState cstate)
 				int	addr1 = PC(m);
 				int	addr2;
 
-				Assert(notfound_handler->stmt->option == PLPSM_HANDLER_EXIT);
-
 				EMIT_OPCODE(JMP_NOT_FOUND, -1);
 				addr2 = PC(m);
 				EMIT_OPCODE(JMP, -1);
@@ -1975,18 +1974,34 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
 			EMIT_OPCODE(JMP, -1);
 			release_addr = PC(m);
 			compile_release_cursors(cstate);
+			if ((bool) obj->stmt->option)
+			{
+				/* release a savepoint */
+				Assert(obj->offset != -1);
+				SET_OPVAL(target.offset, obj->offset);
+				EMIT_OPCODE(RELEASE_SUBTRANSACTION, -1);
+			}
+
 			EMIT_OPCODE(RET_SUBR, -1);
+
 			SET_OPVAL_ADDR(addr1, addr, PC(m));
 			cstate->current_scope = release_psm_object(cstate, obj, release_addr, PC(m));
 		}
 		else
 		{
 			compile_release_cursors(cstate);
+			if ((bool) obj->stmt->option)
+			{
+				/* release a savepoint */
+				Assert(obj->offset != -1);
+				SET_OPVAL(target.offset, obj->offset);
+				EMIT_OPCODE(RELEASE_SUBTRANSACTION, -1);
+			}
 			cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
 		}
 	}
-		else
-			cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+	else
+		cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
 }
 
 /*
@@ -1997,22 +2012,38 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
  * to dynamic object is necessary, then dynamic SQL must be used. ???
  */
 static void 
-_compile(CompileState cstate, Plpsm_stmt *stmt)
+_compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 {
 	int	addr1;
 	int	addr2;
 	Plpsm_object *obj, *var;
 	Plpsm_pcode_module *m = cstate->module;
+	bool		should_insert_subtransaction;		/* true, when start of subtransaction will be inserted after declare statements */
+
+	should_insert_subtransaction = parent != NULL && parent->typ == PLPSM_STMT_COMPOUND_STATEMENT && parent->offset != -1;
 
 	while (stmt != NULL)
 	{
+
+		if (should_insert_subtransaction && 
+			stmt->typ != PLPSM_STMT_DECLARE_VARIABLE && 
+			stmt->typ != PLPSM_STMT_DECLARE_CURSOR &&
+			stmt->typ != PLPSM_STMT_DECLARE_HANDLER)
+		{
+
+			SET_OPVAL(target.offset, parent->offset);
+			EMIT_OPCODE(BEGIN_SUBTRANSACTION, stmt->lineno);
+
+			should_insert_subtransaction = false;
+		}
+
 		switch (stmt->typ)
 		{
 			case PLPSM_STMT_LOOP:
 				{
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					addr1 = PC(m);
-					_compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left, NULL);
 					EMIT_JMP(addr1, stmt->lineno);
 					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
 				}
@@ -2025,7 +2056,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					addr2 = PC(m);
 					EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
-					_compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left, NULL);
 					EMIT_JMP(addr1, stmt->lineno);
 					SET_OPVAL_ADDR(addr2, addr, PC(m));
 					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
@@ -2036,7 +2067,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 				{
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					addr1 = PC(m);
-					_compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left, NULL);
 					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					SET_OPVAL(addr, addr1);
 					EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
@@ -2139,7 +2170,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					}
 					pfree(vars);
 
-					_compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left, NULL);
 					EMIT_JMP(addr2, stmt->lineno);
 					SET_OPVAL_ADDR(addr1, addr, PC(m));
 
@@ -2170,7 +2201,8 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					bool	has_undo_handler = false;
 					bool	has_exit_handler = false;
 					Plpsm_stmt *inner_stmt;
-					int16	offset;
+					int16	offset = -1;		/* be compiler quite */
+					int16		resource_owner_offset = -1;		/* be compiler quite */
 
 					/* 
 					 * Store PC when compound statement contains a exit or undo handler.
@@ -2191,22 +2223,52 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 
 					if (has_undo_handler || has_exit_handler)
 					{
+						/* 
+						 * Allocate a space for storing stack counter
+						 */
 						offset = cstate->stack.ndatums++;
-
 						if (offset >= cstate->stack.oids.size)
 						{
 							cstate->stack.oids.size += 128;
 				    			cstate->stack.oids.data = repalloc(cstate->stack.oids.data, cstate->stack.oids.size * sizeof(Oid));
 						}
 
-						cstate->stack.oids.data[offset] = INT4OID;
+						cstate->stack.oids.data[offset] = InvalidOid;
 
 						SET_OPVAL(target.offset, offset);
 						EMIT_OPCODE(STORE_SP, stmt->lineno);
 					}
 
+					if (has_undo_handler && !((bool) stmt->option))
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("a UNDO handler is allowed only ATOMIC compound statement"),
+									parser_errposition(stmt->location)));
+
 					obj = new_psm_object_for(stmt, cstate, PC(m));
-					_compile(cstate, stmt->inner_left);
+
+					/*
+					 * When compound statement is atomic 
+					 */
+					if ((bool) stmt->option)
+					{
+						/*
+						 * Allocate a space for storing a ResourceOwner pointer
+						 */
+						resource_owner_offset = cstate->stack.ndatums++;
+						if (resource_owner_offset >= cstate->stack.oids.size)
+						{
+							cstate->stack.oids.size += 128;
+							cstate->stack.oids.data = repalloc(cstate->stack.oids.data, cstate->stack.oids.size * sizeof(Oid));
+						}
+
+						cstate->stack.oids.data[resource_owner_offset] = InvalidOid;
+						obj->calls.has_release_call = true;
+					}
+
+					obj->offset = resource_owner_offset;
+					
+					_compile(cstate, stmt->inner_left, obj);
 
 					cstate->stack.has_sqlstate = has_sqlstate;
 					cstate->stack.has_sqlcode = has_sqlcode;
@@ -2244,7 +2306,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					 */
 					 
 					cstate->stack.has_notfound_continue_handler = isnotfound;
-					_compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left, NULL);
 					EMIT_OPCODE(RET_SUBR, stmt->lineno);
 					SET_OPVAL_ADDR(addr1, addr, PC(m));
 
@@ -2306,6 +2368,11 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 						var->cursor.is_dynamic = true;
 						var->cursor.prepname = stmt->name;
 					}
+
+					/* initialise a cursor variable */
+					SET_OPVAL(target.offset, var->cursor.offset);
+					EMIT_OPCODE(SET_NULL, stmt->lineno);
+
 				}
 				break;
 
@@ -2457,13 +2524,13 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					addr1 = PC(m);
 					EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
-					_compile(cstate, stmt->inner_left);
+					_compile(cstate, stmt->inner_left, NULL);
 					if (stmt->inner_right)
 					{
 						addr2 = PC(m);
 						EMIT_OPCODE(JMP, stmt->lineno);
 						SET_OPVAL_ADDR(addr1, addr, PC(m));
-						_compile(cstate, stmt->inner_right);
+						_compile(cstate, stmt->inner_right, NULL);
 						SET_OPVAL_ADDR(addr2, addr, PC(m));
 					}
 					else
@@ -2496,7 +2563,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 						compile_expr(cstate, NULL, expr, BOOLOID, -1);
 						addr1 = PC(m);
 						EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
-						_compile(cstate, cond->inner_left);
+						_compile(cstate, cond->inner_left, NULL);
 						final_jmps = lappend(final_jmps, makeInteger(PC(m)));
 						EMIT_OPCODE(JMP, stmt->lineno);
 						SET_OPVAL_ADDR(addr1, addr, PC(m));
@@ -2510,7 +2577,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt)
 						EMIT_OPCODE(SIGNAL_NODATA, stmt->lineno);
 					}
 					else
-						_compile(cstate, outer_case->inner_right);
+						_compile(cstate, outer_case->inner_right, NULL);
 
 					/* complete leave jumps */
 					foreach (l, final_jmps)
@@ -3008,7 +3075,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	else
 		cstated.finfo.return_expr = NULL;
 
-	_compile(&cstated, plpsm_parser_tree);
+	_compile(&cstated, plpsm_parser_tree, NULL);
 	compile_done(&cstated);
 
 	m->ndatums = cstated.stack.ndatums;
