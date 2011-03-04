@@ -2304,10 +2304,32 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					 * has_notfound_continue_handler can be mistaken, there
 					 * is necessary do recheck.
 					 */
-					 
 					cstate->stack.has_notfound_continue_handler = isnotfound;
-					_compile(cstate, stmt->inner_left, NULL);
-					EMIT_OPCODE(RET_SUBR, stmt->lineno);
+					
+					/* 
+					 * UNDO handler does ROLLBACK on entry and jumps
+					 * to first next statement after current compound 
+					 * statement.
+					 */
+					if (stmt->option != PLPSM_HANDLER_UNDO)
+					{
+						_compile(cstate, stmt->inner_left, NULL);
+						EMIT_OPCODE(RET_SUBR, stmt->lineno);
+					}
+					else
+					{
+						/* rollback a savepoint */
+						Assert(parent != NULL);
+						Assert(parent->offset != -1);
+						SET_OPVAL(target.offset, parent->offset);
+						EMIT_OPCODE(ROLLBACK_SUBTRANSACTION, stmt->lineno);
+						_compile(cstate, stmt->inner_left, NULL);
+						/* jmp from compound statement */
+						parent->calls.leave_jmps = lappend(parent->calls.leave_jmps,
+														makeInteger(PC(m)));
+						EMIT_OPCODE(JMP, stmt->lineno);
+					}
+
 					SET_OPVAL_ADDR(addr1, addr, PC(m));
 
 					cstate->current_scope = obj->outer;

@@ -1214,6 +1214,24 @@ xx:begin
    end xx;
 $$ language psm0;
 
+create table tab62_c(a int check (a > 10));
+create table tab62_n(a int);
+
+create or replace function test62(a int, out result integer)
+returns int as $$
+begin atomic
+  declare undo handler for sqlexception
+     begin
+       print 'exception handler started';
+       insert into tab62_n(a) values(a);
+       set result = -1;
+     end;
+  insert into tab62_c(a) values(a);
+  print 'there was not a exception';
+  set result = 0;
+end;
+$$ language psm0;
+
 /*************************************************
  * Assert functions - sure, it is in plgsql :)
  */
