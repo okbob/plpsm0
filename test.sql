@@ -1224,11 +1224,14 @@ begin atomic
      begin
        print 'exception handler started';
        insert into tab62_n(a) values(a);
-       set result = -1;
+       set result = (select sum(tab62_n.a) from tab62_n) * -1;
+       set result = result + (select sum(tab62_c.a) from tab62_c);
      end;
+  truncate tab62_c, tab62_n;
   insert into tab62_c(a) values(a);
   print 'there was not a exception';
-  set result = 0;
+  set result = (select sum(tab62_c.a) from tab62_c);
+  set result = result - (select sum(tab62_n.a) from tab62_n);
 end;
 $$ language psm0;
 

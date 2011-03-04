@@ -102,7 +102,8 @@
      WHILE = 318,
      INSERT = 319,
      UPDATE = 320,
-     DELETE = 321
+     DELETE = 321,
+     TRUNCATE = 322
    };
 #endif
 
@@ -135,7 +136,7 @@ typedef union YYSTYPE
 
 
 /* Line 1676 of yacc.c  */
-#line 139 "gram.h"
+#line 140 "gram.h"
 } YYSTYPE;
 # define YYSTYPE_IS_TRIVIAL 1
 # define yystype YYSTYPE /* obsolescent; will be withdrawn */

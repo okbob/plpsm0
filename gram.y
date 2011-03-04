@@ -179,6 +179,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %token <keyword>	INSERT
 %token <keyword>	UPDATE
 %token <keyword>	DELETE
+%token <keyword>	TRUNCATE
 
 %%
 
@@ -1028,6 +1029,7 @@ stmt_sql:
 			INSERT 				{ $$ = make_stmt_sql(@1); }
 			| UPDATE 			{ $$ = make_stmt_sql(@1); }
 			| DELETE			{ $$ = make_stmt_sql(@1); }
+			| TRUNCATE			{ $$ = make_stmt_sql(@1); }
 			;
 
 stmt_select_into:
