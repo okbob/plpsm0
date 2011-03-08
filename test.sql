@@ -1222,16 +1222,18 @@ returns int as $$
 begin atomic
   declare undo handler for sqlexception
      begin
-       print 'exception handler started';
-       insert into tab62_n(a) values(a);
-       set result = (select sum(tab62_n.a) from tab62_n) * -1;
-       set result = result + (select sum(tab62_c.a) from tab62_c);
+       declare continue handler for not found
+         print 'not found';
+       print 'sql exception';
      end;
-  truncate tab62_c, tab62_n;
-  insert into tab62_c(a) values(a);
-  print 'there was not a exception';
-  set result = (select sum(tab62_c.a) from tab62_c);
-  set result = result - (select sum(tab62_n.a) from tab62_n);
+  begin atomic
+    declare undo handler for sqlstate '55555'
+      print 'sqlstate 55555';
+    declare continue handler for not found
+      print 'not found';
+    print 'some statement from nested block';
+  end;
+  print 'some statement from outer block';
 end;
 $$ language psm0;
 
@@ -1241,6 +1243,7 @@ $$ language psm0;
 create or replace function assert(text, int, int)
 returns void as $$
 begin
+  raise notice '*** test % ***', $1;
   if ($2 <> $3) then
     raise exception 'test "%" broken. %<>%', $1, $2, $3;
   end if;

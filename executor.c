@@ -109,7 +109,11 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	{
 		Plpsm_pcode *pcode;
 next_op:
-/* elog(NOTICE, "PC %d", PC); */
+/*
+ dinfo->is_signal = true;
+ elog(NOTICE, "PC %d", PC); 
+ dinfo->is_signal = false;
+*/
 		if (PC == 0)
 			elog(ERROR, "invalid memory reference");
 
@@ -1069,10 +1073,10 @@ plpsm_exec_error_callback(void *arg)
 
 	if (pcode->cframe != NULL)
 	{
-		//collect_vars_info(&ds, pcode->cframe, dinfo->out_funcs, dinfo->values, dinfo->nulls);
+		collect_vars_info(&ds, pcode->cframe, dinfo->out_funcs, dinfo->values, dinfo->nulls);
 	}
 
-	errcontext(ds.data);
+	errcontext("%s", ds.data);
 	pfree(ds.data);
 }
 

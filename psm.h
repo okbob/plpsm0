@@ -231,7 +231,8 @@ typedef enum
 	PCODE_LOAD_SP,
 	PCODE_BEGIN_SUBTRANSACTION,
 	PCODE_RELEASE_SUBTRANSACTION,
-	PCODE_ROLLBACK_SUBTRANSACTION
+	PCODE_ROLLBACK_SUBTRANSACTION,
+	PCODE_HT
 } Plpsm_pcode_type;
 
 typedef enum
@@ -250,6 +251,16 @@ typedef enum
 	PLPSM_PARAMBUILDER_APPEND,
 	PLPSM_PARAMBUILDER_FREE
 } Plpsm_parambuilder_op_type;
+
+typedef enum 
+{
+	PLPSM_HT_SQLCODE,
+	PLPSM_HT_SQLCLASS,
+	PLPSM_HT_SQLWARNING,
+	PLPSM_HT_SQLEXCEPTION,
+	PLPSM_HT_PARENT,
+	PLPSM_HT_STOP
+} Plpsm_ht_type;
 
 typedef struct
 {
@@ -352,6 +363,18 @@ typedef struct
 			int	nvars;
 			char *data;
 		} frame_info;
+		struct
+		{
+			Plpsm_ht_type	typ;
+			Plpsm_handler_type htyp;
+			union 
+			{
+				int	sqlcode;
+				int	sqlclass;
+				int	parent_HT_addr;
+			};
+			int addr;
+		} HT_field;
 		int	size;
 		int16	ncolumns;
 		int	lineno;
@@ -380,6 +403,7 @@ typedef struct
 	int		ndata;			/* number of data address used for module's instance */
 	char *name;
 	bool		is_read_only;
+	int		ht_addr;		/* address of Handlers' table */
 	Plpsm_pcode code[1];
 } Plpsm_pcode_module;
 
