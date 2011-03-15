@@ -1248,18 +1248,15 @@ list(Plpsm_pcode_module *m)
 				appendStringInfo(&ds, "LoadSP @%d", VALUE(target.offset));
 				break;
 			case PCODE_BEGIN_SUBTRANSACTION:
-				appendStringInfo(&ds, "BeginSubtransaction @%d", VALUE(target.offset));
+				appendStringInfo(&ds, "BeginSubtransaction");
 				break;
 			case PCODE_RELEASE_SUBTRANSACTION:
-				appendStringInfo(&ds, "ReleaseSubtransaction @%d", VALUE(target.offset));
-				break;
-			case PCODE_ROLLBACK_SUBTRANSACTION:
-				appendStringInfo(&ds, "RollbackSubtransaction @%d", VALUE(target.offset));
+				appendStringInfo(&ds, "ReleaseSubtransaction");
 				break;
 			case PCODE_HT:
 				{
 					appendStringInfoString(&ds, "HT ");
-					if (VALUE(HT_field.typ) != PLPSM_HT_PARENT && VALUE(HT_field.typ != PLPSM_HT_STOP))
+					if (VALUE(HT_field.typ) != PLPSM_HT_PARENT && VALUE(HT_field.typ != PLPSM_HT_STOP) && VALUE(HT_field.typ != PLPSM_HT_RELEASE_SUBTRANSACTION))
 					{
 						switch (VALUE(HT_field.htyp))
 						{
@@ -1292,12 +1289,15 @@ list(Plpsm_pcode_module *m)
 											VALUE(HT_field.addr));
 							break;						
 						case PLPSM_HT_SQLEXCEPTION:
-							appendStringInfo(&ds, "SQLERROR, addr:%d", 
+							appendStringInfo(&ds, "SQLEXCEPTION, addr:%d", 
 											VALUE(HT_field.addr));
 							break;						
 						case PLPSM_HT_PARENT:
 							appendStringInfo(&ds, "Parent tab: %d", 
 											VALUE(HT_field.parent_HT_addr));
+							break;
+						case PLPSM_HT_RELEASE_SUBTRANSACTION:
+							appendStringInfo(&ds, "Release Subtransaction");
 							break;
 						case PLPSM_HT_STOP:
 							appendStringInfo(&ds, "STOP");
@@ -2045,8 +2045,6 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
 			if ((bool) obj->stmt->option)
 			{
 				/* release a savepoint */
-				Assert(obj->offset != -1);
-				SET_OPVAL(target.offset, obj->offset);
 				EMIT_OPCODE(RELEASE_SUBTRANSACTION, -1);
 			}
 
@@ -2061,8 +2059,6 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
 			if ((bool) obj->stmt->option)
 			{
 				/* release a savepoint */
-				Assert(obj->offset != -1);
-				SET_OPVAL(target.offset, obj->offset);
 				EMIT_OPCODE(RELEASE_SUBTRANSACTION, -1);
 			}
 			cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
@@ -2120,7 +2116,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 	int old_th_addr = cstate->stack.th_addr;
 	int local_th_addr = 0;
 
-	should_insert_subtransaction = parent != NULL && parent->typ == PLPSM_STMT_COMPOUND_STATEMENT && parent->offset != -1;
+	should_insert_subtransaction = parent != NULL && parent->typ == PLPSM_STMT_COMPOUND_STATEMENT && parent->is_atomic;
 
 	if (parent != NULL && parent->typ == PLPSM_STMT_COMPOUND_STATEMENT)
 	{
@@ -2129,6 +2125,10 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 		if (htsize > 0)
 		{
 			cstate->stack.nhtfields += htsize + 1;		/* reserve space for local handlers and stop or parent link*/
+			/* reserve one instr for start transaction */
+			if (parent->stmt && (bool) parent->stmt->option)
+				cstate->stack.nhtfields++;
+
 			reassign_th_addr = true;
 			local_th_addr = cstate->stack.nhtfields - 1;
 		}
@@ -2142,7 +2142,6 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 			stmt->typ != PLPSM_STMT_DECLARE_CURSOR &&
 			stmt->typ != PLPSM_STMT_DECLARE_HANDLER)
 		{
-			SET_OPVAL(target.offset, parent->offset);
 			EMIT_OPCODE(BEGIN_SUBTRANSACTION, stmt->lineno);
 
 			should_insert_subtransaction = false;
@@ -2321,7 +2320,6 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					bool	has_exit_handler = false;
 					Plpsm_stmt *inner_stmt;
 					int16	offset = -1;		/* be compiler quite */
-					int16		resource_owner_offset = -1;		/* be compiler quite */
 
 					/* 
 					 * Store PC when compound statement contains a exit or undo handler.
@@ -2365,28 +2363,16 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 									parser_errposition(stmt->location)));
 
 					obj = new_psm_object_for(stmt, cstate, PC(m));
+					obj->is_atomic = (bool) stmt->option;
 
 					/*
 					 * When compound statement is atomic 
 					 */
 					if ((bool) stmt->option)
 					{
-						/*
-						 * Allocate a space for storing a ResourceOwner pointer
-						 */
-						resource_owner_offset = cstate->stack.ndatums++;
-						if (resource_owner_offset >= cstate->stack.oids.size)
-						{
-							cstate->stack.oids.size += 128;
-							cstate->stack.oids.data = repalloc(cstate->stack.oids.data, cstate->stack.oids.size * sizeof(Oid));
-						}
-
-						cstate->stack.oids.data[resource_owner_offset] = InvalidOid;
 						obj->calls.has_release_call = true;
 					}
 
-					obj->offset = resource_owner_offset;
-					
 					_compile(cstate, stmt->inner_left, obj);
 
 					cstate->stack.has_sqlstate = has_sqlstate;
@@ -2438,10 +2424,6 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					else
 					{
 						/* rollback a savepoint */
-						Assert(parent != NULL);
-						Assert(parent->offset != -1);
-						SET_OPVAL(target.offset, parent->offset);
-						EMIT_OPCODE(ROLLBACK_SUBTRANSACTION, stmt->lineno);
 						_compile(cstate, stmt->inner_left, NULL);
 						/* jmp from compound statement */
 						parent->calls.leave_jmps = lappend(parent->calls.leave_jmps,
@@ -2972,6 +2954,7 @@ compile_ht(CompileState cstate, Plpsm_object *scope, int parent_addr)
 	{
 		Plpsm_object *iterator;
 		bool	with_HT_entry = false;
+		bool	reassign_parent_addr = false;
 
 		/* we should to store a stop or link to parent when we found a some handler */
 		iterator = scope->inner;
@@ -2985,6 +2968,7 @@ compile_ht(CompileState cstate, Plpsm_object *scope, int parent_addr)
 					SET_OPVAL(HT_field.typ, PLPSM_HT_PARENT);
 					SET_OPVAL(HT_field.parent_HT_addr, parent_addr);
 					EMIT_OPCODE(HT, -1);
+					reassign_parent_addr = true;
 				}
 				else
 				{
@@ -2992,10 +2976,21 @@ compile_ht(CompileState cstate, Plpsm_object *scope, int parent_addr)
 					SET_OPVAL(HT_field.typ, PLPSM_HT_STOP);
 					parent_addr = PC(m);
 					EMIT_OPCODE(HT, -1);
+					reassign_parent_addr = true;
 				}
 				break;
 			}
 			iterator = iterator->next;
+		}
+
+		/* release a subtransaction when leave a ATOMIC compound statement */
+		if (scope->stmt && (bool) scope->stmt->option)
+		{
+			if (reassign_parent_addr)
+				parent_addr = PC(m);
+
+			SET_OPVAL(HT_field.typ, PLPSM_HT_RELEASE_SUBTRANSACTION);
+			EMIT_OPCODE(HT, -1);
 		}
 
 		if (with_HT_entry)

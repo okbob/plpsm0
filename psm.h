@@ -184,6 +184,7 @@ typedef struct Plpsm_object
 			char *prepname;
 		} cursor;
 		int16		offset;
+		bool	is_atomic;
 	};
 	struct Plpsm_object *next;
 	struct Plpsm_object *last;
@@ -231,7 +232,6 @@ typedef enum
 	PCODE_LOAD_SP,
 	PCODE_BEGIN_SUBTRANSACTION,
 	PCODE_RELEASE_SUBTRANSACTION,
-	PCODE_ROLLBACK_SUBTRANSACTION,
 	PCODE_HT
 } Plpsm_pcode_type;
 
@@ -259,6 +259,7 @@ typedef enum
 	PLPSM_HT_SQLWARNING,
 	PLPSM_HT_SQLEXCEPTION,
 	PLPSM_HT_PARENT,
+	PLPSM_HT_RELEASE_SUBTRANSACTION, 
 	PLPSM_HT_STOP
 } Plpsm_ht_type;
 

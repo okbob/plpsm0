@@ -41,6 +41,107 @@ typedef DebugInfoData *DebugInfo;
 
 static void plpsm_exec_error_callback(void *arg);
 
+/*
+ * Returns a addr of relevant handler or release all nested transaction and
+ * returns zero.
+ */
+static int
+search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int *ROP, int htnum)
+{
+	int handler_addr;
+
+	if (htnum > 0 && edata->sqlerrcode != ERRCODE_QUERY_CANCELED)
+	{
+		int	ht_addr = mod->code->ht_addr + htnum;
+		Plpsm_pcode *ht_item = &mod->code->code[ht_addr];
+
+		Assert(ht_item->typ == PCODE_HT);
+		while (ht_item->HT_field.typ != PLPSM_HT_STOP)
+		{
+			Plpsm_ht_type typ = ht_item->HT_field.typ;
+
+			if (typ == PLPSM_HT_SQLCODE)
+			{
+				if (ht_item->HT_field.sqlcode == edata->sqlerrcode)
+				{
+					handler_addr = ht_item->HT_field.addr;
+					break;
+				}
+			}
+			else if (typ == PLPSM_HT_SQLCLASS)
+			{
+				if (ht_item->HT_field.sqlclass == ERRCODE_TO_CATEGORY(edata->sqlerrcode))
+				{
+					handler_addr = ht_item->HT_field.addr;
+					break;
+				}
+			}
+			else if (typ == PLPSM_HT_SQLEXCEPTION)
+			{
+				int	eclass = ERRCODE_TO_CATEGORY(edata->sqlerrcode);
+
+				if (eclass != MAKE_SQLSTATE('0','2','0','0','0') &&
+					eclass != MAKE_SQLSTATE('0','1','0','0','0'))
+				{
+					handler_addr = ht_item->HT_field.addr;
+					break;
+				}
+			}
+			else if (typ == PLPSM_HT_SQLWARNING)
+			{
+				int	eclass = ERRCODE_TO_CATEGORY(edata->sqlerrcode);
+
+				if (eclass == MAKE_SQLSTATE('0','2','0','0','0') ||
+					eclass == MAKE_SQLSTATE('0','1','0','0','0'))
+				{
+					handler_addr = ht_item->HT_field.addr;
+					break;
+				}
+			}
+			else if (typ == PLPSM_HT_PARENT)
+			{
+				ht_addr = ht_item->HT_field.parent_HT_addr;
+				ht_item = &mod->code->code[--ht_addr];
+				continue;
+			}
+			else if (typ == PLPSM_HT_RELEASE_SUBTRANSACTION)
+			{
+				RollbackAndReleaseCurrentSubTransaction();
+				CurrentResourceOwner = ROstack[(*ROP)--];
+				SPI_restore_connection();
+			}
+
+			ht_item = &mod->code->code[--ht_addr];
+		}
+
+		/* Release a error data, when we found a good handler */
+		if (handler_addr > 0)
+		{
+			if (ht_item->HT_field.htyp == PLPSM_HANDLER_UNDO)
+			{
+				RollbackAndReleaseCurrentSubTransaction();
+				CurrentResourceOwner = ROstack[(*ROP)--];
+				SPI_restore_connection();
+			}
+
+			//FreeErrorData(edata);
+			return handler_addr;
+		}
+	}
+
+	/*
+	 * We didn't find a handler, so now rollback all handlers
+	 */
+	while (*ROP >= 0)
+	{
+		/* rollback all nested transaction */
+		RollbackAndReleaseCurrentSubTransaction();
+		CurrentResourceOwner = ROstack[(*ROP)--];
+		SPI_restore_connection();
+	}
+	return 0;
+}
+
 static Datum
 execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 {
@@ -53,6 +154,8 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	Datum		result = (Datum) 0;
 	bool		isnull;
 	int				CallStack[1024];
+	ResourceOwner			ResourceOwnerStack[1024];
+	int		ROP = -1;
 	int	sqlstate = 0;
 	Bitmapset	*acursors = NULL;		/* active cursors */
 	int	rc;
@@ -64,6 +167,8 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	MemoryContext	exec_ctx;
 	MemoryContext	oldctx;
 	MemoryContext	func_cxt = mod->cxt;
+
+	bool		rollback_nested_transactions = false;
 
 	DataPtrs = mod->DataPtrs;
 
@@ -109,11 +214,13 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	{
 		Plpsm_pcode *pcode;
 next_op:
+
 /*
  dinfo->is_signal = true;
  elog(NOTICE, "PC %d", PC); 
  dinfo->is_signal = false;
 */
+
 		if (PC == 0)
 			elog(ERROR, "invalid memory reference");
 
@@ -202,29 +309,56 @@ next_op:
 						clean_result = false;
 					}
 
-					if (plan == NULL)
-					{
-						plan =  SPI_prepare(pcode->expr.expr, pcode->expr.nparams, pcode->expr.typoids);
-						if (plan == NULL)
-							elog(ERROR, "query \"%s\" cannot be prepared", pcode->expr.expr);
+					oldctx = CurrentMemoryContext;
 
-						oldctx = MemoryContextSwitchTo(func_cxt);
-						DataPtrs[pcode->expr.data] = SPI_saveplan(plan);
+					PG_TRY();
+					{
+						if (plan == NULL)
+						{
+							plan =  SPI_prepare(pcode->expr.expr, pcode->expr.nparams, pcode->expr.typoids);
+							if (plan == NULL)
+								elog(ERROR, "query \"%s\" cannot be prepared", pcode->expr.expr);
+
+							oldctx = MemoryContextSwitchTo(func_cxt);
+							DataPtrs[pcode->expr.data] = SPI_saveplan(plan);
+							MemoryContextSwitchTo(oldctx);
+						}
+
+						oldctx = MemoryContextSwitchTo(exec_ctx);
+						rc = SPI_execute_plan(plan, values, nulls, is_read_only, 2);
 						MemoryContextSwitchTo(oldctx);
 					}
+					PG_CATCH();
+					{
+						ErrorData *edata;
+						int		handler_addr;
+						
+						MemoryContextSwitchTo(oldctx);
+						edata = CopyErrorData();
+						FlushErrorState();
 
-					oldctx = MemoryContextSwitchTo(exec_ctx);
-					rc = SPI_execute_plan(plan, values, nulls, is_read_only, 2);
+						rollback_nested_transactions = true;
+
+						handler_addr = search_handler(mod, edata, ResourceOwnerStack, &ROP, pcode->htnum);
+						if (handler_addr > 0)
+						{
+							/* go to handler */
+							rollback_nested_transactions = false;
+							PC = handler_addr;
+							goto next_op;
+						}
+						else
+							ReThrowError(edata);
+					}
+					PG_END_TRY();
+
 					MemoryContextSwitchTo(oldctx);
 
-					if (rc != SPI_OK_SELECT)
-						elog(ERROR, "SPI_execute failed executing query \"%s\" : %s",
-									pcode->expr.expr, SPI_result_code_string(rc));
 					clean_result = true;
 
 					/* check if returned expression is only one value */
 					if (SPI_tuptable->tupdesc->natts != 1 && !pcode->expr.is_multicol)
-						elog(ERROR, "query returned %d column", 
+						elog(ERROR, "EEEEquery returned %d column", 
 										SPI_tuptable->tupdesc->natts);
 
 					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
@@ -519,9 +653,11 @@ next_op:
 			case PCODE_BEGIN_SUBTRANSACTION:
 				{
 					MemoryContext	oldcontext = CurrentMemoryContext;
-					int offset = pcode->target.offset;
 
-					values[offset] = PointerGetDatum(CurrentResourceOwner);
+					if (++ROP >= 1024)
+						elog(ERROR, "too much nested transactions");
+
+					ResourceOwnerStack[ROP] = CurrentResourceOwner;
 					BeginInternalSubTransaction(NULL);
 
 					MemoryContextSwitchTo(oldcontext);
@@ -532,24 +668,16 @@ next_op:
 			case PCODE_RELEASE_SUBTRANSACTION:
 				{
 					MemoryContext	oldcontext = CurrentMemoryContext;
-					int offset = pcode->target.offset;
 
-					ReleaseCurrentSubTransaction();
-					MemoryContextSwitchTo(oldcontext);
-					CurrentResourceOwner = (ResourceOwner) DatumGetPointer(values[offset]);
-					SPI_restore_connection();
-					break;
-				}
-
-			case PCODE_ROLLBACK_SUBTRANSACTION:
-				{
-					MemoryContext	oldcontext = CurrentMemoryContext;
-					int offset = pcode->target.offset;
-
-					RollbackAndReleaseCurrentSubTransaction();
+					if (ROP == -1)
+						elog(NOTICE, "there are no active subtransaction");
+					if (rollback_nested_transactions)
+						RollbackAndReleaseCurrentSubTransaction();
+					else
+						ReleaseCurrentSubTransaction();
 
 					MemoryContextSwitchTo(oldcontext);
-					CurrentResourceOwner = (ResourceOwner) DatumGetPointer(values[offset]);
+					CurrentResourceOwner = ResourceOwnerStack[ROP--];
 					SPI_restore_connection();
 					break;
 				}
@@ -927,6 +1055,20 @@ next_op:
 		elog(ERROR, "invalid memory reference");
 
 leave_process:
+
+	/* 
+	 * we should to release a allocated resources. The most important
+	 * is correct finishing a nested transactions.
+	 */
+	while (ROP >= 0)
+	{
+		if (rollback_nested_transactions)
+			RollbackAndReleaseCurrentSubTransaction();
+		else
+			ReleaseCurrentSubTransaction();
+
+		CurrentResourceOwner = ResourceOwnerStack[ROP--];
+	}
 
 	fcinfo->isnull = isnull;
 	MemoryContextDelete(exec_ctx);

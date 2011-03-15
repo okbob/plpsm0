@@ -1237,6 +1237,18 @@ begin atomic
 end;
 $$ language psm0;
 
+create or replace function test63(a int, out result integer) as $$
+begin atomic
+  declare undo handler for sqlexception
+    set result = -1;
+  set result = 10 / a;
+  set result = result + 2;
+end;
+$$ language psm0;
+
+  
+
+
 /*************************************************
  * Assert functions - sure, it is in plgsql :)
  */
@@ -1382,6 +1394,8 @@ begin
   perform assert('test61', 30, test61(10));
   perform assert('test61_a', 10, test61(100));
   perform assert('test61_a', 30, test61(10));
+  perform assert('test63', 3, test63(10));
+  perform assert('test63',-1, test63(0));
 
   raise notice '******* All tests are ok *******';
 end;
