@@ -68,7 +68,8 @@ typedef enum
 	PLPSM_STMT_IF,
 	PLPSM_STMT_CASE,
 	PLPSM_STMT_SQL,
-	PLPSM_STMT_SELECT_INTO
+	PLPSM_STMT_SELECT_INTO,
+	PLPSM_STMT_SIGNAL
 } Plpsm_stmt_type;
 
 typedef enum
@@ -101,6 +102,20 @@ typedef struct
 	bool	typbyval;
 	int16	typlen;
 } Plpsm_type_descriptor;
+
+typedef enum
+{
+	PLPSM_SINFO_DETAIL,
+	PLPSM_SINFO_HINT,
+	PLPSM_SINFO_MESSAGE
+} Plpsm_signal_info_item_type;
+
+typedef struct Plpsm_signal_info
+{
+	Plpsm_signal_info_item_type	typ;
+	char	*value;
+	struct Plpsm_signal_info *next;
+} Plpsm_signal_info;
 
 typedef enum
 {
