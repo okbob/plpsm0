@@ -1253,6 +1253,23 @@ list(Plpsm_pcode_module *m)
 			case PCODE_RELEASE_SUBTRANSACTION:
 				appendStringInfo(&ds, "ReleaseSubtransaction");
 				break;
+			case PCODE_SIGNAL_JMP:
+				appendStringInfo(&ds, "Signal Jmp %s %d detail:%s, hint: %s, message: %s",
+												    unpack_sql_state(VALUE(signal_params.sqlcode)),
+												    VALUE(signal_params.addr),
+												    VALUE(signal_params.detail) ? VALUE(signal_params.detail) : "",
+												    VALUE(signal_params.hint) ? VALUE(signal_params.hint) : "",
+												    VALUE(signal_params.message) ? VALUE(signal_params.message) : "");
+				break;
+			case PCODE_SIGNAL_CALL:
+				appendStringInfo(&ds, "Signal Call %s %d detail:%s, hint: %s, message: %s",
+												    unpack_sql_state(VALUE(signal_params.sqlcode)),
+												    VALUE(signal_params.addr),
+												    VALUE(signal_params.detail) ? VALUE(signal_params.detail) : "",
+												    VALUE(signal_params.hint) ? VALUE(signal_params.hint) : "",
+												    VALUE(signal_params.message) ? VALUE(signal_params.message) : "");
+				break;
+
 			case PCODE_HT:
 				{
 					appendStringInfoString(&ds, "HT ");
@@ -1317,6 +1334,8 @@ list(Plpsm_pcode_module *m)
 			case PCODE_PREPARE:
 			case PCODE_PARAMBUILDER:
 			case PCODE_EXECUTE:
+			case PCODE_SIGNAL_JMP:
+			case PCODE_SIGNAL_CALL:
 				appendStringInfo(&ds, ", HT[%d]", VALUE(htnum));
 			}
 		}
@@ -2094,6 +2113,59 @@ ht_size(Plpsm_stmt *stmt)
 		iterator = iterator->next;
 	}
 	return result;
+}
+
+/*
+ * compile a signal statement
+ */
+static void
+compile_signal(CompileState cstate, Plpsm_stmt *stmt, int addr, Plpsm_pcode_type typ, bool is_undo_handler)
+{
+	Plpsm_signal_info *sinfo = (Plpsm_signal_info *) stmt->data;
+	Plpsm_pcode_module *m = cstate->module;
+	int	eclass = ERRCODE_TO_CATEGORY(stmt->option);
+
+
+	SET_OPVAL(signal_params.addr, addr);
+	SET_OPVAL(signal_params.is_undo_handler, is_undo_handler);
+
+	SET_OPVAL(signal_params.sqlcode, stmt->option);
+	/* 
+	 * SQL/PSM doesn't know a levels in PL/pgSQL semantic. We must to deduce
+	 * level from sql state.
+	 */
+	if (eclass == MAKE_SQLSTATE('0','0','0','0','0'))
+		SET_OPVAL(signal_params.level, NOTICE);
+	if (eclass == MAKE_SQLSTATE('0','2','0','0','0') || eclass != MAKE_SQLSTATE('0','1','0','0','0'))
+		SET_OPVAL(signal_params.level, WARNING);
+	else
+		SET_OPVAL(signal_params.level, ERROR);
+
+	SET_OPVAL(signal_params.sqlcode, stmt->option);
+	while (sinfo != NULL)
+	{
+		switch (sinfo->typ)
+		{
+			case PLPSM_SINFO_DETAIL:
+				SET_OPVAL(signal_params.detail, pstrdup(sinfo->value));
+				break;
+			case PLPSM_SINFO_HINT:
+				SET_OPVAL(signal_params.hint, pstrdup(sinfo->value));
+				break;
+			case PLPSM_SINFO_MESSAGE:
+				SET_OPVAL(signal_params.message, pstrdup(sinfo->value));
+				break;
+		}
+		sinfo = sinfo->next;
+	}
+
+	if (typ == PCODE_SIGNAL_JMP)
+		EMIT_OPCODE(SIGNAL_JMP, stmt->lineno);
+	else 
+	{
+		Assert(typ == PCODE_SIGNAL_CALL);
+		EMIT_OPCODE(SIGNAL_CALL, stmt->lineno);
+	}
 }
 
 /*
@@ -2920,6 +2992,39 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					SET_OPVAL(prepare.name, stmt->name);
 					SET_OPVAL(prepare.data, prepnum);
 					EMIT_OPCODE(PREPARE, stmt->lineno);
+				}
+				break;
+
+			case PLPSM_STMT_SIGNAL:
+				{
+					Plpsm_object *handler;
+					Plpsm_condition_value condition;
+
+					condition.typ = PLPSM_SQLSTATE;
+					condition.sqlstate = stmt->option;
+					condition.next = NULL;
+
+					handler = lookup_handler(cstate->current_scope, &condition);
+					if (handler != NULL)
+					{
+						/* when handler is undo or exit, generate a leave steps */
+						if (handler->stmt->option != PLPSM_HANDLER_CONTINUE)
+						{
+							compile_leave_target_block(cstate, cstate->current_scope, handler->outer);
+							compile_signal(cstate, stmt, handler->calls.entry_addr, PCODE_SIGNAL_JMP,
+								handler->stmt->option == PLPSM_HANDLER_UNDO);
+						}
+						else
+						{
+							compile_signal(cstate, stmt, handler->calls.entry_addr, PCODE_SIGNAL_CALL,
+								handler->stmt->option == PLPSM_HANDLER_UNDO);
+						}
+					}
+					else
+					{
+						/* there are no local handler */
+						compile_signal(cstate, stmt, 0, PCODE_SIGNAL_JMP, false);
+					}
 				}
 				break;
 

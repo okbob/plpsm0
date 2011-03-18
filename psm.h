@@ -247,7 +247,9 @@ typedef enum
 	PCODE_LOAD_SP,
 	PCODE_BEGIN_SUBTRANSACTION,
 	PCODE_RELEASE_SUBTRANSACTION,
-	PCODE_HT
+	PCODE_HT,
+	PCODE_SIGNAL_JMP,
+	PCODE_SIGNAL_CALL
 } Plpsm_pcode_type;
 
 typedef enum
@@ -391,6 +393,16 @@ typedef struct
 			};
 			int addr;
 		} HT_field;
+		struct
+		{
+			int		addr;
+			bool		is_undo_handler;
+			int	level;
+			int	sqlcode;
+			char	*detail;
+			char	*hint;
+			char	*message;
+		} signal_params;
 		int	size;
 		int16	ncolumns;
 		int	lineno;

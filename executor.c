@@ -1043,6 +1043,48 @@ next_op:
 				}
 				break;
 
+			case PCODE_SIGNAL_CALL:
+			case PCODE_SIGNAL_JMP:
+				{
+					if (pcode->signal_params.addr != 0)
+					{
+						if (pcode->signal_params.is_undo_handler)
+						{
+							MemoryContext	oldcontext = CurrentMemoryContext;
+
+							RollbackAndReleaseCurrentSubTransaction();
+							MemoryContextSwitchTo(oldcontext);
+							CurrentResourceOwner = ResourceOwnerStack[ROP--];
+							SPI_restore_connection();
+						}
+
+						if (pcode->typ == PCODE_SIGNAL_JMP)
+						{
+							PC = pcode->addr;
+							goto next_op;
+						}
+						else
+						{
+							if (SP == 1024)
+								elog(ERROR, "runtime error, stack is full");
+							CallStack[SP++] = PC + 1;
+							PC = pcode->addr;
+							goto next_op;
+						}
+					}
+					else
+					{
+						/* raise a outer exception */
+
+						ereport(pcode->signal_params.level,
+								( errcode(pcode->signal_params.sqlcode),
+								 errmsg_internal("%s", pcode->signal_params.message != NULL ? 
+												pcode->signal_params.message : ""),
+								 (pcode->signal_params.detail != NULL) ? errdetail("%s", pcode->signal_params.detail) : 0,
+								 (pcode->signal_params.hint != NULL) ? errhint("%s", pcode->signal_params.hint) : 0));
+					}
+				}
+				break;
 
 			default:
 				elog(ERROR, "unknown pcode %d %d", pcode->typ, PC);

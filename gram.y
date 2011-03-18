@@ -84,6 +84,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 		Plpsm_ESQL			*esql;
 		Plpsm_positioned_qualid		*qualid;
 		Plpsm_condition_value		*condition;
+		Plpsm_signal_info		*sinfo;
 		Node		*node;
 }
 
@@ -105,9 +106,10 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %type <stmt>	stmt_open stmt_fetch stmt_close stmt_for for_prefetch
 %type <stmt>	stmt_case case_when_list case_when opt_case_else
 %type <esql>	opt_expr_until_when expr_until_semi_or_coma_or_parent
-%type <stmt>	stmt_sql stmt_select_into
+%type <stmt>	stmt_sql stmt_select_into stmt_signal
 %type <ival>	sqlstate
 %type <boolean>		opt_atomic
+%type <sinfo>	signal_info signal_info_item
 
 /*
  * Basic non-keyword token types.  These are hard-wired into the core lexer.
@@ -137,6 +139,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %token <keyword>	CURSOR
 %token <keyword>	DECLARE
 %token <keyword>	DEFAULT
+%token <keyword>	DETAIL
 %token <keyword>	DO
 %token <keyword>	ELSE
 %token <keyword>	ELSEIF
@@ -148,12 +151,14 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %token <keyword>	FOUND
 %token <keyword>	FROM
 %token <keyword>	HANDLER
+%token <keyword>	HINT
 %token <keyword>	IF
 %token <keyword>	IMMEDIATE
 %token <keyword>	INTO
 %token <keyword>	ITERATE
 %token <keyword>	LEAVE
 %token <keyword>	LOOP
+%token <keyword>	MESSAGE
 %token <keyword>	NO
 %token <keyword>	NOT
 %token <keyword>	OPEN
@@ -164,6 +169,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %token <keyword>	SCROLL
 %token <keyword>	SELECT
 %token <keyword>	SET
+%token <keyword>	SIGNAL
 %token <keyword>	SQLEXCEPTION
 %token <keyword>	SQLSTATE
 %token <keyword>	SQLCODE
@@ -244,6 +250,7 @@ stmt:
 			| stmt_case				{ $$ = $1; }
 			| stmt_sql				{ $$ = $1; }
 			| stmt_select_into			{ $$ = $1; }
+			| stmt_signal				{ $$ = $1; }
 		;
 
 /*----
@@ -496,7 +503,8 @@ condition:
 				}
 		;
 
-sqlstate:		SCONST
+sqlstate:
+			SCONST
 				{
 					char   *sqlstatestr;
 
@@ -528,7 +536,8 @@ opt_value:
  *
  * IF ... THEN  ELSIF ... THEN ... ELSE ... END IF
  */
-stmt_if:		IF expr_until_then statements ';' stmt_else END IF
+stmt_if:
+			IF expr_until_then statements ';' stmt_else END IF
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_IF, @1);
 					new->esql = $2;
@@ -562,7 +571,8 @@ stmt_else:
  * CASE expr WHEN x [, ...] THEN ... [ ELSE ... ] END CASE
  * CASE WHEN expr THEN .. ... [ ELSE ...] END CASE
  */
-stmt_case: 		CASE opt_expr_until_when case_when_list opt_case_else END CASE
+stmt_case:
+			CASE opt_expr_until_when case_when_list opt_case_else END CASE
 					{
 						Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_CASE, @1);
 						new->esql = $2;
@@ -584,7 +594,8 @@ case_when_list:
 				}
 		;
 
-case_when:		WHEN expr_until_then statements ';'
+case_when:
+			WHEN expr_until_then statements ';'
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_CASE, @1);
 					new->esql = $2;
@@ -701,7 +712,8 @@ qual_identif:
  *
  * note: this is only PostgreSQL feature
  */
-stmt_print:		PRINT expr_list
+stmt_print:
+			PRINT expr_list
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_PRINT, @1);
 					new->esql_list = $2;
@@ -739,7 +751,8 @@ stmt_return:
  * [ label: ] LOOP statements; END LOOP [ label ]
  *
  */
-stmt_loop:		opt_label LOOP statements ';' END LOOP opt_end_label
+stmt_loop:
+			opt_label LOOP statements ';' END LOOP opt_end_label
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_LOOP, $1 ? @1 : @2);
 					new->name = $1;
@@ -755,7 +768,8 @@ stmt_loop:		opt_label LOOP statements ';' END LOOP opt_end_label
  * [ label: ] WHILE expr DO statements; END WHILE [ label ]
  *
  */
-stmt_while:		opt_label WHILE expr_until_do statements ';' END WHILE opt_end_label
+stmt_while:
+			opt_label WHILE expr_until_do statements ';' END WHILE opt_end_label
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_WHILE, $1 ? @1 : @2);
 					new->name = $1;
@@ -772,7 +786,8 @@ stmt_while:		opt_label WHILE expr_until_do statements ';' END WHILE opt_end_labe
  * [ label: ] REPEAT statements; UNTIL expr END REPEAT [ label ]
  *
  */
-stmt_repeat_until:	opt_label REPEAT statements ';' UNTIL expr_until_end REPEAT opt_end_label
+stmt_repeat_until:
+		opt_label REPEAT statements ';' UNTIL expr_until_end REPEAT opt_end_label
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_REPEAT_UNTIL, $1 ? @1 : @2);
 					new->name = $1;
@@ -789,7 +804,8 @@ stmt_repeat_until:	opt_label REPEAT statements ';' UNTIL expr_until_end REPEAT o
  * ITERATE label
  *
  */
-stmt_iterate:		ITERATE WORD
+stmt_iterate:
+			ITERATE WORD
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_ITERATE, @1);
 					new->name = $2.ident;
@@ -804,7 +820,8 @@ stmt_iterate:		ITERATE WORD
  *
  * note: LEAVE can be used inside compound statement too
  */
-stmt_leave:		LEAVE WORD
+stmt_leave:
+			LEAVE WORD
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_LEAVE, @1);
 					new->name = $2.ident;
@@ -812,6 +829,91 @@ stmt_leave:		LEAVE WORD
 				}
 		;
 
+/*----
+ *
+ * SIGNAL SQLSTATE [ VALUE ] sqlstate [ SET name = 'value [, .. 
+ *
+ * note: raise a exception
+ */
+stmt_signal:
+			SIGNAL SQLSTATE opt_value sqlstate 
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SIGNAL, @1);
+					new->option = $4;
+					$$ = new;
+				}
+			| SIGNAL WORD
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SIGNAL, @1);
+					new->name = $2.ident;
+					$$ = new;
+				}
+			| SIGNAL SQLSTATE opt_value sqlstate SET signal_info
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SIGNAL, @1);
+					new->option = $4;
+					new->data = $6;
+					$$ = new;
+				}
+			| SIGNAL WORD SET signal_info
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SIGNAL, @1);
+					new->name = $2.ident;
+					new->data = $4;
+					$$ = new;
+				}
+		;
+
+signal_info:
+			signal_info_item
+				{
+					$1->next = NULL;
+					$$ = $1;
+				}
+			| signal_info ',' signal_info_item
+				{
+					Plpsm_signal_info *iterator = $1;
+
+					/* check unique type in list */
+					while (iterator != NULL)
+					{
+						if (iterator->typ == $3->typ)
+							yyerror("syntax error, signal info name isn't unique");
+						if (iterator->next == NULL)
+						{
+							iterator->next = $3;
+							break;
+						}
+
+						iterator = iterator->next;
+					}
+					$$ = $1;
+				}
+		;
+
+signal_info_item:
+			DETAIL '=' SCONST
+				{
+					Plpsm_signal_info *new = palloc(sizeof(Plpsm_signal_info));
+					new->typ = PLPSM_SINFO_DETAIL;
+					new->value = $3;
+					$$ = new;
+				}
+			| HINT '=' SCONST
+				{
+					Plpsm_signal_info *new = palloc(sizeof(Plpsm_signal_info));
+					new->typ = PLPSM_SINFO_HINT;
+					new->value = $3;
+					$$ = new;
+				}
+			| MESSAGE '=' SCONST
+				{
+					Plpsm_signal_info *new = palloc(sizeof(Plpsm_signal_info));
+					new->typ = PLPSM_SINFO_MESSAGE;
+					new->value = $3;
+					$$ = new;
+				}
+		;
 
 /*----
  * create a prepare statement
@@ -910,7 +1012,8 @@ stmt_open:
  * FETCH cursor_name INTO variable [, variable [..] ]
  *
  */
-stmt_fetch:		FETCH qual_identif INTO qual_identif_list
+stmt_fetch:
+			FETCH qual_identif INTO qual_identif_list
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_FETCH, @1);
 					new->target = $2;
@@ -926,7 +1029,8 @@ stmt_fetch:		FETCH qual_identif INTO qual_identif_list
  * CLOSE cursor_name
  *
  */
-stmt_close:		CLOSE qual_identif
+stmt_close:
+			CLOSE qual_identif
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_CLOSE, @1);
 					new->target = $2;
@@ -1478,9 +1582,12 @@ is_unreserved_keyword(int tok)
 		case ATOMIC:
 		case AS:
 		case CONTINUE:
+		case DETAIL:
 		case EXIT:
 		case FOUND:
+		case HINT:
 		case IMMEDIATE:
+		case MESSAGE:
 		case NO:
 		case NOT:
 		case SCROLL:
@@ -1570,6 +1677,8 @@ parser_stmt_name(Plpsm_stmt_type typ)
 			return "if statement";
 		case PLPSM_STMT_CASE:
 			return "case statement";
+		case PLPSM_STMT_SIGNAL:
+			return "signal statement";
 		default:
 			return "unknown statment typid";
 	}
@@ -1675,7 +1784,10 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 	appendStringInfo(ds, "%s| Variables: ", ident);
 	pqualid_list_out(ds, stmt->variables);
 	appendStringInfoChar(ds, '\n');
-	appendStringInfo(ds, "%s| Option: %d\n", ident, stmt->option);
+	if (stmt->typ == PLPSM_STMT_SIGNAL)
+		appendStringInfo(ds, "%s| Option: %s\n", ident, unpack_sql_state(stmt->option));
+	else
+		appendStringInfo(ds, "%s| Option: %d\n", ident, stmt->option);
 	appendStringInfo(ds, "%s| ESQL: ", ident);
 	esql_out(ds, stmt->esql);
 	appendStringInfoChar(ds, '\n');
@@ -1717,6 +1829,32 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 					condition = condition->next;
 				}
 				appendStringInfoChar(ds, '\n');
+				break;
+			}
+		case PLPSM_STMT_SIGNAL:
+			{
+				Plpsm_signal_info *sinfo = (Plpsm_signal_info *) stmt->data;
+				if (sinfo != NULL)
+				{
+					appendStringInfo(ds, "%s| info:", ident);
+					while (sinfo != NULL)
+					{
+						switch (sinfo->typ)
+						{
+							case PLPSM_SINFO_DETAIL:
+								appendStringInfo(ds, " DETAIL=\"%s\"", sinfo->value);
+								break;
+							case PLPSM_SINFO_HINT:
+								appendStringInfo(ds, " HINT=\"%s\"", sinfo->value);
+								break;
+							case PLPSM_SINFO_MESSAGE:
+								appendStringInfo(ds, " MESSAGE=\"%s\"", sinfo->value);
+								break;
+						}
+						sinfo = sinfo->next;
+					}
+					appendStringInfoChar(ds, '\n');
+				}
 				break;
 			}
 		default:
@@ -1837,6 +1975,7 @@ read_embeded_sql(int until1,
 			case PRINT:
 			case REPEAT:
 			case RETURN:
+			case SIGNAL:
 			case WHILE:
 			case UNTIL:
 				yyerror("using not allowed PLPSM keyword");
