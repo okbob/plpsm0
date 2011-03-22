@@ -1246,7 +1246,220 @@ begin atomic
 end;
 $$ language psm0;
 
-  
+create or replace function test63_1(a int, out result integer) as $$
+begin atomic
+  declare undo handler for sqlstate '22012'
+    set result = -1;
+  declare undo handler for sqlexception
+    set result = -2;
+  set result = 10 / a;
+  set result = result + 2;
+end;
+$$ language psm0;
+
+create or replace function test63_2(a int, out result integer) as $$
+begin atomic
+  declare undo handler for sqlexception
+    set result = -2;
+  declare undo handler for sqlstate '22012'
+    set result = -1;
+  set result = 100000 / a;
+  set result = result + 2;
+end;
+$$ language psm0;
+
+create or replace function test63_3(a int, out result integer) as $$
+begin atomic
+  declare undo handler for sqlexception
+    set result = -2;
+  declare undo handler for sqlstate '22012'
+    set result = -1;
+  set result = 100000 * a;
+  set result = result + 2;
+end;
+$$ language psm0;
+
+create or replace function test63_4(a int, out result integer) as $$
+begin atomic
+  declare undo handler for sqlstate '22012'
+    set result = -1;
+  declare undo handler for sqlexception
+    set result = -2;
+  set result = 100000 * a;
+  set result = result + 2;
+end;
+$$ language psm0;
+
+create or replace function test64()
+returns int as $$
+begin
+  signal sqlstate '00001';
+  return 1;
+end;
+$$ language psm0;
+
+create or replace function test64_1()
+returns int as $$
+begin
+  signal sqlstate '02001';
+  return 1;
+end;
+$$ language psm0;
+
+create or replace function test64_2(out a int) as $$
+begin
+  declare continue handler for sqlstate '02001'
+    set a = a + 1;
+  set a = 10;
+  signal sqlstate '02001';
+  set a = a + 1;
+end;
+$$ language psm0;
+
+create or replace function test64_3(out a int) as $$
+begin
+  declare exit handler for sqlstate '02001'
+    set a = a + 1;
+  set a = 10;
+  signal sqlstate '02001';
+  set a = a + 1;
+end;
+$$ language psm0;
+
+create or replace function test64_33(out a int) as $$
+begin
+  declare exit handler for sqlstate '02001'
+    set a = a + 1;
+  set a = 10;
+  signal sqlstate '02002';
+  signal sqlstate '02001';
+  set a = a + 1;
+end;
+$$ language psm0;
+
+create or replace function test64_4(out a int) as $$
+begin
+  declare exit handler for sqlwarning
+    set a = a * 10;
+  declare exit handler for sqlstate '02001'
+    set a = a + 1;
+  set a = 10;
+  signal sqlstate '02002';
+  signal sqlstate '02001';
+  set a = a + 1;
+end;
+$$ language psm0;
+
+create or replace function test64_5(par int, out a int) as $$
+begin atomic
+  declare undo handler for sqlwarning
+    set a = a * 10;
+  declare exit handler for sqlstate '02001'
+    set a = a + 3;
+  set a = 10;
+  if par = 1 then
+    signal sqlstate '02002';
+  elseif par = 2 then
+    signal sqlstate '02001';
+  end if;
+  set a = a + 1;
+end;
+$$ language psm0;
+
+create or replace function test65(a int, out r int) as $$
+begin
+  set r = 0;
+x: while a > 0 do
+     begin atomic
+       if a = 5 then
+         leave x;
+       end if;
+       set a = a - 1;
+       set r = r + 1;
+     end;
+   end while;
+   set r = r + 1;
+end;
+$$ language psm0;
+
+create or replace function test65_1(a int, out r int) as $$
+begin
+  declare counter int default 10;
+  declare exit handler for sqlstate '02001'
+    set r = r + 100;
+  set r = 0;
+x: while counter > 0 do
+     begin atomic
+       if counter = a then
+         signal sqlstate '02001';
+       end if;
+       set counter = counter - 1;
+       set r = r + 1;
+     end;
+   end while;
+   set r = r + 1;
+end;
+$$ language psm0;
+
+create or replace function test65_2(a int, out r int) as $$
+begin atomic
+  declare counter int default 10;
+  declare undo handler for sqlstate '03001'
+    set r = r + 100;
+  set r = 0;
+x: while counter > 0 do
+     begin atomic
+       if counter = a then
+         signal sqlstate '03001';
+       end if;
+       set counter = counter - 1;
+       set r = r + 1;
+     end;
+   end while;
+   set r = r + 1;
+end;
+$$ language psm0;
+
+create or replace function test65_3(a int, out r int) as $$
+begin atomic
+  declare counter int default 10;
+  declare exit handler for sqlstate '02001'
+  begin
+    print 'catch warning';
+    set r = r + 100;
+    set r = r + 100;
+  end;
+  set r = 0;
+x: while counter > 0 do
+     begin atomic
+       if counter = a then
+         signal sqlstate '02001';
+       end if;
+       set counter = counter - 1;
+       set r = r + 1;
+     end;
+   end while;
+   set r = r + 1;
+end;
+$$ language psm0;
+
+create or replace function test66(a int, out r int) as $$
+begin
+  declare continue handler for sqlstate '01002'
+    set r = r + 1;
+  declare continue handler for sqlstate '01003'
+    set r = r + 2;
+  set r = 0;
+x: while a > 0 do
+     if a % 2 = 0 then
+       signal sqlstate '01002';
+     else
+       signal sqlstate '01003';
+     end if;
+     set a = a - 1;
+   end while;
+end;
+$$ language psm0;
 
 
 /*************************************************
@@ -1396,6 +1609,31 @@ begin
   perform assert('test61_a', 30, test61(10));
   perform assert('test63', 3, test63(10));
   perform assert('test63',-1, test63(0));
+  perform assert('test63_1', 3, test63_1(10));
+  perform assert('test63_2', -1, test63_2(0));
+  perform assert('test63_3', 1000002, test63_3(10));
+  perform assert('test63_4', -2, test63_4(100000));
+  perform assert('test64', 1, test64());
+  perform assert('test64_1', 1, test64_1());
+  perform assert('test64_2', 12, test64_2());
+  perform assert('test64_3', 11, test64_3());
+  perform assert('test64_33', 11, test64_33());
+  perform assert('test64_4', 100, test64_4());
+  perform assert('test64_5', 11, test64_5(0));
+  perform assert('test64_5', 100, test64_5(1));
+  perform assert('test64_5', 13, test64_5(2));
+  perform assert('test65', 6, test65(10));
+  perform assert('test65_1', 11, test65_1(-1));
+  perform assert('test65_1', 105, test65_1(5));
+  perform assert('test65_2', 11, test65_2(-1));
+  perform assert('test65_2', 105, test65_2(5));
+  perform assert('test65_3', 11, test65_3(-1));
+  perform assert('test65_3', 205, test65_3(5));
+  perform assert('test66', 0, test66(0));
+  perform assert('test66', 2, test66(1));
+  perform assert('test66', 3, test66(2));
+  perform assert('test66', 5, test66(3));
+  perform assert('test66', 6, test66(4));
 
   raise notice '******* All tests are ok *******';
 end;

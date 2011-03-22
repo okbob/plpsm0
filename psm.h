@@ -187,8 +187,9 @@ typedef struct Plpsm_object
 		{
 			int	entry_addr;
 			bool	has_release_call;
-			List	*release_calls;
-			List	*leave_jmps;
+			List	*release_calls;			/* call to release part of current compound statement */
+			List	*leave_jmps;			/* jump after compound statement */
+			List	*release_jmps;			/* jump to release part of current compound statement */
 		} calls;
 		struct
 		{

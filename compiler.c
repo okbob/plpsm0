@@ -1254,16 +1254,18 @@ list(Plpsm_pcode_module *m)
 				appendStringInfo(&ds, "ReleaseSubtransaction");
 				break;
 			case PCODE_SIGNAL_JMP:
-				appendStringInfo(&ds, "Signal Jmp %s %d detail:%s, hint: %s, message: %s",
+				appendStringInfo(&ds, "Signal Jmp %s:%d %d detail:%s, hint: %s, message: %s",
 												    unpack_sql_state(VALUE(signal_params.sqlcode)),
+												    VALUE(signal_params.level),
 												    VALUE(signal_params.addr),
 												    VALUE(signal_params.detail) ? VALUE(signal_params.detail) : "",
 												    VALUE(signal_params.hint) ? VALUE(signal_params.hint) : "",
 												    VALUE(signal_params.message) ? VALUE(signal_params.message) : "");
 				break;
 			case PCODE_SIGNAL_CALL:
-				appendStringInfo(&ds, "Signal Call %s %d detail:%s, hint: %s, message: %s",
+				appendStringInfo(&ds, "Signal Call %s:%d %d detail:%s, hint: %s, message: %s",
 												    unpack_sql_state(VALUE(signal_params.sqlcode)),
+												    VALUE(signal_params.level),
 												    VALUE(signal_params.addr),
 												    VALUE(signal_params.detail) ? VALUE(signal_params.detail) : "",
 												    VALUE(signal_params.hint) ? VALUE(signal_params.hint) : "",
@@ -1451,21 +1453,14 @@ compile_leave_target_block(CompileState cstate, Plpsm_object *scope, Plpsm_objec
 	if (scope == NULL)
 		return;
 
-	if (scope->calls.has_release_call)
+	if (scope != target_scope && scope->calls.has_release_call)
 	{
 		scope->calls.release_calls = lappend(scope->calls.release_calls,
 										    makeInteger(PC(m)));
 		EMIT_OPCODE(CALL, -1);
-	}
 
-	if (scope == target_scope)
-	{
-		scope->calls.leave_jmps = lappend(scope->calls.leave_jmps,
-										    makeInteger(PC(m)));
-		EMIT_OPCODE(JMP, -1);
-	}
-	else
 		compile_leave_target_block(cstate, scope->outer, target_scope);
+	}
 }
 
 /*
@@ -1506,9 +1501,9 @@ compile_leave_iterate(CompileState cstate,
 					{
 						if (scope->calls.has_release_call)
 						{
-							scope->calls.release_calls = lappend(scope->calls.release_calls, 
+							scope->calls.release_jmps = lappend(scope->calls.release_jmps, 
 														makeInteger(PC(m)));
-							EMIT_OPCODE(CALL, stmt->lineno);
+							EMIT_OPCODE(JMP, stmt->lineno);
 						}
 						
 						scope->calls.leave_jmps = lappend(scope->calls.leave_jmps,
@@ -1588,17 +1583,26 @@ compile_done(CompileState cstate)
  *
  */
 static Plpsm_object *
-release_psm_object(CompileState cstate, Plpsm_object *obj, int release_entry, int leave_entry)
+release_psm_object(CompileState cstate, Plpsm_object *obj, int release_call_entry, int release_jmp_entry, int leave_entry)
 {
 	Plpsm_pcode_module *m = cstate->module;
 	ListCell	*l;
 
 	if (obj->calls.release_calls)
 	{
-		Assert(release_entry != 0);
+		Assert(release_call_entry != 0);
 		foreach(l, obj->calls.release_calls)
 		{
-			SET_OPVAL_ADDR(intVal(lfirst(l)), addr, release_entry);
+			SET_OPVAL_ADDR(intVal(lfirst(l)), addr, release_call_entry);
+		}
+	}
+
+	if (obj->calls.release_jmps)
+	{
+		//Assert(release_jmp_entry != 0);
+		foreach(l, obj->calls.release_jmps)
+		{
+			SET_OPVAL_ADDR(intVal(lfirst(l)), addr, release_jmp_entry);
 		}
 	}
 
@@ -2027,6 +2031,8 @@ compile_refresh_basic_diagnostic(CompileState cstate)
 				int	addr1 = PC(m);
 				int	addr2;
 
+// ToDo: release first, then call a handler
+
 				EMIT_OPCODE(JMP_NOT_FOUND, -1);
 				addr2 = PC(m);
 				EMIT_OPCODE(JMP, -1);
@@ -2047,19 +2053,20 @@ compile_refresh_basic_diagnostic(CompileState cstate)
 static void
 finalize_block(CompileState cstate, Plpsm_object *obj)
 {
-	int	addr1;
+	int	release_call_entry = 0;
+	int	release_jmp_entry = 0;
+	
 	Plpsm_pcode_module *m = cstate->module;
 
 	if (obj->calls.has_release_call)
 	{
 		if (obj->calls.release_calls != NULL)
 		{
-			int release_addr;
-			/* generate a release block as subrotine */
-			EMIT_CALL(PC(m) + 2, -1);
-			addr1 = PC(m);
+			int addr1 = PC(m);
+
 			EMIT_OPCODE(JMP, -1);
-			release_addr = PC(m);
+
+			release_call_entry = PC(m);
 			compile_release_cursors(cstate);
 			if ((bool) obj->stmt->option)
 			{
@@ -2068,23 +2075,19 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
 			}
 
 			EMIT_OPCODE(RET_SUBR, -1);
-
 			SET_OPVAL_ADDR(addr1, addr, PC(m));
-			cstate->current_scope = release_psm_object(cstate, obj, release_addr, PC(m));
 		}
-		else
-		{
-			compile_release_cursors(cstate);
-			if ((bool) obj->stmt->option)
-			{
-				/* release a savepoint */
-				EMIT_OPCODE(RELEASE_SUBTRANSACTION, -1);
-			}
-			cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
-		}
+
+		release_jmp_entry = PC(m);
+		compile_release_cursors(cstate);
+		if ((bool) obj->stmt->option)
+			/* release a savepoint */
+			EMIT_OPCODE(RELEASE_SUBTRANSACTION, -1);
 	}
 	else
-		cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+		release_jmp_entry = PC(m);
+
+	cstate->current_scope = release_psm_object(cstate, obj, release_call_entry, release_jmp_entry, PC(m));
 }
 
 /*
@@ -2136,7 +2139,7 @@ compile_signal(CompileState cstate, Plpsm_stmt *stmt, int addr, Plpsm_pcode_type
 	 */
 	if (eclass == MAKE_SQLSTATE('0','0','0','0','0'))
 		SET_OPVAL(signal_params.level, NOTICE);
-	if (eclass == MAKE_SQLSTATE('0','2','0','0','0') || eclass != MAKE_SQLSTATE('0','1','0','0','0'))
+	else if (eclass == MAKE_SQLSTATE('0','2','0','0','0') || eclass == MAKE_SQLSTATE('0','1','0','0','0'))
 		SET_OPVAL(signal_params.level, WARNING);
 	else
 		SET_OPVAL(signal_params.level, ERROR);
@@ -2235,7 +2238,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					addr1 = PC(m);
 					_compile(cstate, stmt->inner_left, NULL);
 					EMIT_JMP(addr1, stmt->lineno);
-					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+					cstate->current_scope = release_psm_object(cstate, obj, 0, 0, PC(m));
 				}
 				break;
 
@@ -2249,7 +2252,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					_compile(cstate, stmt->inner_left, NULL);
 					EMIT_JMP(addr1, stmt->lineno);
 					SET_OPVAL_ADDR(addr2, addr, PC(m));
-					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+					cstate->current_scope = release_psm_object(cstate, obj, 0, 0, PC(m));
 				}
 				break;
 
@@ -2261,7 +2264,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
 					SET_OPVAL(addr, addr1);
 					EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
-					cstate->current_scope = release_psm_object(cstate, obj, 0, PC(m));
+					cstate->current_scope = release_psm_object(cstate, obj, 0, 0, PC(m));
 				}
 				break;
 
@@ -2464,9 +2467,6 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 
 			case PLPSM_STMT_DECLARE_HANDLER:
 				{
-					/*
-					 * In this moment, only continue not found handlers are supported
-					 */
 					bool	isnotfound = false;
 
 					addr1 = PC(m);
@@ -2488,14 +2488,31 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					 * to first next statement after current compound 
 					 * statement.
 					 */
-					if (stmt->option != PLPSM_HANDLER_UNDO)
+					if (stmt->option == PLPSM_HANDLER_CONTINUE)
 					{
 						_compile(cstate, stmt->inner_left, NULL);
 						EMIT_OPCODE(RET_SUBR, stmt->lineno);
 					}
+					else if (stmt->option == PLPSM_HANDLER_EXIT)
+					{
+						/*
+						 * when parent is ATOMIC, then we have to release a
+						 * current block. We can do it via jump to last
+						 * statement of current compound statement, that is
+						 * RELEASE stmt.
+						 */
+						_compile(cstate, stmt->inner_left, NULL);
+						parent->calls.release_jmps = lappend(parent->calls.release_jmps,
+														makeInteger(PC(m)));
+						EMIT_OPCODE(JMP, stmt->lineno);
+					}
 					else
 					{
-						/* rollback a savepoint */
+						Assert(stmt->option == PLPSM_HANDLER_UNDO);
+
+						/* 
+						 * a rollbac is done before we call a handler
+						 */
 						_compile(cstate, stmt->inner_left, NULL);
 						/* jmp from compound statement */
 						parent->calls.leave_jmps = lappend(parent->calls.leave_jmps,

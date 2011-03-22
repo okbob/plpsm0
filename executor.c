@@ -1075,6 +1075,11 @@ next_op:
 					else
 					{
 						/* raise a outer exception */
+						int oldinfo = dinfo->is_signal;
+
+						/* dont append context informations to notices */
+						if (pcode->signal_params.level == NOTICE)
+							dinfo->is_signal = true;
 
 						ereport(pcode->signal_params.level,
 								( errcode(pcode->signal_params.sqlcode),
@@ -1082,6 +1087,7 @@ next_op:
 												pcode->signal_params.message : ""),
 								 (pcode->signal_params.detail != NULL) ? errdetail("%s", pcode->signal_params.detail) : 0,
 								 (pcode->signal_params.hint != NULL) ? errhint("%s", pcode->signal_params.hint) : 0));
+						dinfo->is_signal = oldinfo;
 					}
 				}
 				break;
