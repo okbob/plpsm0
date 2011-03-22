@@ -1461,6 +1461,51 @@ x: while a > 0 do
 end;
 $$ language psm0;
 
+create or replace function test67(a int, out r int) as $$
+begin
+  declare exit handler for sqlwarning
+    set r = r + 5;
+  begin
+    declare exit handler for sqlstate '02002'
+       begin
+         set r = r + 1;
+         signal sqlstate '02002';
+       end;
+    set r = 0;
+    set r = r + 1;
+    if a = 1 then
+      signal sqlstate '02002';
+    elseif a = 2 then
+      signal sqlstate '02003';
+    end if;
+  end;
+  set r = r + 100;
+end;
+$$ language psm0;
+
+create or replace function test67_1(a int, out r int) as $$
+begin atomic
+  declare undo handler for sqlexception
+    set r = r + 5;
+  begin atomic
+    declare undo handler for sqlstate '03002'
+       begin
+         set r = r + 1;
+         signal sqlstate '03002';
+       end;
+    set r = 0;
+    set r = r + 1;
+    if a = 1 then
+      signal sqlstate '03002';
+    elseif a = 2 then
+      signal sqlstate '03003';
+    end if;
+  end;
+  set r = r + 100;
+end;
+$$ language psm0;
+
+
 
 /*************************************************
  * Assert functions - sure, it is in plgsql :)
@@ -1634,6 +1679,14 @@ begin
   perform assert('test66', 3, test66(2));
   perform assert('test66', 5, test66(3));
   perform assert('test66', 6, test66(4));
+  perform assert('test67', 7, test67(1));
+  perform assert('test67', 6, test67(2));
+  perform assert('test67', 101, test67(3));
+  perform assert('test67_1', 7, test67_1(1));
+  perform assert('test67_1', 6, test67_1(2));
+  perform assert('test67_1', 101, test67_1(3));
+
+  
 
   raise notice '******* All tests are ok *******';
 end;
