@@ -1505,6 +1505,77 @@ begin atomic
 end;
 $$ language psm0;
 
+-- handler cannot be called recursive
+create or replace function test68(out r int) as $$
+  begin atomic
+    declare undo handler for sqlexception
+      begin
+        print 'handler 0';
+        set r = r + 100;
+      end;
+    begin atomic
+      declare undo handler for sqlstate '03002'
+      begin atomic
+        declare undo handler for sqlstate '03002'
+          begin
+            print 'nested handler';
+            -- resignal 
+            set r = r + 1;
+            signal sqlstate '03003';
+          end;
+        print 'handler 1';
+        set r = r + 1;
+        signal sqlstate '03002';
+      end;
+      print 'nested block';
+      set r = 0;
+      signal sqlstate '03002';
+    end;
+  end;
+$$ language psm0;
+
+-- handlers doesn't process a signals from same
+-- compound statement handler's body. It protection
+-- again to cross recursive calls.
+create or replace function test68_1(out r int) as $$
+  begin
+    declare continue handler for sqlstate '01001'
+      begin
+        print 'handler 0';
+        set r = r + 100;
+      end;
+    begin atomic
+      declare continue handler for sqlstate '01001'
+        begin
+          -- must not be called
+          print 'same compound statement handler';
+          set r = r + 50;
+        end;
+      declare undo handler for sqlstate '03002'
+      begin atomic
+        declare undo handler for sqlstate '03002'
+          begin
+            print 'nested handler';
+            -- resignal 
+            set r = r + 1;
+            /*
+             * This signal isn't handled by some nested handler
+             * so we have to search out of current compound
+             * statement - and there is "handler 0"
+             */
+            signal sqlstate '01001';
+            set r = r + 1;
+          end;
+        print 'handler 1';
+        set r = r + 1;
+        signal sqlstate '03002';
+      end;
+      print 'nested block';
+      set r = 0;
+      signal sqlstate '03002';
+    end;
+  end;
+$$ language psm0;
 
 
 /*************************************************
@@ -1685,6 +1756,8 @@ begin
   perform assert('test67_1', 7, test67_1(1));
   perform assert('test67_1', 6, test67_1(2));
   perform assert('test67_1', 101, test67_1(3));
+  perform assert('test68', 102, test68());
+  perform assert('test68_1', 103, test68_1());
 
   
 
