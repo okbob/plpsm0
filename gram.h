@@ -80,33 +80,34 @@
      ITERATE = 297,
      LEAVE = 298,
      LOOP = 299,
-     MESSAGE = 300,
+     MESSAGE_TEXT = 300,
      NO = 301,
      NOT = 302,
      OPEN = 303,
      PREPARE = 304,
      PRINT = 305,
      REPEAT = 306,
-     RETURN = 307,
-     SCROLL = 308,
-     SELECT = 309,
-     SET = 310,
-     SIGNAL = 311,
-     SQLEXCEPTION = 312,
-     SQLSTATE = 313,
-     SQLCODE = 314,
-     SQLWARNING = 315,
-     THEN = 316,
-     UNDO = 317,
-     UNTIL = 318,
-     USING = 319,
-     VALUE = 320,
-     WHEN = 321,
-     WHILE = 322,
-     INSERT = 323,
-     UPDATE = 324,
-     DELETE = 325,
-     TRUNCATE = 326
+     RESIGNAL = 307,
+     RETURN = 308,
+     SCROLL = 309,
+     SELECT = 310,
+     SET = 311,
+     SIGNAL = 312,
+     SQLEXCEPTION = 313,
+     SQLSTATE = 314,
+     SQLCODE = 315,
+     SQLWARNING = 316,
+     THEN = 317,
+     UNDO = 318,
+     UNTIL = 319,
+     USING = 320,
+     VALUE = 321,
+     WHEN = 322,
+     WHILE = 323,
+     INSERT = 324,
+     UPDATE = 325,
+     DELETE = 326,
+     TRUNCATE = 327
    };
 #endif
 
@@ -140,7 +141,7 @@ typedef union YYSTYPE
 
 
 /* Line 1685 of yacc.c  */
-#line 144 "gram.h"
+#line 145 "gram.h"
 } YYSTYPE;
 # define YYSTYPE_IS_TRIVIAL 1
 # define yystype YYSTYPE /* obsolescent; will be withdrawn */

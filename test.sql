@@ -1535,8 +1535,8 @@ create or replace function test68(out r int) as $$
 $$ language psm0;
 
 -- handlers doesn't process a signals from same
--- compound statement handler's body. It protection
--- again to cross recursive calls.
+-- compound statement handler's body. It protect us
+-- against to cross recursive calls.
 create or replace function test68_1(out r int) as $$
   begin
     declare continue handler for sqlstate '01001'
@@ -1577,6 +1577,23 @@ create or replace function test68_1(out r int) as $$
   end;
 $$ language psm0;
 
+/*
+ * example of before trigger
+
+create or replace function trg01()
+returns trigger as $$
+begin
+  declare n footab as new;
+  declare o footab as old;
+  if n.i <> o.i then
+    -- skip this row
+    signal sqlstate '02099';
+  end if;
+  set n.j = o.j;
+end;
+$$ language psm0;
+
+*/
 
 /*************************************************
  * Assert functions - sure, it is in plgsql :)

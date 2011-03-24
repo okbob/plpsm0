@@ -106,7 +106,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %type <stmt>	stmt_open stmt_fetch stmt_close stmt_for for_prefetch
 %type <stmt>	stmt_case case_when_list case_when opt_case_else
 %type <esql>	opt_expr_until_when expr_until_semi_or_coma_or_parent
-%type <stmt>	stmt_sql stmt_select_into stmt_signal
+%type <stmt>	stmt_sql stmt_select_into stmt_signal stmt_resignal
 %type <ival>	sqlstate
 %type <boolean>		opt_atomic
 %type <sinfo>	signal_info signal_info_item
@@ -158,13 +158,14 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %token <keyword>	ITERATE
 %token <keyword>	LEAVE
 %token <keyword>	LOOP
-%token <keyword>	MESSAGE
+%token <keyword>	MESSAGE_TEXT
 %token <keyword>	NO
 %token <keyword>	NOT
 %token <keyword>	OPEN
 %token <keyword>	PREPARE
 %token <keyword>	PRINT
 %token <keyword>	REPEAT
+%token <keyword>	RESIGNAL
 %token <keyword>	RETURN
 %token <keyword>	SCROLL
 %token <keyword>	SELECT
@@ -251,6 +252,7 @@ stmt:
 			| stmt_sql				{ $$ = $1; }
 			| stmt_select_into			{ $$ = $1; }
 			| stmt_signal				{ $$ = $1; }
+			| stmt_resignal				{ $$ = $1; }
 		;
 
 /*----
@@ -520,6 +522,8 @@ sqlstate:
 										  sqlstatestr[2],
 										  sqlstatestr[3],
 										  sqlstatestr[4]);
+					if ($$ == 0)
+						yyerror("invalid SQLSTATE code");
 				}
 		;
 
@@ -831,7 +835,7 @@ stmt_leave:
 
 /*----
  *
- * SIGNAL SQLSTATE [ VALUE ] sqlstate [ SET name = 'value [, .. 
+ * SIGNAL SQLSTATE [ VALUE ] sqlstate [ SET name = 'value' [, ... ]]
  *
  * note: raise a exception
  */
@@ -860,6 +864,51 @@ stmt_signal:
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_SIGNAL, @1);
 					new->name = $2.ident;
 					new->data = $4;
+					$$ = new;
+				}
+		;
+
+/*----
+ * RESIGNAL [ SQLSTATE [ VALUE ] sqlstate ] [ SET name = 'value' [, ... ]]
+ *
+ * note: reraise a exception
+ */
+stmt_resignal:
+			RESIGNAL
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
+					$$ = new;
+				}
+			| RESIGNAL SQLSTATE opt_value sqlstate
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
+					new->option = $4;
+					$$ = new;
+				}
+			| RESIGNAL WORD
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
+					new->name = $2.ident;
+					$$ = new;
+				}
+			| RESIGNAL SQLSTATE opt_value sqlstate SET signal_info
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
+					new->option = $4;
+					new->data = $6;
+					$$ = new;
+				}
+			| RESIGNAL WORD SET signal_info
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
+					new->name = $2.ident;
+					new->data = $4;
+					$$ = new;
+				}
+			| RESIGNAL SET signal_info
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
+					new->data = $3;
 					$$ = new;
 				}
 		;
@@ -906,7 +955,7 @@ signal_info_item:
 					new->value = $3;
 					$$ = new;
 				}
-			| MESSAGE '=' SCONST
+			| MESSAGE_TEXT '=' SCONST
 				{
 					Plpsm_signal_info *new = palloc(sizeof(Plpsm_signal_info));
 					new->typ = PLPSM_SINFO_MESSAGE;
@@ -1587,7 +1636,7 @@ is_unreserved_keyword(int tok)
 		case FOUND:
 		case HINT:
 		case IMMEDIATE:
-		case MESSAGE:
+		case MESSAGE_TEXT:
 		case NO:
 		case NOT:
 		case SCROLL:
@@ -1679,6 +1728,8 @@ parser_stmt_name(Plpsm_stmt_type typ)
 			return "case statement";
 		case PLPSM_STMT_SIGNAL:
 			return "signal statement";
+		case PLPSM_STMT_RESIGNAL:
+			return "resignal statement";
 		default:
 			return "unknown statment typid";
 	}
@@ -1832,6 +1883,7 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 				break;
 			}
 		case PLPSM_STMT_SIGNAL:
+		case PLPSM_STMT_RESIGNAL:
 			{
 				Plpsm_signal_info *sinfo = (Plpsm_signal_info *) stmt->data;
 				if (sinfo != NULL)

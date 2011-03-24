@@ -77,6 +77,7 @@ typedef struct
 		int	ndata;				/* number of data address global		*/
 		int	nhtfields;			/* number of field in handlers' table */
 		int	th_addr;			/* offset to TH table */
+		inside_handler;				/* true, when we are in handler */
 	}			stack;
 	struct						/* used as data for parsing a SQL expression */
 	{
@@ -2190,6 +2191,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 
 	int old_th_addr = cstate->stack.th_addr;
 	int local_th_addr = 0;
+	bool	inside_handler = cstate->stack.inside_handler;
 
 	should_insert_subtransaction = parent != NULL && parent->typ == PLPSM_STMT_COMPOUND_STATEMENT && parent->is_atomic;
 
@@ -2482,6 +2484,9 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					 * is necessary do recheck.
 					 */
 					cstate->stack.has_notfound_continue_handler = isnotfound;
+
+					/* in inner code, we can use a RESIGNAL statement */
+					cstate->inside_handler = true;
 					
 					/* 
 					 * UNDO handler does ROLLBACK on entry and jumps
@@ -3045,6 +3050,16 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 				}
 				break;
 
+			case PLPSM_STMT_RESIGNAL:
+				{
+					if (!cstate->stack.inside_handler)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use a RESIGNAL statement outside condition handler"),
+									parser_errposition(stmt->location)));
+				}
+				breal;
+
 			default:
 				elog(ERROR, "unknown command typeid");
 		}
@@ -3053,6 +3068,9 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 
 	/* returns back TH pointer */
 	cstate->stack.th_addr = old_th_addr;
+
+	/* return back info about handler's compilation */
+	cstate->stack.inside_handler = inside_handler;
 }
 
 /*
@@ -3389,6 +3407,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	cstated.stack.has_sqlstate = false;
 	cstated.stack.has_sqlcode = false;
 	cstated.stack.has_notfound_continue_handler = false;
+	cstated.stack.inside_handler = false;
 	cstated.prepared = NULL;
 
 	cstated.finfo.result.datum.typoid = procStruct->prorettype;
