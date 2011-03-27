@@ -251,7 +251,8 @@ typedef enum
 	PCODE_RELEASE_SUBTRANSACTION,
 	PCODE_HT,
 	PCODE_SIGNAL_JMP,
-	PCODE_SIGNAL_CALL
+	PCODE_SIGNAL_CALL,
+	PCODE_SET_SQLSTATE
 } Plpsm_pcode_type;
 
 typedef enum
@@ -408,6 +409,7 @@ typedef struct
 		int	size;
 		int16	ncolumns;
 		int	lineno;
+		int	sqlstate;
 	};
 } Plpsm_pcode;
 

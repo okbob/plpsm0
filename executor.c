@@ -142,6 +142,47 @@ search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int 
 	return 0;
 }
 
+static void
+set_state_variable(Plpsm_module *mod, int sqlstate, int PC, Datum *values, char *nulls)
+{
+	Plpsm_pcode *pcode;
+	Plpsm_pcode_module *module = mod->code;
+
+	if (PC == 0)
+		elog(ERROR, "invalid memory reference");
+
+	pcode = &module->code[PC];
+	switch (pcode->typ)
+	{
+		case PCODE_SQLSTATE_REFRESH:
+			{
+				char *unpacked_sqlstate;
+
+				/* release a memory */
+				if (nulls[pcode->target.offset] != 'n')
+					pfree(DatumGetPointer(values[pcode->target.offset]));
+
+				if (sqlstate != 0)
+					unpacked_sqlstate = unpack_sql_state(sqlstate);
+				else
+					unpacked_sqlstate = "00000";
+
+					values[pcode->target.offset] = CStringGetTextDatum(unpacked_sqlstate);
+					nulls[pcode->target.offset] = ' ';
+			}
+			break;
+
+		case PCODE_SQLCODE_REFRESH:
+			{
+				values[pcode->target.offset] = Int32GetDatum(sqlstate);
+				nulls[pcode->target.offset] = ' ';
+			}
+			break;
+			/* do nothing */
+	}
+}
+
+
 static Datum
 execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 {
@@ -217,7 +258,7 @@ next_op:
 
 /*
  dinfo->is_signal = true;
- elog(NOTICE, "PC %d", PC); 
+ elog(NOTICE, "PC %d  ... sqlstate:%d", PC, sqlstate); 
  dinfo->is_signal = false;
 */
 
@@ -342,6 +383,15 @@ next_op:
 						handler_addr = search_handler(mod, edata, ResourceOwnerStack, &ROP, pcode->htnum);
 						if (handler_addr > 0)
 						{
+							sqlstate = edata->sqlerrcode;
+							/* 
+							 * before we jump to handler, we should to set
+							 * a state variables. A addresses of these variables
+							 * are stored in next two instructions - if are used
+							 */
+							set_state_variable(mod, sqlstate, PC + 1, values, nulls);
+							set_state_variable(mod, sqlstate, PC + 2, values, nulls);
+
 							/* go to handler */
 							rollback_nested_transactions = false;
 							PC = handler_addr;
@@ -477,20 +527,22 @@ next_op:
 				break;
 
 			case PCODE_PRINT:
-				if (isnull)
-					elog(NOTICE, "NULL");
-				else
 				{
-					char *str = text_to_cstring(DatumGetTextP(result));
-					
 					if (dinfo != NULL)
 						dinfo->is_signal = true;
 
-					elog(NOTICE, "%s", str);
+					if (isnull)
+						elog(NOTICE, "NULL");
+					else
+					{
+						char *str = text_to_cstring(DatumGetTextP(result));
+
+						elog(NOTICE, "%s", str);
+						pfree(str);
+					}
+
 					if (dinfo != NULL)
 						dinfo->is_signal = false;
-
-					pfree(str);
 				}
 				break;
 
@@ -560,6 +612,12 @@ next_op:
 				{
 					values[pcode->target.offset] = Int32GetDatum(sqlstate);
 					nulls[pcode->target.offset] = ' ';
+				}
+				break;
+
+			case PCODE_SET_SQLSTATE:
+				{
+					sqlstate = pcode->sqlstate;
 				}
 				break;
 

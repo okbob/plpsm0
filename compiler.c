@@ -77,7 +77,7 @@ typedef struct
 		int	ndata;				/* number of data address global		*/
 		int	nhtfields;			/* number of field in handlers' table */
 		int	th_addr;			/* offset to TH table */
-		inside_handler;				/* true, when we are in handler */
+		bool inside_handler;				/* true, when we are in handler */
 	}			stack;
 	struct						/* used as data for parsing a SQL expression */
 	{
@@ -115,7 +115,7 @@ static void _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent
 static Node *resolve_column_ref(CompileState cstate, ColumnRef *cref);
 void plpsm_parser_setup(struct ParseState *pstate, CompileState cstate);
 static Plpsm_object *lookup_var(Plpsm_object *scope, const char *name);
-static void compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid targetoid, int16 typmod);
+static void compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid targetoid, int16 typmod, bool refresh_state_vars);
 
 static Plpsm_module *compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, 
 								Plpsm_module_hashkey *hashkey, bool forValidator);
@@ -1273,6 +1273,10 @@ list(Plpsm_pcode_module *m)
 												    VALUE(signal_params.message) ? VALUE(signal_params.message) : "");
 				break;
 
+			case PCODE_SET_SQLSTATE:
+				appendStringInfo(&ds, "Set SQLSTATE '%s'", unpack_sql_state(VALUE(sqlstate)));
+				break;
+
 			case PCODE_HT:
 				{
 					appendStringInfoString(&ds, "HT ");
@@ -1559,7 +1563,7 @@ compile_done(CompileState cstate)
 	if (cstate->finfo.return_expr != NULL && cstate->finfo.result.datum.typoid != VOIDOID)
 	{
 		compile_expr(cstate, NULL, cstate->finfo.return_expr,
-						cstate->finfo.result.datum.typoid, -1);
+						cstate->finfo.result.datum.typoid, -1, false);
 		SET_OPVAL(target.typlen, cstate->finfo.result.datum.typlen);
 		SET_OPVAL(target.typbyval, cstate->finfo.result.datum.typbyval);
 		EMIT_OPCODE(RETURN, -1);
@@ -1895,7 +1899,7 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, Plpsm_ESQL *from_cl
  * emit instruction to execute a expression with specified targetoid and typmod
  */
 static void 
-compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid targetoid, int16 typmod)
+compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid targetoid, int16 typmod, bool refresh_state_vars)
 {
 	StringInfoData	ds;
 	Plpsm_pcode_module *m = cstate->module;
@@ -1932,6 +1936,28 @@ compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid target
 	{
 		/* Restore former ereport callback */
 		error_context_stack = syntax_errcontext.previous;
+	}
+
+	/*
+	 * refresh state variables
+	 */
+	if (refresh_state_vars)
+	{
+		if (cstate->stack.has_sqlstate)
+		{
+			Plpsm_object *var = lookup_var(cstate->current_scope, "sqlstate");
+			Assert(var != NULL);
+			SET_OPVALS_DATUM_COPY(target, var);
+			EMIT_OPCODE(SQLSTATE_REFRESH, -1);
+		}
+
+		if (cstate->stack.has_sqlcode)
+		{
+			Plpsm_object *var = lookup_var(cstate->current_scope, "sqlcode");
+			Assert(var != NULL);
+			SET_OPVALS_DATUM_COPY(target, var);
+			EMIT_OPCODE(SQLCODE_REFRESH, -1);
+		}
 	}
 }
 
@@ -2248,7 +2274,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 				{
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					addr1 = PC(m);
-					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
+					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1, true);
 					addr2 = PC(m);
 					EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
 					_compile(cstate, stmt->inner_left, NULL);
@@ -2263,7 +2289,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					obj = new_psm_object_for(stmt, cstate, PC(m));
 					addr1 = PC(m);
 					_compile(cstate, stmt->inner_left, NULL);
-					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
+					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1, true);
 					SET_OPVAL(addr, addr1);
 					EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
 					cstate->current_scope = release_psm_object(cstate, obj, 0, 0, PC(m));
@@ -2486,7 +2512,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					cstate->stack.has_notfound_continue_handler = isnotfound;
 
 					/* in inner code, we can use a RESIGNAL statement */
-					cstate->inside_handler = true;
+					cstate->stack.inside_handler = true;
 					
 					/* 
 					 * UNDO handler does ROLLBACK on entry and jumps
@@ -2536,7 +2562,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					ListCell *l;
 
 					if (stmt->esql != NULL)
-						compile_expr(cstate, stmt->esql, NULL, stmt->datum.typoid, stmt->datum.typmod);
+						compile_expr(cstate, stmt->esql, NULL, stmt->datum.typoid, stmt->datum.typmod, false);
 
 					foreach(l, stmt->compound_target)
 					{
@@ -2740,7 +2766,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 
 			case PLPSM_STMT_IF:
 				{
-					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1);
+					compile_expr(cstate, stmt->esql, NULL, BOOLOID, -1, true);
 					addr1 = PC(m);
 					EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
 					_compile(cstate, stmt->inner_left, NULL);
@@ -2779,7 +2805,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 						else
 							expr = pstrdup(cond->esql->sqlstr);
 
-						compile_expr(cstate, NULL, expr, BOOLOID, -1);
+						compile_expr(cstate, NULL, expr, BOOLOID, -1, true);
 						addr1 = PC(m);
 						EMIT_OPCODE(JMP_FALSE_UNKNOWN, stmt->lineno);
 						_compile(cstate, cond->inner_left, NULL);
@@ -2852,7 +2878,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					}
 					else
 					{
-						compile_expr(cstate, linitial(stmt->esql_list), NULL, TEXTOID, -1);
+						compile_expr(cstate, linitial(stmt->esql_list), NULL, TEXTOID, -1, false);
 						EMIT_OPCODE(PRINT, stmt->lineno);
 					}
 				}
@@ -2877,7 +2903,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 																		    &typmod,
 																			    stmt->target->location);
 
-							compile_expr(cstate, stmt->esql, NULL, typoid, typmod);
+							compile_expr(cstate, stmt->esql, NULL, typoid, typmod, true);
 							SET_OPVAL(update_field.fno, fno);
 							SET_OPVAL(update_field.typoid, var->stmt->datum.typoid);
 							SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
@@ -2887,7 +2913,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 						}
 						else
 						{
-							compile_expr(cstate, stmt->esql, NULL, var->stmt->datum.typoid, var->stmt->datum.typmod);
+							compile_expr(cstate, stmt->esql, NULL, var->stmt->datum.typoid, var->stmt->datum.typmod, true);
 							SET_OPVALS_DATUM_COPY(target, var);
 							EMIT_OPCODE(SAVETO, stmt->lineno);
 						}
@@ -2925,10 +2951,10 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 									parser_errposition(stmt->location)));
 
 						if (stmt->esql != NULL)
-							compile_expr(cstate, stmt->esql, NULL, cstate->finfo.result.datum.typoid, -1);
+							compile_expr(cstate, stmt->esql, NULL, cstate->finfo.result.datum.typoid, -1, false);
 						else
 							compile_expr(cstate, NULL, cstate->finfo.return_expr,
-											cstate->finfo.result.datum.typoid, -1);
+											cstate->finfo.result.datum.typoid, -1, false);
 
 						SET_OPVAL(target.typlen, cstate->finfo.result.datum.typlen);
 						SET_OPVAL(target.typbyval, cstate->finfo.result.datum.typbyval);
@@ -2946,7 +2972,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 
 			case PLPSM_STMT_EXECUTE_IMMEDIATE:
 				{
-					compile_expr(cstate, stmt->esql, NULL, TEXTOID, -1);
+					compile_expr(cstate, stmt->esql, NULL, TEXTOID, -1, true);
 					EMIT_OPCODE(EXECUTE_IMMEDIATE, stmt->lineno);
 					compile_refresh_basic_diagnostic(cstate);
 				}
@@ -3010,7 +3036,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 			case PLPSM_STMT_PREPARE:
 				{
 					int	prepnum = fetchPrepared(cstate, stmt->name);
-					compile_expr(cstate, stmt->esql, NULL, TEXTOID, -1);
+					compile_expr(cstate, stmt->esql, NULL, TEXTOID, -1, true);
 					SET_OPVAL(prepare.name, stmt->name);
 					SET_OPVAL(prepare.data, prepnum);
 					EMIT_OPCODE(PREPARE, stmt->lineno);
@@ -3025,6 +3051,28 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					condition.typ = PLPSM_SQLSTATE;
 					condition.sqlstate = stmt->option;
 					condition.next = NULL;
+
+					if (cstate->stack.has_sqlstate || cstate->stack.has_sqlcode)
+					{
+						SET_OPVAL(sqlstate, condition.sqlstate);
+						EMIT_OPCODE(SET_SQLSTATE, stmt->lineno);
+
+						if (cstate->stack.has_sqlstate)
+						{
+							Plpsm_object *var = lookup_var(cstate->current_scope, "sqlstate");
+							Assert(var != NULL);
+							SET_OPVALS_DATUM_COPY(target, var);
+							EMIT_OPCODE(SQLSTATE_REFRESH, -1);
+						}
+
+						if (cstate->stack.has_sqlcode)
+						{
+							Plpsm_object *var = lookup_var(cstate->current_scope, "sqlcode");
+							Assert(var != NULL);
+							SET_OPVALS_DATUM_COPY(target, var);
+							EMIT_OPCODE(SQLCODE_REFRESH, -1);
+						}
+					}
 
 					handler = lookup_handler(cstate->current_scope, &condition);
 					if (handler != NULL)
@@ -3058,7 +3106,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 								 errmsg("cannot use a RESIGNAL statement outside condition handler"),
 									parser_errposition(stmt->location)));
 				}
-				breal;
+				break;
 
 			default:
 				elog(ERROR, "unknown command typeid");

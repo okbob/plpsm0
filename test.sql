@@ -85,6 +85,7 @@ begin
 end;
 $$ language psm0;
 
+-- recursion call test
 create or replace function test06_06(a int)
 returns int as $$
 if a > 1 then
@@ -386,6 +387,8 @@ begin
 end;
 $$ language psm0;
 
+-- out sqlcode will be zero, because 'not found' sqlcode
+-- is replaced by success from test "sqlcode = 0"
 create or replace function test30(out x int, out s int, out sqlcode int, out sqlstate char(5))
 as $$
 begin
@@ -394,9 +397,9 @@ begin
   set s = 0;
   fetch cx into x;
   while sqlcode = 0 do
+    print s;
     set s = s + x;
     fetch cx into x;
-    print s;
   end while;
 end;
 $$ language psm0;
@@ -1577,6 +1580,56 @@ create or replace function test68_1(out r int) as $$
   end;
 $$ language psm0;
 
+create or replace function test69()
+returns text as $$
+begin
+  declare sqlstate char(5);
+  declare sqlcode int;
+  declare continue handler for sqlwarning
+  begin
+    print sqlcode, sqlstate;
+    return sqlstate;
+  end;
+  print 'start';
+  signal sqlstate '02002';
+end;
+$$ language psm0;
+
+create or replace function test69_1()
+returns text as $$
+begin atomic
+  declare sqlstate char(5);
+  declare sqlcode int;
+  declare undo handler for sqlexception
+  begin
+    print sqlcode, sqlstate;
+    return sqlstate;
+  end;
+  print 'start';
+  signal sqlstate '03002';
+end;
+$$ language psm0;
+
+--
+-- print doesn't modify a sqlstate or sqlcode
+--
+create or replace function test69_2(a int)
+returns text as $$
+begin atomic
+  declare sqlstate char(5);
+  declare sqlcode int;
+  declare aux int;
+  declare undo handler for sqlexception
+  begin
+    print sqlcode, sqlstate;
+    return sqlstate;
+  end;
+  print 'start';
+  set aux = 10 / a;
+  return '00000';
+end;
+$$ language psm0;
+
 /*
  * example of before trigger
 
@@ -1677,8 +1730,8 @@ begin
   perform assert('test27', 40, test27(5));
   perform assert('test28',  6, test28(4));
   perform assert('test30', 10, (select s from test30()));
-  perform assert('test30', 128,(select sqlcode from test30()));
-  perform assert('test30', '02000', (select sqlstate from test30()));
+  perform assert('test30', 0,(select sqlcode from test30()));
+  perform assert('test30', '00000', (select sqlstate from test30()));
   perform assert('test31', 12, test31());
   perform assert('test31_01', 15, test31_01());
   perform assert('test32', 12, test32());
@@ -1775,6 +1828,10 @@ begin
   perform assert('test67_1', 101, test67_1(3));
   perform assert('test68', 102, test68());
   perform assert('test68_1', 103, test68_1());
+  perform assert('test69', '02002', test69());
+  perform assert('test69_1', '03002', test69_1());
+  perform assert('test69_2', '00000', test69_2(10));
+  perform assert('test69_2', '22012', test69_2(0));
 
   
 
