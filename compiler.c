@@ -43,6 +43,8 @@ typedef struct
 
 const char *plpsm_error_funcname;
 
+ParserState pstate = NULL;		/* parser state */
+
 typedef struct
 {							/* it's used for storing data from SQL parser */
 	int	location;
@@ -1277,6 +1279,47 @@ list(Plpsm_pcode_module *m)
 				appendStringInfo(&ds, "Set SQLSTATE '%s'", unpack_sql_state(VALUE(sqlstate)));
 				break;
 
+			case PCODE_DIAGNOSTICS_INIT:
+				appendStringInfo(&ds, "Diagnostics Init");
+				break;
+
+			case PCODE_DIAGNOSTICS_PUSH:
+				appendStringInfo(&ds, "Diagnostics Push");
+				break;
+
+			case PCODE_DIAGNOSTICS_POP:
+				appendStringInfo(&ds, "Diagnostics Pop");
+				break;
+
+			case PCODE_GET_DIAGNOSTICS:
+				appendStringInfo(&ds, "Get %s Diagnostics @%d oid:%d byval:%s = ",
+							VALUE(get_diagnostics.which_area) == PLPSM_GDAREA_CURRENT ? "CURRENT" : "STACKED",
+							VALUE(get_diagnostics.offset),
+							VALUE(get_diagnostics.target_type),
+							VALUE(get_diagnostics.byval) ? "BYVAL" : "BYREF");
+				switch (VALUE(get_diagnostics.typ))
+				{
+					case PLPSM_GDINFO_DETAIL:
+						appendStringInfoString(&ds, "DETAIL_TEXT");
+						break;
+					case PLPSM_GDINFO_HINT:
+						appendStringInfoString(&ds, "HINT_TEXT");
+						break;
+					case PLPSM_GDINFO_MESSAGE:
+						appendStringInfoString(&ds, "MESSAGE_TEXT");
+						break;
+					case PLPSM_GDINFO_SQLSTATE:
+						appendStringInfoString(&ds, "SQLSTATE");
+						break;
+					case PLPSM_GDINFO_SQLCODE:
+						appendStringInfoString(&ds, "SQLCODE");
+						break;
+					case PLPSM_GDINFO_ROW_COUNT:
+						appendStringInfoString(&ds, "ROWCOUNT");
+						break;
+				}
+				break;
+
 			case PCODE_HT:
 				{
 					appendStringInfoString(&ds, "HT ");
@@ -1922,6 +1965,8 @@ compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid target
 		syntax_errcontext.previous = error_context_stack;
 		error_context_stack = &syntax_errcontext;
 	}
+
+	SET_OPVAL(expr.without_diagnostics, !refresh_state_vars);
 
 	initStringInfo(&ds);
 	appendStringInfo(&ds, "SELECT (%s)::%s", expr, format_type_with_typemod(targetoid, typmod));
@@ -2852,6 +2897,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 						addr1 = PC(m);
 						SET_OPVAL(expr.data, cstate->stack.ndata++);
 						SET_OPVAL(expr.is_multicol, true);
+						SET_OPVAL(expr.without_diagnostics, true);
 						EMIT_OPCODE(EXEC_EXPR, stmt->lineno);
 						appendStringInfoString(&ds, "SELECT ");
 
@@ -3105,6 +3151,56 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 								(errcode(ERRCODE_SYNTAX_ERROR),
 								 errmsg("cannot use a RESIGNAL statement outside condition handler"),
 									parser_errposition(stmt->location)));
+				}
+				break;
+
+			case PLPSM_STMT_GET_DIAGNOSTICS:
+				{
+					Plpsm_diagnostics_area which_type = (Plpsm_diagnostics_area) stmt->option;
+					Plpsm_gd_info *iterator = (Plpsm_gd_info *) stmt->data;
+					const char	*fieldname;
+
+					while (iterator != NULL)
+					{
+						Plpsm_object *var = resolve_target(cstate, iterator->target,  &fieldname, PLPSM_STMT_DECLARE_VARIABLE);
+
+						if (fieldname != NULL)
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("cannot use a composite variables inside GET DIAGNOSTICS statement"),
+										parser_errposition(stmt->location)));
+
+						SET_OPVAL(get_diagnostics.which_area, which_type);
+						SET_OPVAL(get_diagnostics.typ, iterator->typ);
+						SET_OPVAL(get_diagnostics.offset, var->offset);
+						SET_OPVAL(get_diagnostics.byval, var->stmt->datum.typbyval);
+						SET_OPVAL(get_diagnostics.target_type, var->stmt->datum.typoid);
+
+						switch (iterator->typ)
+						{
+							case PLPSM_GDINFO_DETAIL:
+							case PLPSM_GDINFO_HINT:
+							case PLPSM_GDINFO_MESSAGE:
+							case PLPSM_GDINFO_SQLSTATE:
+								if (var->stmt->datum.typoid != TEXTOID)
+									ereport(ERROR,
+											(errcode(ERRCODE_SYNTAX_ERROR),
+											 errmsg("target of MESSAGE_TEXT, DETAIL_TEXT, HINT_TEXT or SQLSTATE should be text type"),
+												parser_errposition(stmt->location)));
+								break;
+							case PLPSM_GDINFO_SQLCODE:
+							case PLPSM_GDINFO_ROW_COUNT:
+								if (var->stmt->datum.typoid != INT4OID && var->stmt->datum.typoid != INT8OID)
+									ereport(ERROR,
+											(errcode(ERRCODE_SYNTAX_ERROR),
+											 errmsg("target of SQLCODE or ROW_COUNT should be text int or big int"),
+												parser_errposition(stmt->location)));
+								break;
+						}
+
+						EMIT_OPCODE(GET_DIAGNOSTICS, stmt->lineno);
+						iterator = iterator->next;
+					}
 				}
 				break;
 
@@ -3386,6 +3482,8 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	MemoryContext	func_cxt;
 	Plpsm_pcode_module *m;
 
+	ParserStateData parser_state_var;
+
 	procStruct = (Form_pg_proc) GETSTRUCT(procTup);
 
 	prosrcdatum = SysCacheGetAttr(PROCOID, procTup,
@@ -3425,6 +3523,10 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	m->is_read_only = (procStruct->provolatile != PROVOLATILE_VOLATILE);
 
 	proc_source = TextDatumGetCString(prosrcdatum);
+
+	parser_state_var.has_get_diagnostics_stmt = false;
+	parser_state_var.has_get_stacked_diagnostics_stmt = false;
+	pstate = &parser_state_var;
 
 	plerrcontext.callback = plpsm_compile_error_callback;
 	plerrcontext.arg = forValidator ? proc_source : NULL;
@@ -3466,6 +3568,12 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 		SET_OPVAL(str, pstrdup(proc_source));
 		EMIT_OPCODE(DEBUG_SOURCE_CODE, -1);
 	}
+
+	/*
+	 * initialise diagnostics when is used
+	 */
+	if (parser_state_var.has_get_diagnostics_stmt)
+		EMIT_OPCODE(DIAGNOSTICS_INIT, -1);
 
 	/* 
 	 * append to scope a variables for parameters, and store 

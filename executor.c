@@ -18,6 +18,18 @@
 
 typedef struct
 {
+	int			level;
+	int64	row_count;
+	int	sqlstate;
+	char		*message_text;
+	char		*detail_text;
+	char		*hint_text;
+} DiagnosticsInfoData;
+
+typedef DiagnosticsInfoData *DiagnosticsInfo;
+
+typedef struct
+{
 	int nargs;
 	Oid	*argtypes;
 	Datum	*values;
@@ -182,6 +194,39 @@ set_state_variable(Plpsm_module *mod, int sqlstate, int PC, Datum *values, char 
 	}
 }
 
+static void 
+set_text(char **ptr, char *str)
+{
+	if (*ptr != NULL)
+		pfree(*ptr);
+	if (str != NULL)
+		*ptr = pstrdup(str);
+	else
+		*ptr = NULL;
+}
+
+static void
+set_diagnostics(DiagnosticsInfo dginfo, ErrorData *edata)
+{
+	dginfo->level = edata->elevel;
+	dginfo->row_count = 0;
+	dginfo->sqlstate = edata->sqlerrcode;
+
+	set_text(&dginfo->message_text, edata->message);
+	set_text(&dginfo->detail_text, edata->detail);
+	set_text(&dginfo->hint_text, edata->hint);
+}
+
+static void
+diagnostics_sqlstate(DiagnosticsInfo dginfo, int sqlstate, int level, int64 row_count)
+{
+	dginfo->level = level;
+	dginfo->row_count = row_count;
+	dginfo->sqlstate = sqlstate;
+	set_text(&dginfo->message_text, NULL);
+	set_text(&dginfo->detail_text, NULL);
+	set_text(&dginfo->hint_text, NULL);
+}
 
 static Datum
 execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
@@ -196,8 +241,12 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	bool		isnull;
 	int				CallStack[1024];
 	ResourceOwner			ResourceOwnerStack[1024];
+	DiagnosticsInfoData		DInfoStack[128];
+	DiagnosticsInfoData		first_area;
 	int		ROP = -1;
 	int	sqlstate = 0;
+	int64		row_count;
+	int		DID = -1;
 	Bitmapset	*acursors = NULL;		/* active cursors */
 	int	rc;
 	Plpsm_pcode_module *module = mod->code;
@@ -210,6 +259,8 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	MemoryContext	func_cxt = mod->cxt;
 
 	bool		rollback_nested_transactions = false;
+
+	bool 	keep_diagnostics_info = false;		/* when is true, then statement actualises first_area */
 
 	DataPtrs = mod->DataPtrs;
 
@@ -249,7 +300,6 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 
 	if (mod->with_cframe_debug)
 		init_out_funcs(mod->code->code[1].cframe, out_funcs);
-
 
 	while (PC < module->length)
 	{
@@ -392,6 +442,11 @@ next_op:
 							set_state_variable(mod, sqlstate, PC + 1, values, nulls);
 							set_state_variable(mod, sqlstate, PC + 2, values, nulls);
 
+							if (keep_diagnostics_info)
+								set_diagnostics(&first_area, edata);
+
+							FreeErrorData(edata);
+
 							/* go to handler */
 							rollback_nested_transactions = false;
 							PC = handler_addr;
@@ -412,6 +467,10 @@ next_op:
 										SPI_tuptable->tupdesc->natts);
 
 					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
+					row_count = SPI_processed;
+
+					if (keep_diagnostics_info && !pcode->expr.without_diagnostics)
+						diagnostics_sqlstate(&first_area, sqlstate, WARNING, row_count);
 
 					if (SPI_processed == 0)
 					{
@@ -475,6 +534,10 @@ next_op:
 					}
 
 					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
+					row_count = SPI_processed;
+
+					if (keep_diagnostics_info)
+						diagnostics_sqlstate(&first_area, sqlstate, WARNING, row_count);
 				}
 				break;
 
@@ -502,6 +565,10 @@ next_op:
 												sqlstr);
 					}
 					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
+					row_count = SPI_processed;
+
+					if (keep_diagnostics_info)
+						diagnostics_sqlstate(&first_area, sqlstate, WARNING, row_count);
 
 					pfree(sqlstr);
 					SPI_freetuptable(SPI_tuptable);
@@ -621,6 +688,118 @@ next_op:
 				}
 				break;
 
+			case PCODE_DIAGNOSTICS_INIT:
+				{
+					first_area.row_count = 0;
+					first_area.sqlstate = 0;
+					first_area.message_text = NULL;
+					first_area.detail_text = NULL;
+					first_area.hint_text = 0;
+
+					keep_diagnostics_info = true;
+				}
+				break;
+
+			case PCODE_DIAGNOSTICS_PUSH:
+				{
+					if (DID++ == -1)
+						elog(ERROR, "runtime error, diagnostics stack is empty");
+
+					DInfoStack[DID].level = first_area.level;
+					DInfoStack[DID].sqlstate = first_area.sqlstate;
+					DInfoStack[DID].message_text = pstrdup(first_area.message_text);
+					DInfoStack[DID].detail_text = pstrdup(first_area.detail_text);
+					DInfoStack[DID].hint_text = pstrdup(first_area.hint_text);
+				}
+				break;
+
+			case PCODE_DIAGNOSTICS_POP:
+				{
+					if (++DID == 128)
+						elog(ERROR, "runtime error, diagnostics stack overflow");
+
+					first_area.level = DInfoStack[DID].level;
+					first_area.sqlstate = DInfoStack[DID].sqlstate;
+					first_area.message_text = DInfoStack[DID].message_text;
+					first_area.detail_text = DInfoStack[DID].detail_text;
+					first_area.hint_text = DInfoStack[DID].hint_text;
+
+					DID--;
+				}
+				break;
+
+			case PCODE_GET_DIAGNOSTICS:
+				{
+					DiagnosticsInfo darea;
+					Datum value = (Datum) 0;
+					bool		isnull = false;
+
+					if (pcode->get_diagnostics.which_area == PLPSM_GDAREA_CURRENT)
+						darea = &first_area;
+					else
+					{
+						/* access to a stacked diagnostics info */
+						if (DID == -1)
+							elog(ERROR, "diagnostics exception — stacked diagnostics accessed without active handler");
+						darea = &DInfoStack[DID];
+					}
+
+					if (nulls[pcode->get_diagnostics.offset] == ' ' && !pcode->get_diagnostics.byval)
+						pfree(DatumGetPointer(values[pcode->get_diagnostics.offset]));
+
+					switch (pcode->get_diagnostics.typ)
+					{
+						case PLPSM_GDINFO_DETAIL:
+							
+							if (darea->detail_text != NULL)
+								value = CStringGetTextDatum(darea->detail_text);
+							else
+								isnull = true;
+							break;
+
+						case PLPSM_GDINFO_HINT:
+							if (darea->hint_text != NULL)
+								value = CStringGetTextDatum(darea->hint_text);
+							else
+								isnull = true;
+							break;
+
+						case PLPSM_GDINFO_MESSAGE:
+							if (darea->message_text)
+								value = CStringGetTextDatum(darea->message_text);
+							else
+								isnull = true;
+							break;
+
+						case PLPSM_GDINFO_SQLSTATE:
+							value = CStringGetTextDatum(unpack_sql_state(darea->sqlstate));
+							break;
+
+						case PLPSM_GDINFO_SQLCODE:
+							if (pcode->get_diagnostics.target_type == INT4OID)
+								value = Int32GetDatum(darea->sqlstate);
+							else
+								value = Int64GetDatum((int64) darea->sqlstate);
+							break;
+
+						case PLPSM_GDINFO_ROW_COUNT:
+							if (pcode->get_diagnostics.target_type == INT4OID)
+								values[pcode->get_diagnostics.offset] = 
+											DirectFunctionCall1(int84, Int64GetDatum(darea->row_count));
+							else
+								values[pcode->get_diagnostics.offset] = Int64GetDatum(darea->row_count);
+							break;
+					}
+					if (!isnull)
+					{
+						values[pcode->get_diagnostics.offset] = value;
+						nulls[pcode->get_diagnostics.offset] = ' ';
+					}
+					else
+						nulls[pcode->get_diagnostics.offset] = 'n';
+				}
+				break;
+
 			case PCODE_CURSOR_OPEN:
 				{
 					Portal portal;
@@ -691,6 +870,10 @@ next_op:
 					clean_result = true;
 
 					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
+					row_count = SPI_processed;
+
+					if (keep_diagnostics_info)
+						diagnostics_sqlstate(&first_area, sqlstate, WARNING, row_count);
 				}
 				break;
 
@@ -1106,6 +1289,20 @@ next_op:
 				{
 					if (pcode->signal_params.addr != 0)
 					{
+						/* 
+						 * Actualise a first_area when it is requested
+						 * Handler must to push and pop these first_area on stack when it is requested
+						 */
+						if (keep_diagnostics_info)
+						{
+							first_area.level = pcode->signal_params.level;
+							first_area.row_count = 0;
+							first_area.sqlstate = pcode->signal_params.sqlcode;
+							set_text(&first_area.message_text, pcode->signal_params.message);
+							set_text(&first_area.detail_text, pcode->signal_params.detail);
+							set_text(&first_area.hint_text, pcode->signal_params.hint);
+						}
+
 						if (pcode->signal_params.is_undo_handler)
 						{
 							MemoryContext	oldcontext = CurrentMemoryContext;
@@ -1138,6 +1335,20 @@ next_op:
 						/* dont append context informations to notices */
 						if (pcode->signal_params.level == NOTICE)
 							dinfo->is_signal = true;
+
+						/* 
+						 * in this moment we don't call a handler, so when level is NOTICE or WARNING
+						 * we must to actualise a diagnostics info.
+						 */
+						if (keep_diagnostics_info && (pcode->signal_params.level == NOTICE || pcode->signal_params.level == WARNING))
+						{
+							first_area.row_count = 0;
+							first_area.sqlstate = pcode->signal_params.sqlcode;
+
+							set_text(&first_area.message_text, pcode->signal_params.message);
+							set_text(&first_area.detail_text, pcode->signal_params.detail);
+							set_text(&first_area.hint_text, pcode->signal_params.hint);
+						}
 
 						ereport(pcode->signal_params.level,
 								( errcode(pcode->signal_params.sqlcode),

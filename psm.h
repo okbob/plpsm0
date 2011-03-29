@@ -12,6 +12,14 @@
 
 typedef struct
 {
+	bool has_get_diagnostics_stmt;
+	bool has_get_stacked_diagnostics_stmt;
+} ParserStateData;
+
+typedef ParserStateData *ParserState;
+
+typedef struct
+{
 	char	*ident;				/* palloc'd converted identifier */
 	bool		quoted;			/* Was it double quoted? */
 } PLword;
@@ -70,7 +78,8 @@ typedef enum
 	PLPSM_STMT_SQL,
 	PLPSM_STMT_SELECT_INTO,
 	PLPSM_STMT_SIGNAL,
-	PLPSM_STMT_RESIGNAL
+	PLPSM_STMT_RESIGNAL,
+	PLPSM_STMT_GET_DIAGNOSTICS
 } Plpsm_stmt_type;
 
 typedef enum
@@ -106,10 +115,33 @@ typedef struct
 
 typedef enum
 {
+	PLPSM_GDAREA_CURRENT,
+	PLPSM_GDAREA_STACKED
+} Plpsm_diagnostics_area;
+
+typedef enum
+{
+	PLPSM_GDINFO_DETAIL,
+	PLPSM_GDINFO_HINT,
+	PLPSM_GDINFO_MESSAGE,
+	PLPSM_GDINFO_SQLSTATE,
+	PLPSM_GDINFO_SQLCODE,
+	PLPSM_GDINFO_ROW_COUNT
+} Plpsm_gd_info_type;
+
+typedef enum
+{
 	PLPSM_SINFO_DETAIL,
 	PLPSM_SINFO_HINT,
 	PLPSM_SINFO_MESSAGE
 } Plpsm_signal_info_item_type;
+
+typedef struct Plpsm_gd_info
+{
+	Plpsm_gd_info_type typ;
+	Plpsm_positioned_qualid *target;
+	struct Plpsm_gd_info *next;
+} Plpsm_gd_info;
 
 typedef struct Plpsm_signal_info
 {
@@ -252,7 +284,11 @@ typedef enum
 	PCODE_HT,
 	PCODE_SIGNAL_JMP,
 	PCODE_SIGNAL_CALL,
-	PCODE_SET_SQLSTATE
+	PCODE_SET_SQLSTATE,
+	PCODE_DIAGNOSTICS_INIT,
+	PCODE_DIAGNOSTICS_PUSH,
+	PCODE_DIAGNOSTICS_POP,
+	PCODE_GET_DIAGNOSTICS
 } Plpsm_pcode_type;
 
 typedef enum
@@ -300,6 +336,7 @@ typedef struct
 			Oid	*typoids;
 			int	data;
 			bool	is_multicol;
+			bool	without_diagnostics;
 		} expr;
 		struct
 		{
@@ -406,6 +443,14 @@ typedef struct
 			char	*hint;
 			char	*message;
 		} signal_params;
+		struct
+		{
+			Plpsm_gd_info_type typ;
+			int16		offset;
+			Oid	target_type;
+			bool	byval;
+			Plpsm_diagnostics_area	which_area;
+		} get_diagnostics;
 		int	size;
 		int16	ncolumns;
 		int	lineno;

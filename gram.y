@@ -62,6 +62,8 @@ static void pqualid_list_out(StringInfo ds, List *list);
 
 static Plpsm_stmt *make_stmt_sql(int location);
 
+extern ParserState pstate;
+
 %}
 
 %expect 0
@@ -85,6 +87,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 		Plpsm_positioned_qualid		*qualid;
 		Plpsm_condition_value		*condition;
 		Plpsm_signal_info		*sinfo;
+		Plpsm_gd_info			*ginfo;
 		Node		*node;
 }
 
@@ -107,9 +110,12 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %type <stmt>	stmt_case case_when_list case_when opt_case_else
 %type <esql>	opt_expr_until_when expr_until_semi_or_coma_or_parent
 %type <stmt>	stmt_sql stmt_select_into stmt_signal stmt_resignal
+%type <stmt>	stmt_get_diag
 %type <ival>	sqlstate
 %type <boolean>		opt_atomic
 %type <sinfo>	signal_info signal_info_item
+%type <ival>	gd_area_opt gd_info_enum
+%type <ginfo>	gd_info gd_info_list
 
 /*
  * Basic non-keyword token types.  These are hard-wired into the core lexer.
@@ -137,9 +143,11 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %token <keyword>	CONDITION
 %token <keyword>	CONTINUE
 %token <keyword>	CURSOR
+%token <keyword>	CURRENT
 %token <keyword>	DECLARE
 %token <keyword>	DEFAULT
-%token <keyword>	DETAIL
+%token <keyword>	DETAIL_TEXT
+%token <keyword>	DIAGNOSTICS
 %token <keyword>	DO
 %token <keyword>	ELSE
 %token <keyword>	ELSEIF
@@ -150,8 +158,9 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %token <keyword>	FOR
 %token <keyword>	FOUND
 %token <keyword>	FROM
+%token <keyword>	GET
 %token <keyword>	HANDLER
-%token <keyword>	HINT
+%token <keyword>	HINT_TEXT
 %token <keyword>	IF
 %token <keyword>	IMMEDIATE
 %token <keyword>	INTO
@@ -167,6 +176,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %token <keyword>	REPEAT
 %token <keyword>	RESIGNAL
 %token <keyword>	RETURN
+%token <keyword>	ROW_COUNT
 %token <keyword>	SCROLL
 %token <keyword>	SELECT
 %token <keyword>	SET
@@ -175,6 +185,7 @@ static Plpsm_stmt *make_stmt_sql(int location);
 %token <keyword>	SQLSTATE
 %token <keyword>	SQLCODE
 %token <keyword>	SQLWARNING
+%token <keyword>	STACKED
 %token <keyword>	THEN
 %token <keyword>	UNDO
 %token <keyword>	UNTIL
@@ -253,6 +264,7 @@ stmt:
 			| stmt_select_into			{ $$ = $1; }
 			| stmt_signal				{ $$ = $1; }
 			| stmt_resignal				{ $$ = $1; }
+			| stmt_get_diag				{ $$ = $1; }
 		;
 
 /*----
@@ -835,6 +847,82 @@ stmt_leave:
 
 /*----
  *
+ * GET [ CURRENT | STACKED | ] DIAGNOSTICS var = key [, ... ]
+ *
+ * fill a variable by diagnostic data
+ */
+stmt_get_diag:
+			GET gd_area_opt DIAGNOSTICS gd_info_list
+				{
+					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_GET_DIAGNOSTICS, @1);
+					new->option = $2;
+					new->data = $4;
+					$$ = new;
+				}
+		;
+
+gd_info_list:
+			gd_info
+				{
+					$1->next = NULL;
+					$$ = $1;
+				}
+			| gd_info_list ',' gd_info
+				{
+					Plpsm_gd_info *iterator = $1;
+					while (iterator != NULL)
+					{
+						if (iterator->next == NULL)
+						{
+							iterator->next = $3;
+							$3->next = NULL;
+							break;
+						}
+						iterator = iterator->next;
+					}
+					$$ = $1;
+				}
+		;
+
+gd_info:
+			qual_identif '=' gd_info_enum
+				{
+					Plpsm_gd_info *new = palloc(sizeof(Plpsm_gd_info));
+					new->target = $1;
+					new->typ = $3;
+					$$ = new;
+				}
+
+gd_area_opt:
+			CURRENT
+				{
+					pstate->has_get_diagnostics_stmt = true;
+					$$ = PLPSM_GDAREA_CURRENT;
+				}
+			| STACKED
+				{
+					pstate->has_get_diagnostics_stmt = true;
+					pstate->has_get_stacked_diagnostics_stmt = true;
+					$$ = PLPSM_GDAREA_STACKED;
+				}
+			|
+				{
+					pstate->has_get_diagnostics_stmt = true;
+					$$ = PLPSM_GDAREA_CURRENT;
+				}
+		;
+
+gd_info_enum:
+			SQLSTATE		{ $$ = PLPSM_GDINFO_SQLSTATE; }
+			| SQLCODE		{ $$ = PLPSM_GDINFO_SQLCODE; }
+			| MESSAGE_TEXT		{ $$ = PLPSM_GDINFO_MESSAGE; }
+			| DETAIL_TEXT		{ $$ = PLPSM_GDINFO_DETAIL; }
+			| HINT_TEXT		{ $$ = PLPSM_GDINFO_HINT; }
+			| ROW_COUNT		{ $$ = PLPSM_GDINFO_ROW_COUNT; }
+		;
+
+/*----
+ *
  * SIGNAL SQLSTATE [ VALUE ] sqlstate [ SET name = 'value' [, ... ]]
  *
  * note: raise a exception
@@ -941,14 +1029,14 @@ signal_info:
 		;
 
 signal_info_item:
-			DETAIL '=' SCONST
+			DETAIL_TEXT '=' SCONST
 				{
 					Plpsm_signal_info *new = palloc(sizeof(Plpsm_signal_info));
 					new->typ = PLPSM_SINFO_DETAIL;
 					new->value = $3;
 					$$ = new;
 				}
-			| HINT '=' SCONST
+			| HINT_TEXT '=' SCONST
 				{
 					Plpsm_signal_info *new = palloc(sizeof(Plpsm_signal_info));
 					new->typ = PLPSM_SINFO_HINT;
@@ -1631,19 +1719,23 @@ is_unreserved_keyword(int tok)
 		case ATOMIC:
 		case AS:
 		case CONTINUE:
-		case DETAIL:
+		case CURRENT:
+		case DETAIL_TEXT:
+		case DIAGNOSTICS:
 		case EXIT:
 		case FOUND:
-		case HINT:
+		case HINT_TEXT:
 		case IMMEDIATE:
 		case MESSAGE_TEXT:
 		case NO:
 		case NOT:
+		case ROW_COUNT:
 		case SCROLL:
 		case SQLEXCEPTION:
 		case SQLSTATE:
 		case SQLWARNING:
 		case SQLCODE:
+		case STACKED:
 		case UNDO:
 			return true;
 		default:
@@ -1730,6 +1822,8 @@ parser_stmt_name(Plpsm_stmt_type typ)
 			return "signal statement";
 		case PLPSM_STMT_RESIGNAL:
 			return "resignal statement";
+		case PLPSM_STMT_GET_DIAGNOSTICS:
+			return "get diagnostics statement";
 		default:
 			return "unknown statment typid";
 	}
@@ -1858,7 +1952,6 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 		case PLPSM_STMT_DECLARE_HANDLER:
 			{
 				Plpsm_condition_value *condition = (Plpsm_condition_value *) stmt->data;
-
 				appendStringInfo(ds, "%s| condtions:", ident);
 				while (condition != NULL)
 				{
@@ -1904,6 +1997,42 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 								break;
 						}
 						sinfo = sinfo->next;
+					}
+					appendStringInfoChar(ds, '\n');
+				}
+				break;
+			}
+		case PLPSM_STMT_GET_DIAGNOSTICS:
+			{
+				Plpsm_gd_info *gdinfo = (Plpsm_gd_info *) stmt->data;
+				if (gdinfo != NULL)
+				{
+					pqualid_out(ds, gdinfo->target);
+					appendStringInfo(ds, "%s| info:", ident);
+					while (gdinfo != NULL)
+					{
+						switch (gdinfo->typ)
+						{
+							case PLPSM_GDINFO_DETAIL:
+								appendStringInfoString(ds, " = DETAIL_TEXT");
+								break;
+							case PLPSM_GDINFO_HINT:
+								appendStringInfoString(ds, " = HINT_TEXT");
+								break;
+							case PLPSM_GDINFO_MESSAGE:
+								appendStringInfoString(ds, " = MESSAGE_TEXT");
+								break;
+							case PLPSM_GDINFO_SQLSTATE:
+								appendStringInfoString(ds, " = SQLSTATE");
+								break;
+							case PLPSM_GDINFO_SQLCODE:
+								appendStringInfoString(ds, " = SQLCODE");
+								break;
+							case PLPSM_GDINFO_ROW_COUNT:
+								appendStringInfoString(ds, " = ROW_COUNT");
+								break;
+						}
+						gdinfo = gdinfo->next;
 					}
 					appendStringInfoChar(ds, '\n');
 				}
@@ -2030,6 +2159,7 @@ read_embeded_sql(int until1,
 			case SIGNAL:
 			case WHILE:
 			case UNTIL:
+			case GET:
 				yyerror("using not allowed PLPSM keyword");
 		}
 

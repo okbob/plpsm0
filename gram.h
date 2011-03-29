@@ -59,55 +59,60 @@
      CONDITION = 276,
      CONTINUE = 277,
      CURSOR = 278,
-     DECLARE = 279,
-     DEFAULT = 280,
-     DETAIL = 281,
-     DO = 282,
-     ELSE = 283,
-     ELSEIF = 284,
-     END = 285,
-     EXECUTE = 286,
-     EXIT = 287,
-     FETCH = 288,
-     FOR = 289,
-     FOUND = 290,
-     FROM = 291,
-     HANDLER = 292,
-     HINT = 293,
-     IF = 294,
-     IMMEDIATE = 295,
-     INTO = 296,
-     ITERATE = 297,
-     LEAVE = 298,
-     LOOP = 299,
-     MESSAGE_TEXT = 300,
-     NO = 301,
-     NOT = 302,
-     OPEN = 303,
-     PREPARE = 304,
-     PRINT = 305,
-     REPEAT = 306,
-     RESIGNAL = 307,
-     RETURN = 308,
-     SCROLL = 309,
-     SELECT = 310,
-     SET = 311,
-     SIGNAL = 312,
-     SQLEXCEPTION = 313,
-     SQLSTATE = 314,
-     SQLCODE = 315,
-     SQLWARNING = 316,
-     THEN = 317,
-     UNDO = 318,
-     UNTIL = 319,
-     USING = 320,
-     VALUE = 321,
-     WHEN = 322,
-     WHILE = 323,
-     INSERT = 324,
-     UPDATE = 325,
-     DELETE = 326,
-     TRUNCATE = 327
+     CURRENT = 279,
+     DECLARE = 280,
+     DEFAULT = 281,
+     DETAIL_TEXT = 282,
+     DIAGNOSTICS = 283,
+     DO = 284,
+     ELSE = 285,
+     ELSEIF = 286,
+     END = 287,
+     EXECUTE = 288,
+     EXIT = 289,
+     FETCH = 290,
+     FOR = 291,
+     FOUND = 292,
+     FROM = 293,
+     GET = 294,
+     HANDLER = 295,
+     HINT_TEXT = 296,
+     IF = 297,
+     IMMEDIATE = 298,
+     INTO = 299,
+     ITERATE = 300,
+     LEAVE = 301,
+     LOOP = 302,
+     MESSAGE_TEXT = 303,
+     NO = 304,
+     NOT = 305,
+     OPEN = 306,
+     PREPARE = 307,
+     PRINT = 308,
+     REPEAT = 309,
+     RESIGNAL = 310,
+     RETURN = 311,
+     ROW_COUNT = 312,
+     SCROLL = 313,
+     SELECT = 314,
+     SET = 315,
+     SIGNAL = 316,
+     SQLEXCEPTION = 317,
+     SQLSTATE = 318,
+     SQLCODE = 319,
+     SQLWARNING = 320,
+     STACKED = 321,
+     THEN = 322,
+     UNDO = 323,
+     UNTIL = 324,
+     USING = 325,
+     VALUE = 326,
+     WHEN = 327,
+     WHILE = 328,
+     INSERT = 329,
+     UPDATE = 330,
+     DELETE = 331,
+     TRUNCATE = 332
    };
 #endif
 
@@ -118,7 +123,7 @@ typedef union YYSTYPE
 {
 
 /* Line 1685 of yacc.c  */
-#line 71 "gram.y"
+#line 73 "gram.y"
 
 		core_YYSTYPE		core_yystype;
 		/* these fields must match core_YYSTYPE */
@@ -136,12 +141,13 @@ typedef union YYSTYPE
 		Plpsm_positioned_qualid		*qualid;
 		Plpsm_condition_value		*condition;
 		Plpsm_signal_info		*sinfo;
+		Plpsm_gd_info			*ginfo;
 		Node		*node;
 
 
 
 /* Line 1685 of yacc.c  */
-#line 145 "gram.h"
+#line 151 "gram.h"
 } YYSTYPE;
 # define YYSTYPE_IS_TRIVIAL 1
 # define yystype YYSTYPE /* obsolescent; will be withdrawn */

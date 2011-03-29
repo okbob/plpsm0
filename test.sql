@@ -1630,6 +1630,86 @@ begin atomic
 end;
 $$ language psm0;
 
+create or replace function test70(out r text) as $$
+begin
+  declare exit handler for sqlwarning
+      get diagnostics r = sqlstate;
+  signal sqlstate '02002';
+end;
+$$ language psm0;
+
+create or replace function test70_1(out r int) as $$
+begin
+  declare sqlstate char(5);
+  declare sqlcode int;
+  declare exit handler for sqlwarning
+    begin
+      print sqlstate, sqlcode;
+      get diagnostics r = sqlcode;
+    end;
+  signal sqlstate '02002';
+end;
+$$ language psm0;
+
+--
+-- get diagnostics statement doesn't modify first_area
+--
+create or replace function test70_2(out r int) as $$
+begin
+  declare sqlstate char(5);
+  declare sqlcode int;
+  declare exit handler for sqlwarning
+    begin
+      get diagnostics r = sqlcode;
+      print sqlstate, sqlcode;
+    end;
+  signal sqlstate '02002';
+end;
+$$ language psm0;
+
+create or replace function test71(out s int, out _sqlcode int, out _sqlstate text)
+as $$
+begin
+  declare aux int;
+  declare c1 cursor for select a from footab;
+  declare exit handler for not found
+    begin
+      get diagnostics _sqlcode = sqlcode, _sqlstate = sqlstate;
+    end;
+  set s = 0;
+  open c1;
+  fetch c1 into aux;
+  loop
+    set s = s + aux;
+    fetch c1 into aux;
+  end loop;
+end;
+$$ language psm0;
+
+create or replace function test71_1(out s int, out _sqlcode int, out _sqlstate text, out _message text)
+as $$
+begin atomic
+  declare aux int;
+  declare sqlcode int;
+  declare c1 cursor for select a from footab;
+  declare undo handler for sqlstate '55001'
+    begin
+      get diagnostics _sqlcode = sqlcode, _sqlstate = sqlstate, _message = message_text;
+    end;
+  set s = 0;
+  open c1;
+  loop
+    fetch c1 into aux;
+    if sqlcode <> 0 then
+      signal sqlstate '55001' set message_text = 'HANDLED NOT FOUND, ALL IS OK';
+    end if;
+    set s = s + aux;
+  end loop;
+end;
+$$ language psm0;
+
+
+
 /*
  * example of before trigger
 
@@ -1654,7 +1734,6 @@ $$ language psm0;
 create or replace function assert(text, int, int)
 returns void as $$
 begin
-  raise notice '*** test % ***', $1;
   if ($2 <> $3) then
     raise exception 'test "%" broken. %<>%', $1, $2, $3;
   end if;
@@ -1833,7 +1912,11 @@ begin
   perform assert('test69_2', '00000', test69_2(10));
   perform assert('test69_2', '22012', test69_2(0));
 
-  
+  perform assert('test70', '02002', test70());
+  perform assert('test70_1', 33554560, test70_1());
+  perform assert('test70_2', 33554560, test70_2());
+  perform assert('test71', 128, (test71())._sqlcode);
+  perform assert('test71_1', 'HANDLED NOT FOUND, ALL IS OK', (test71_1())._message);
 
   raise notice '******* All tests are ok *******';
 end;
