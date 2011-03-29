@@ -1708,7 +1708,20 @@ begin atomic
 end;
 $$ language psm0;
 
-
+create or replace function test71_2(a int)
+returns text as $$
+begin atomic
+  declare _sqlstate text;
+  declare aux int;
+  declare undo handler for sqlexception
+  begin
+    get diagnostics _sqlstate = sqlstate;
+    return _sqlstate;
+  end;
+  set aux = 10 / a;
+  return '00000';
+end;
+$$ language psm0;
 
 /*
  * example of before trigger
@@ -1917,6 +1930,8 @@ begin
   perform assert('test70_2', 33554560, test70_2());
   perform assert('test71', 128, (test71())._sqlcode);
   perform assert('test71_1', 'HANDLED NOT FOUND, ALL IS OK', (test71_1())._message);
+  perform assert('test71_2', '00000', test71_2(10));
+  perform assert('test71_2', '22012', test71_2(0));
 
   raise notice '******* All tests are ok *******';
 end;
