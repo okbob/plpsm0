@@ -58,9 +58,9 @@ static void plpsm_exec_error_callback(void *arg);
  * returns zero.
  */
 static int
-search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int *ROP, int htnum)
+search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int *ROP, int htnum, Plpsm_handler_type *htyp)
 {
-	int handler_addr;
+	int handler_addr = 0;
 
 	if (htnum > 0 && edata->sqlerrcode != ERRCODE_QUERY_CANCELED)
 	{
@@ -126,7 +126,6 @@ search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int 
 			ht_item = &mod->code->code[--ht_addr];
 		}
 
-		/* Release a error data, when we found a good handler */
 		if (handler_addr > 0)
 		{
 			if (ht_item->HT_field.htyp == PLPSM_HANDLER_UNDO)
@@ -136,7 +135,9 @@ search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int 
 				SPI_restore_connection();
 			}
 
-			//FreeErrorData(edata);
+			if (htyp != NULL)
+				*htyp = ht_item->HT_field.htyp;
+
 			return handler_addr;
 		}
 	}
@@ -228,6 +229,29 @@ diagnostics_sqlstate(DiagnosticsInfo dginfo, int sqlstate, int level, int64 row_
 	set_text(&dginfo->hint_text, NULL);
 }
 
+static void
+diagnostics_info_move(DiagnosticsInfo target, DiagnosticsInfo src)
+{
+	target->level = src->level;
+	target->row_count = src->row_count;
+	target->sqlstate = src->sqlstate;
+
+	if (target->message_text != NULL)
+		pfree(target->message_text);
+	if (target->detail_text != NULL)
+		pfree(target->detail_text);
+	if (target->hint_text != NULL)
+		pfree(target->hint_text);
+
+	target->message_text = src->message_text;
+	target->detail_text = src->detail_text;
+	target->hint_text = src->hint_text;
+
+	src->message_text = NULL;
+	src->detail_text = NULL;
+	src->hint_text = NULL;
+}
+
 static Datum
 execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 {
@@ -243,6 +267,7 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	ResourceOwner			ResourceOwnerStack[1024];
 	DiagnosticsInfoData		DInfoStack[128];
 	DiagnosticsInfoData		first_area;
+	DiagnosticsInfoData		signal_properties;
 	int		ROP = -1;
 	int	sqlstate = 0;
 	int64		row_count;
@@ -263,6 +288,14 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	bool 	keep_diagnostics_info = false;		/* when is true, then statement actualises first_area */
 
 	DataPtrs = mod->DataPtrs;
+
+	/* initialise stack of signal properties */
+	signal_properties.level = 0;
+	signal_properties.row_count = 0;
+	signal_properties.sqlstate = 0;
+	signal_properties.message_text = NULL;
+	signal_properties.detail_text = NULL;
+	signal_properties.hint_text = NULL;
 
 	/* 
 	 * Output functions for types used in variables are not searchable in 
@@ -430,7 +463,7 @@ next_op:
 
 						rollback_nested_transactions = true;
 
-						handler_addr = search_handler(mod, edata, ResourceOwnerStack, &ROP, pcode->htnum);
+						handler_addr = search_handler(mod, edata, ResourceOwnerStack, &ROP, pcode->htnum, NULL);
 						if (handler_addr > 0)
 						{
 							sqlstate = edata->sqlerrcode;
@@ -789,6 +822,9 @@ next_op:
 							else
 								values[pcode->get_diagnostics.offset] = Int64GetDatum(darea->row_count);
 							break;
+
+						default:
+							/* be compiler quite */;
 					}
 					if (!isnull)
 					{
@@ -1294,14 +1330,7 @@ next_op:
 						 * Handler must to push and pop these first_area on stack when it is requested
 						 */
 						if (keep_diagnostics_info)
-						{
-							first_area.level = pcode->signal_params.level;
-							first_area.row_count = 0;
-							first_area.sqlstate = pcode->signal_params.sqlcode;
-							set_text(&first_area.message_text, pcode->signal_params.message);
-							set_text(&first_area.detail_text, pcode->signal_params.detail);
-							set_text(&first_area.hint_text, pcode->signal_params.hint);
-						}
+							diagnostics_info_move(&first_area, &signal_properties);
 
 						if (pcode->signal_params.is_undo_handler)
 						{
@@ -1333,30 +1362,230 @@ next_op:
 						int oldinfo = dinfo->is_signal;
 
 						/* dont append context informations to notices */
-						if (pcode->signal_params.level == NOTICE)
+						if (signal_properties.level == NOTICE)
 							dinfo->is_signal = true;
 
 						/* 
 						 * in this moment we don't call a handler, so when level is NOTICE or WARNING
 						 * we must to actualise a diagnostics info.
 						 */
-						if (keep_diagnostics_info && (pcode->signal_params.level == NOTICE || pcode->signal_params.level == WARNING))
-						{
-							first_area.row_count = 0;
-							first_area.sqlstate = pcode->signal_params.sqlcode;
+						if (keep_diagnostics_info && (signal_properties.level == NOTICE || 
+								    signal_properties.level == WARNING))
+							diagnostics_info_move(&first_area, &signal_properties);
 
-							set_text(&first_area.message_text, pcode->signal_params.message);
-							set_text(&first_area.detail_text, pcode->signal_params.detail);
-							set_text(&first_area.hint_text, pcode->signal_params.hint);
+						ereport(signal_properties.level,
+								( errcode(signal_properties.sqlstate),
+								 errmsg_internal("%s", signal_properties.message_text != NULL ? 
+												signal_properties.message_text : ""),
+								 (signal_properties.detail_text != NULL) ? errdetail("%s", signal_properties.detail_text) : 0,
+								 (signal_properties.hint_text != NULL) ? errhint("%s", signal_properties.hint_text) : 0));
+						dinfo->is_signal = oldinfo;
+					}
+				}
+				break;
+
+			case PCODE_RESIGNAL_CALL:
+			case PCODE_RESIGNAL_JMP:
+				{
+					/* 
+					 * now signal_properties has a mix of stacked info and resignal stmt info,
+					 * if we know a target address, we can call there.
+					 */
+					if (pcode->signal_params.addr != 0)
+					{
+						/* 
+						 * Actualise a first_area when it is requested
+						 * Handler must to push and pop these first_area on stack when it is requested
+						 */
+						if (keep_diagnostics_info)
+							diagnostics_info_move(&first_area, &signal_properties);
+
+						if (pcode->signal_params.is_undo_handler)
+						{
+							MemoryContext	oldcontext = CurrentMemoryContext;
+
+							RollbackAndReleaseCurrentSubTransaction();
+							MemoryContextSwitchTo(oldcontext);
+							CurrentResourceOwner = ResourceOwnerStack[ROP--];
+							SPI_restore_connection();
 						}
 
-						ereport(pcode->signal_params.level,
-								( errcode(pcode->signal_params.sqlcode),
-								 errmsg_internal("%s", pcode->signal_params.message != NULL ? 
-												pcode->signal_params.message : ""),
-								 (pcode->signal_params.detail != NULL) ? errdetail("%s", pcode->signal_params.detail) : 0,
-								 (pcode->signal_params.hint != NULL) ? errhint("%s", pcode->signal_params.hint) : 0));
-						dinfo->is_signal = oldinfo;
+						if (pcode->typ == PCODE_SIGNAL_JMP)
+						{
+							PC = pcode->addr;
+							goto next_op;
+						}
+						else
+						{
+							if (SP == 1024)
+								elog(ERROR, "runtime error, stack is full");
+							CallStack[SP++] = PC + 1;
+							PC = pcode->addr;
+							goto next_op;
+						}
+					}
+					else
+					{
+						int		handler_addr;
+						ErrorData edata;
+						Plpsm_handler_type htyp;
+
+						edata.sqlerrcode = signal_properties.sqlstate;
+						handler_addr = search_handler(mod, &edata, ResourceOwnerStack, &ROP, pcode->htnum, &htyp);
+						if (handler_addr > 0)
+						{
+							if (keep_diagnostics_info)
+								diagnostics_info_move(&first_area, &signal_properties);
+
+							if (htyp == PLPSM_HANDLER_CONTINUE)
+							{
+								if (SP == 1024)
+									elog(ERROR, "runtime error, stack is full");
+								CallStack[SP++] = PC + 1;
+								PC = handler_addr;
+								goto next_op;
+							}
+							else
+							{
+								PC = handler_addr;
+								goto next_op;
+							}
+						}
+						else
+						{
+							/* there isn't local handler, so emit outer handler */
+							/* raise a outer exception */
+							int oldinfo = dinfo->is_signal;
+
+							/* dont append context informations to notices */
+							if (signal_properties.level == NOTICE)
+								dinfo->is_signal = true;
+
+							/* 
+							 * in this moment we don't call a handler, so when level is NOTICE or WARNING
+							 * we must to actualise a diagnostics info.
+							 */
+							if (keep_diagnostics_info && (signal_properties.level == NOTICE || 
+									    signal_properties.level == WARNING))
+								diagnostics_info_move(&first_area, &signal_properties);
+
+							ereport(signal_properties.level,
+									( errcode(signal_properties.sqlstate),
+									 errmsg_internal("%s", signal_properties.message_text != NULL ? 
+													signal_properties.message_text : ""),
+									 (signal_properties.detail_text != NULL) ? errdetail("%s", signal_properties.detail_text) : 0,
+									 (signal_properties.hint_text != NULL) ? errhint("%s", signal_properties.hint_text) : 0));
+							dinfo->is_signal = oldinfo;
+						}
+					}
+				}
+				break;
+
+			case PCODE_SIGNAL_PROPERTY:
+				{
+					switch (pcode->signal_property.typ)
+					{
+						case PLPSM_SIGNAL_PROPERTY_RESET:
+							{
+								signal_properties.level = 0;
+								signal_properties.row_count = 0;
+								signal_properties.sqlstate = 0;
+								set_text(&signal_properties.message_text, NULL);
+								set_text(&signal_properties.detail_text, NULL);
+								set_text(&signal_properties.hint_text, NULL);
+							}
+							break;
+
+						case PLPSM_SIGNAL_PROPERTY_LOAD_STACKED:
+							{
+								if (DID == -1)
+									elog(ERROR, "runtime error, diagnostick stack is empty");
+
+								signal_properties.level = DInfoStack[DID].level;
+								signal_properties.row_count = 0;
+								signal_properties.sqlstate = DInfoStack[DID].sqlstate;
+								sqlstate = signal_properties.sqlstate;
+								set_text(&signal_properties.message_text, DInfoStack[DID].message_text);
+								set_text(&signal_properties.detail_text, DInfoStack[DID].detail_text);
+								set_text(&signal_properties.hint_text, DInfoStack[DID].hint_text);
+							}
+							break;
+
+						case PLPSM_SIGNAL_PROPERTY_SET_INT:
+							{
+								Assert(pcode->signal_property.gdtyp == PLPSM_GDINFO_SQLCODE ||
+									pcode->signal_property.gdtyp == PLPSM_GDINFO_LEVEL);
+
+								switch (pcode->signal_property.gdtyp)
+								{
+									case PLPSM_GDINFO_SQLCODE:
+										signal_properties.sqlstate = pcode->signal_property.ival;
+										sqlstate = signal_properties.sqlstate;
+										break;
+									case PLPSM_GDINFO_LEVEL:
+										signal_properties.level = pcode->signal_property.ival;
+										break;
+									default:
+										elog(ERROR, "internal error, diagnostics variable isn't of int type");
+								}
+							}
+							break;
+
+						case PLPSM_SIGNAL_PROPERTY_SET_CSTRING:
+							{
+								Assert(pcode->signal_property.gdtyp == PLPSM_GDINFO_DETAIL ||
+									pcode->signal_property.gdtyp == PLPSM_GDINFO_HINT ||
+									pcode->signal_property.gdtyp == PLPSM_GDINFO_MESSAGE);
+
+								switch (pcode->signal_property.gdtyp)
+								{
+									case PLPSM_GDINFO_DETAIL:
+										set_text(&signal_properties.detail_text,
+												pstrdup(pcode->signal_property.cstr));
+										break;
+									case PLPSM_GDINFO_HINT:
+										set_text(&signal_properties.hint_text,
+												pstrdup(pcode->signal_property.cstr));
+										break;
+									case PLPSM_GDINFO_MESSAGE:
+										set_text(&signal_properties.message_text,
+												pstrdup(pcode->signal_property.cstr));
+										break;
+									default:
+										elog(ERROR, "internal error, diagnostics variable isn't of text type");
+								}
+							}
+							break;
+
+						case PLPSM_SIGNAL_PROPERTY_COPY_TEXT_VAR:
+							{
+								char *cstr = NULL;
+
+								Assert(pcode->signal_property.gdtyp == PLPSM_GDINFO_DETAIL ||
+									pcode->signal_property.gdtyp == PLPSM_GDINFO_HINT ||
+									pcode->signal_property.gdtyp == PLPSM_GDINFO_MESSAGE);
+
+								if (nulls[pcode->signal_property.offset] == 'n')
+									elog(ERROR, "a diagnostics value is NULL");
+								else
+									cstr = text_to_cstring(DatumGetTextP(values[pcode->signal_property.offset]));
+
+								switch (pcode->signal_property.gdtyp)
+								{
+									case PLPSM_GDINFO_DETAIL:
+										set_text(&signal_properties.detail_text, cstr);
+										break;
+									case PLPSM_GDINFO_HINT:
+										set_text(&signal_properties.hint_text, cstr);
+										break;
+									case PLPSM_GDINFO_MESSAGE:
+										set_text(&signal_properties.message_text, cstr);
+										break;
+									default:
+										elog(ERROR, "internal error, diagnostics variable isn't of text type");
+								}
+							}
+							break;
 					}
 				}
 				break;
@@ -1538,5 +1767,3 @@ plpsm_exec_error_callback(void *arg)
 	errcontext("%s", ds.data);
 	pfree(ds.data);
 }
-
-

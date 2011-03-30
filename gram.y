@@ -965,18 +965,21 @@ stmt_resignal:
 			RESIGNAL
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
+					pstate->has_resignal_stmt = true;
 					$$ = new;
 				}
 			| RESIGNAL SQLSTATE opt_value sqlstate
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
 					new->option = $4;
+					pstate->has_resignal_stmt = true;
 					$$ = new;
 				}
 			| RESIGNAL WORD
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
 					new->name = $2.ident;
+					pstate->has_resignal_stmt = true;
 					$$ = new;
 				}
 			| RESIGNAL SQLSTATE opt_value sqlstate SET signal_info
@@ -984,6 +987,7 @@ stmt_resignal:
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
 					new->option = $4;
 					new->data = $6;
+					pstate->has_resignal_stmt = true;
 					$$ = new;
 				}
 			| RESIGNAL WORD SET signal_info
@@ -991,12 +995,14 @@ stmt_resignal:
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
 					new->name = $2.ident;
 					new->data = $4;
+					pstate->has_resignal_stmt = true;
 					$$ = new;
 				}
 			| RESIGNAL SET signal_info
 				{
 					Plpsm_stmt *new = plpsm_new_stmt(PLPSM_STMT_RESIGNAL, @1);
 					new->data = $3;
+					pstate->has_resignal_stmt = true;
 					$$ = new;
 				}
 		;
@@ -1048,6 +1054,27 @@ signal_info_item:
 					Plpsm_signal_info *new = palloc(sizeof(Plpsm_signal_info));
 					new->typ = PLPSM_SINFO_MESSAGE;
 					new->value = $3;
+					$$ = new;
+				}
+			| DETAIL_TEXT '=' qual_identif
+				{
+					Plpsm_signal_info *new = palloc(sizeof(Plpsm_signal_info));
+					new->typ = PLPSM_SINFO_DETAIL;
+					new->var = $3;
+					$$ = new;
+				}
+			| HINT_TEXT '=' qual_identif
+				{
+					Plpsm_signal_info *new = palloc(sizeof(Plpsm_signal_info));
+					new->typ = PLPSM_SINFO_HINT;
+					new->var = $3;
+					$$ = new;
+				}
+			| MESSAGE_TEXT '=' qual_identif
+				{
+					Plpsm_signal_info *new = palloc(sizeof(Plpsm_signal_info));
+					new->typ = PLPSM_SINFO_MESSAGE;
+					new->var = $3;
 					$$ = new;
 				}
 		;
@@ -1987,13 +2014,26 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 						switch (sinfo->typ)
 						{
 							case PLPSM_SINFO_DETAIL:
-								appendStringInfo(ds, " DETAIL=\"%s\"", sinfo->value);
+								
+								appendStringInfoString(ds, " DETAIL=");
+								if (sinfo->var != NULL)
+									pqualid_out(ds, sinfo->var);
+								else
+									appendStringInfoString(ds, sinfo->value);
 								break;
 							case PLPSM_SINFO_HINT:
-								appendStringInfo(ds, " HINT=\"%s\"", sinfo->value);
+								appendStringInfo(ds, " HINT=");
+								if (sinfo->var != NULL)
+									pqualid_out(ds, sinfo->var);
+								else
+									appendStringInfoString(ds, sinfo->value);
 								break;
 							case PLPSM_SINFO_MESSAGE:
-								appendStringInfo(ds, " MESSAGE=\"%s\"", sinfo->value);
+								appendStringInfo(ds, " MESSAGE=");
+								if (sinfo->var != NULL)
+									pqualid_out(ds, sinfo->var);
+								else
+									appendStringInfoString(ds, sinfo->value);
 								break;
 						}
 						sinfo = sinfo->next;
@@ -2031,6 +2071,8 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 							case PLPSM_GDINFO_ROW_COUNT:
 								appendStringInfoString(ds, " = ROW_COUNT");
 								break;
+							default:
+								/* be compiler quite */;
 						}
 						gdinfo = gdinfo->next;
 					}

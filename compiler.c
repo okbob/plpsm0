@@ -1257,40 +1257,90 @@ list(Plpsm_pcode_module *m)
 				appendStringInfo(&ds, "ReleaseSubtransaction");
 				break;
 			case PCODE_SIGNAL_JMP:
-				appendStringInfo(&ds, "Signal Jmp %s:%d %d detail:%s, hint: %s, message: %s",
-												    unpack_sql_state(VALUE(signal_params.sqlcode)),
-												    VALUE(signal_params.level),
-												    VALUE(signal_params.addr),
-												    VALUE(signal_params.detail) ? VALUE(signal_params.detail) : "",
-												    VALUE(signal_params.hint) ? VALUE(signal_params.hint) : "",
-												    VALUE(signal_params.message) ? VALUE(signal_params.message) : "");
+				appendStringInfo(&ds, "Signal Jmp %d", VALUE(signal_params.addr));
 				break;
 			case PCODE_SIGNAL_CALL:
-				appendStringInfo(&ds, "Signal Call %s:%d %d detail:%s, hint: %s, message: %s",
-												    unpack_sql_state(VALUE(signal_params.sqlcode)),
-												    VALUE(signal_params.level),
-												    VALUE(signal_params.addr),
-												    VALUE(signal_params.detail) ? VALUE(signal_params.detail) : "",
-												    VALUE(signal_params.hint) ? VALUE(signal_params.hint) : "",
-												    VALUE(signal_params.message) ? VALUE(signal_params.message) : "");
+				appendStringInfo(&ds, "Signal Call %d", VALUE(signal_params.addr));
 				break;
-
+			case PCODE_RESIGNAL_JMP:
+				appendStringInfo(&ds, "Resignal Jmp %d", VALUE(signal_params.addr));
+				break;
+			case PCODE_RESIGNAL_CALL:
+				appendStringInfo(&ds, "Resignal Call %d", VALUE(signal_params.addr));
+				break;
 			case PCODE_SET_SQLSTATE:
 				appendStringInfo(&ds, "Set SQLSTATE '%s'", unpack_sql_state(VALUE(sqlstate)));
 				break;
-
 			case PCODE_DIAGNOSTICS_INIT:
 				appendStringInfo(&ds, "Diagnostics Init");
 				break;
-
 			case PCODE_DIAGNOSTICS_PUSH:
 				appendStringInfo(&ds, "Diagnostics Push");
 				break;
-
 			case PCODE_DIAGNOSTICS_POP:
 				appendStringInfo(&ds, "Diagnostics Pop");
 				break;
-
+			case PCODE_SIGNAL_PROPERTY:
+				{
+					appendStringInfoString(&ds, "Signal Property ");
+					switch (VALUE(signal_property.typ))
+					{
+						case PLPSM_SIGNAL_PROPERTY_RESET:
+							appendStringInfoString(&ds, "Reset");
+							break;
+						case PLPSM_SIGNAL_PROPERTY_LOAD_STACKED:
+							appendStringInfoString(&ds, "Load Stacked");
+							break;
+						case PLPSM_SIGNAL_PROPERTY_SET_INT:
+						case PLPSM_SIGNAL_PROPERTY_SET_CSTRING:
+							switch (VALUE(signal_property.gdtyp))
+							{
+								case PLPSM_GDINFO_MESSAGE:
+									appendStringInfo(&ds, "MESSAGE_TEXT = %s", 
+										VALUE(signal_property.cstr));
+									break;
+								case PLPSM_GDINFO_DETAIL:
+									appendStringInfo(&ds, "DETAIL_TEXT = %s", 
+										VALUE(signal_property.cstr));
+									break;
+								case PLPSM_GDINFO_HINT:
+									appendStringInfo(&ds, "HINT_TEXT = %s", 
+										VALUE(signal_property.cstr));
+									break;
+								case PLPSM_GDINFO_SQLCODE:
+									appendStringInfo(&ds, "SQLCODE = %d", 
+										VALUE(signal_property.ival));
+									break;
+								case PLPSM_GDINFO_LEVEL:
+									appendStringInfo(&ds, "LEVEL = %d", 
+										VALUE(signal_property.ival));
+									break;
+								default:
+									/* be compiler quite */;
+							}
+							break;
+						case PLPSM_SIGNAL_PROPERTY_COPY_TEXT_VAR:
+							switch (VALUE(signal_property.gdtyp))
+							{
+								case PLPSM_GDINFO_MESSAGE:
+									appendStringInfo(&ds, "MESSAGE_TEXT = @%d", 
+										VALUE(signal_property.offset));
+									break;
+								case PLPSM_GDINFO_DETAIL:
+									appendStringInfo(&ds, "DETAIL_TEXT = @%d", 
+										VALUE(signal_property.offset));
+									break;
+								case PLPSM_GDINFO_HINT:
+									appendStringInfo(&ds, "HINT_TEXT = @%d", 
+										VALUE(signal_property.offset));
+									break;
+								default:
+									/* be compiler quite */;
+							}
+							break;
+					}
+					break;
+				}
 			case PCODE_GET_DIAGNOSTICS:
 				appendStringInfo(&ds, "Get %s Diagnostics @%d oid:%d byval:%s = ",
 							VALUE(get_diagnostics.which_area) == PLPSM_GDAREA_CURRENT ? "CURRENT" : "STACKED",
@@ -1317,9 +1367,10 @@ list(Plpsm_pcode_module *m)
 					case PLPSM_GDINFO_ROW_COUNT:
 						appendStringInfoString(&ds, "ROWCOUNT");
 						break;
+					default:
+						/* be compiler quite */;
 				}
 				break;
-
 			case PCODE_HT:
 				{
 					appendStringInfoString(&ds, "HT ");
@@ -1338,7 +1389,7 @@ list(Plpsm_pcode_module *m)
 								break;
 						}
 					}
-				
+
 					switch (VALUE(HT_field.typ))
 					{
 						case PLPSM_HT_SQLCODE:
@@ -1464,6 +1515,12 @@ check_module_size(Plpsm_pcode_module *m)
 						SET_OPVAL(strbuilder.p, v); \
 						EMIT_OPCODE(STRBUILDER, -1); \
 					} while (0)
+#define SIGNAL_PROPERTY(t, gdt, f, v)	do { \
+						SET_OPVAL(signal_property.typ, PLPSM_SIGNAL_PROPERTY_ ## t); \
+						SET_OPVAL(signal_property.gdtyp, PLPSM_GDINFO_ ## gdt); \
+						SET_OPVAL(signal_property.f, v); \
+						EMIT_OPCODE(SIGNAL_PROPERTY, -1); \
+					} while (0);
 
 static void
 compile_release_cursors(CompileState cstate)
@@ -2146,6 +2203,12 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
 				EMIT_OPCODE(RELEASE_SUBTRANSACTION, -1);
 			}
 
+			if (pstate->has_resignal_stmt || pstate->has_get_stacked_diagnostics_stmt)
+			{
+				/* pop a stacked diagnostics info to first_area */
+				EMIT_OPCODE(DIAGNOSTICS_POP, -1);
+			}
+
 			EMIT_OPCODE(RET_SUBR, -1);
 			SET_OPVAL_ADDR(addr1, addr, PC(m));
 		}
@@ -2155,6 +2218,12 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
 		if ((bool) obj->stmt->option)
 			/* release a savepoint */
 			EMIT_OPCODE(RELEASE_SUBTRANSACTION, -1);
+
+		if (pstate->has_resignal_stmt || pstate->has_get_stacked_diagnostics_stmt)
+		{
+			/* pop a stacked diagnostics info to first_area */
+			EMIT_OPCODE(DIAGNOSTICS_POP, -1);
+		}
 	}
 	else
 		release_jmp_entry = PC(m);
@@ -2194,52 +2263,120 @@ ht_size(Plpsm_stmt *stmt)
  * compile a signal statement
  */
 static void
-compile_signal(CompileState cstate, Plpsm_stmt *stmt, int addr, Plpsm_pcode_type typ, bool is_undo_handler)
+compile_signal(CompileState cstate, Plpsm_stmt *stmt, int addr, Plpsm_pcode_type typ, bool is_undo_handler, bool is_resignal)
 {
 	Plpsm_signal_info *sinfo = (Plpsm_signal_info *) stmt->data;
 	Plpsm_pcode_module *m = cstate->module;
 	int	eclass = ERRCODE_TO_CATEGORY(stmt->option);
-
+	int	level;
 
 	SET_OPVAL(signal_params.addr, addr);
 	SET_OPVAL(signal_params.is_undo_handler, is_undo_handler);
 
-	SET_OPVAL(signal_params.sqlcode, stmt->option);
 	/* 
 	 * SQL/PSM doesn't know a levels in PL/pgSQL semantic. We must to deduce
 	 * level from sql state.
 	 */
 	if (eclass == MAKE_SQLSTATE('0','0','0','0','0'))
-		SET_OPVAL(signal_params.level, NOTICE);
+		level = NOTICE;
 	else if (eclass == MAKE_SQLSTATE('0','2','0','0','0') || eclass == MAKE_SQLSTATE('0','1','0','0','0'))
-		SET_OPVAL(signal_params.level, WARNING);
+		level = WARNING;
 	else
-		SET_OPVAL(signal_params.level, ERROR);
+		level = ERROR;
 
-	SET_OPVAL(signal_params.sqlcode, stmt->option);
+	SIGNAL_PROPERTY(SET_INT, SQLCODE, ival, stmt->option);
+	SIGNAL_PROPERTY(SET_INT, LEVEL, ival, level);
+
 	while (sinfo != NULL)
 	{
-		switch (sinfo->typ)
+		Plpsm_object *var;
+
+		if (sinfo->var != NULL)
 		{
-			case PLPSM_SINFO_DETAIL:
-				SET_OPVAL(signal_params.detail, pstrdup(sinfo->value));
-				break;
-			case PLPSM_SINFO_HINT:
-				SET_OPVAL(signal_params.hint, pstrdup(sinfo->value));
-				break;
-			case PLPSM_SINFO_MESSAGE:
-				SET_OPVAL(signal_params.message, pstrdup(sinfo->value));
-				break;
+			const char *fieldname;
+
+			var = resolve_target(cstate, sinfo->var, &fieldname, PLPSM_STMT_DECLARE_VARIABLE);
+			if (fieldname != NULL)
+				elog(ERROR, "variable used in SIGNAL or RESIGNAL statement must not be a composite type");
+
+			switch (var->stmt->datum.typoid)
+			{
+				case TEXTOID:
+				case BPCHAROID:
+				case VARCHAROID:
+					break;
+				default:
+					elog(ERROR, "variable used in SIGNAL or RESIGNAL statement should be only text type");
+			}
+
+			switch (sinfo->typ)
+			{
+				case PLPSM_SINFO_DETAIL:
+					SIGNAL_PROPERTY(COPY_TEXT_VAR, DETAIL, offset, var->offset);
+					break;
+				case PLPSM_SINFO_HINT:
+					SIGNAL_PROPERTY(COPY_TEXT_VAR, HINT, offset, var->offset);
+					break;
+				case PLPSM_SINFO_MESSAGE:
+					SIGNAL_PROPERTY(COPY_TEXT_VAR, MESSAGE, offset, var->offset);
+					break;
+			}
+		}
+		else
+		{
+			switch (sinfo->typ)
+			{
+				case PLPSM_SINFO_DETAIL:
+					SIGNAL_PROPERTY(SET_CSTRING, DETAIL, cstr, pstrdup(sinfo->value));
+					break;
+				case PLPSM_SINFO_HINT:
+					SIGNAL_PROPERTY(SET_CSTRING, HINT, cstr, pstrdup(sinfo->value));
+					break;
+				case PLPSM_SINFO_MESSAGE:
+					SIGNAL_PROPERTY(SET_CSTRING, MESSAGE, cstr, pstrdup(sinfo->value));
+					break;
+			}
 		}
 		sinfo = sinfo->next;
 	}
 
-	if (typ == PCODE_SIGNAL_JMP)
-		EMIT_OPCODE(SIGNAL_JMP, stmt->lineno);
-	else 
+	if (cstate->stack.has_sqlstate)
 	{
-		Assert(typ == PCODE_SIGNAL_CALL);
-		EMIT_OPCODE(SIGNAL_CALL, stmt->lineno);
+		Plpsm_object *var = lookup_var(cstate->current_scope, "sqlstate");
+		Assert(var != NULL);
+		SET_OPVALS_DATUM_COPY(target, var);
+		EMIT_OPCODE(SQLSTATE_REFRESH, -1);
+	}
+
+	if (cstate->stack.has_sqlcode)
+	{
+		Plpsm_object *var = lookup_var(cstate->current_scope, "sqlcode");
+		Assert(var != NULL);
+		SET_OPVALS_DATUM_COPY(target, var);
+		EMIT_OPCODE(SQLCODE_REFRESH, -1);
+	}
+
+	SET_OPVAL(addr, addr);
+
+	if (!is_resignal)
+	{
+		if (typ == PCODE_SIGNAL_JMP)
+			EMIT_OPCODE(SIGNAL_JMP, stmt->lineno);
+		else 
+		{
+			Assert(typ == PCODE_SIGNAL_CALL);
+			EMIT_OPCODE(SIGNAL_CALL, stmt->lineno);
+		}
+	}
+	else
+	{
+		if (typ == PCODE_SIGNAL_JMP)
+			EMIT_OPCODE(RESIGNAL_JMP, stmt->lineno);
+		else 
+		{
+			Assert(typ == PCODE_SIGNAL_CALL);
+			EMIT_OPCODE(RESIGNAL_CALL, stmt->lineno);
+		}
 	}
 }
 
@@ -2495,7 +2632,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 						if (offset >= cstate->stack.oids.size)
 						{
 							cstate->stack.oids.size += 128;
-				    			cstate->stack.oids.data = repalloc(cstate->stack.oids.data, cstate->stack.oids.size * sizeof(Oid));
+							cstate->stack.oids.data = repalloc(cstate->stack.oids.data, cstate->stack.oids.size * sizeof(Oid));
 						}
 
 						cstate->stack.oids.data[offset] = InvalidOid;
@@ -2520,6 +2657,9 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					{
 						obj->calls.has_release_call = true;
 					}
+
+					if (pstate->has_resignal_stmt || pstate->has_get_stacked_diagnostics_stmt)
+						EMIT_OPCODE(DIAGNOSTICS_PUSH, -1);
 
 					_compile(cstate, stmt->inner_left, obj);
 
@@ -3090,18 +3230,84 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 				break;
 
 			case PLPSM_STMT_SIGNAL:
+			case PLPSM_STMT_RESIGNAL:
 				{
-					Plpsm_object *handler;
-					Plpsm_condition_value condition;
+					bool	is_resignal = stmt->typ == PLPSM_STMT_RESIGNAL;
 
-					condition.typ = PLPSM_SQLSTATE;
-					condition.sqlstate = stmt->option;
-					condition.next = NULL;
+					if (!cstate->stack.inside_handler && is_resignal)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use a RESIGNAL statement outside condition handler"),
+									parser_errposition(stmt->location)));
 
-					if (cstate->stack.has_sqlstate || cstate->stack.has_sqlcode)
+					if (is_resignal)
 					{
-						SET_OPVAL(sqlstate, condition.sqlstate);
-						EMIT_OPCODE(SET_SQLSTATE, stmt->lineno);
+						SET_OPVAL(signal_property.typ, PLPSM_SIGNAL_PROPERTY_LOAD_STACKED);
+						EMIT_OPCODE(SIGNAL_PROPERTY, -1);
+					}
+					else
+					{
+						SET_OPVAL(signal_property.typ, PLPSM_SIGNAL_PROPERTY_RESET);
+						EMIT_OPCODE(SIGNAL_PROPERTY, -1);
+					}
+
+					if (!is_resignal || (is_resignal && stmt->option != 0))
+					{
+						Plpsm_object *handler;
+						Plpsm_condition_value condition;
+
+						condition.typ = PLPSM_SQLSTATE;
+						condition.sqlstate = stmt->option;
+						condition.next = NULL;
+
+						handler = lookup_handler(cstate->current_scope, &condition);
+						if (handler != NULL)
+						{
+							/* when handler is undo or exit, generate a leave steps */
+							if (handler->stmt->option != PLPSM_HANDLER_CONTINUE)
+							{
+								compile_leave_target_block(cstate, cstate->current_scope, handler->outer);
+								compile_signal(cstate, stmt, handler->calls.entry_addr, PCODE_SIGNAL_JMP,
+											handler->stmt->option == PLPSM_HANDLER_UNDO, is_resignal);
+							}
+							else
+							{
+								compile_signal(cstate, stmt, handler->calls.entry_addr, PCODE_SIGNAL_CALL,
+											handler->stmt->option == PLPSM_HANDLER_UNDO, is_resignal);
+							}
+						}
+						else
+						{
+							/* there are no local handler */
+							compile_signal(cstate, stmt, 0, PCODE_SIGNAL_JMP, false, is_resignal);
+						}
+					}
+					else
+					{
+						Plpsm_signal_info *sinfo = (Plpsm_signal_info *) stmt->data;
+
+						/*
+						 * resignal without known sqlstate, we have to put REFRESH routines
+						 * after statement.
+						 */
+						SIGNAL_PROPERTY(SET_INT, SQLCODE, ival, 0);
+
+						while (sinfo != NULL)
+						{
+							switch (sinfo->typ)
+							{
+								case PLPSM_SINFO_DETAIL:
+									SIGNAL_PROPERTY(SET_CSTRING, DETAIL, cstr, pstrdup(sinfo->value));
+									break;
+								case PLPSM_SINFO_HINT:
+									SIGNAL_PROPERTY(SET_CSTRING, HINT, cstr, pstrdup(sinfo->value));
+									break;
+								case PLPSM_SINFO_MESSAGE:
+									SIGNAL_PROPERTY(SET_CSTRING, MESSAGE, cstr, pstrdup(sinfo->value));
+									break;
+							}
+							sinfo = sinfo->next;
+						}
 
 						if (cstate->stack.has_sqlstate)
 						{
@@ -3118,39 +3324,9 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 							SET_OPVALS_DATUM_COPY(target, var);
 							EMIT_OPCODE(SQLCODE_REFRESH, -1);
 						}
-					}
 
-					handler = lookup_handler(cstate->current_scope, &condition);
-					if (handler != NULL)
-					{
-						/* when handler is undo or exit, generate a leave steps */
-						if (handler->stmt->option != PLPSM_HANDLER_CONTINUE)
-						{
-							compile_leave_target_block(cstate, cstate->current_scope, handler->outer);
-							compile_signal(cstate, stmt, handler->calls.entry_addr, PCODE_SIGNAL_JMP,
-								handler->stmt->option == PLPSM_HANDLER_UNDO);
-						}
-						else
-						{
-							compile_signal(cstate, stmt, handler->calls.entry_addr, PCODE_SIGNAL_CALL,
-								handler->stmt->option == PLPSM_HANDLER_UNDO);
-						}
+						EMIT_OPCODE(RESIGNAL_JMP, stmt->lineno);
 					}
-					else
-					{
-						/* there are no local handler */
-						compile_signal(cstate, stmt, 0, PCODE_SIGNAL_JMP, false);
-					}
-				}
-				break;
-
-			case PLPSM_STMT_RESIGNAL:
-				{
-					if (!cstate->stack.inside_handler)
-						ereport(ERROR,
-								(errcode(ERRCODE_SYNTAX_ERROR),
-								 errmsg("cannot use a RESIGNAL statement outside condition handler"),
-									parser_errposition(stmt->location)));
 				}
 				break;
 
@@ -3196,6 +3372,8 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 											 errmsg("target of SQLCODE or ROW_COUNT should be text int or big int"),
 												parser_errposition(stmt->location)));
 								break;
+							case PLPSM_GDINFO_LEVEL:
+								/* do nothing */;
 						}
 
 						EMIT_OPCODE(GET_DIAGNOSTICS, stmt->lineno);
@@ -3572,7 +3750,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	/*
 	 * initialise diagnostics when is used
 	 */
-	if (parser_state_var.has_get_diagnostics_stmt)
+	if (parser_state_var.has_get_diagnostics_stmt || parser_state_var.has_resignal_stmt)
 		EMIT_OPCODE(DIAGNOSTICS_INIT, -1);
 
 	/* 

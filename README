@@ -57,3 +57,13 @@ What is same between PLPSM and PL/pgSQL:
 
 * lot of routines, that ensure perfect syntax error diagnostic are taken from PL/pgSQL
   source code.
+
+
+What is supported:
+
+P001 Stored modules
+P002 Computational completeness
+P004 Extended CASE statement
+P005 Qualified SQL variable references
+P006 Multiple assignment
+P007 Enhanced diagnostics management (partial, only with diagnostics info supported by PostgreSQL)

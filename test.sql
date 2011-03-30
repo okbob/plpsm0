@@ -1708,7 +1708,33 @@ begin atomic
 end;
 $$ language psm0;
 
-create or replace function test71_2(a int)
+create or replace function test71_2(out s int, out _sqlcode int, out _sqlstate text, out _message text)
+as $$
+begin atomic
+  declare aux int;
+  declare sqlcode int;
+  declare sqlstate char(5);
+  declare msg text default 'My dynamic message';
+  declare c1 cursor for select a from footab;
+  declare undo handler for sqlstate '55001'
+    begin
+      get diagnostics _sqlcode = sqlcode, _sqlstate = sqlstate, _message = message_text;
+    end;
+  set s = 0;
+  open c1;
+  loop
+    fetch c1 into aux;
+    get diagnostics _sqlcode = sqlcode, _sqlstate = sqlstate;
+    if _sqlcode <> 0 then
+      set msg = msg || ' ' || _sqlstate;
+      signal sqlstate '55001' set message_text = msg;
+    end if;
+    set s = s + aux;
+  end loop;
+end;
+$$ language psm0;
+
+create or replace function test71_3(a int)
 returns text as $$
 begin atomic
   declare _sqlstate text;
@@ -1732,7 +1758,7 @@ begin
   declare n footab as new;
   declare o footab as old;
   if n.i <> o.i then
-    -- skip this row
+    -- skip this record
     signal sqlstate '02099';
   end if;
   set n.j = o.j;
@@ -1930,8 +1956,9 @@ begin
   perform assert('test70_2', 33554560, test70_2());
   perform assert('test71', 128, (test71())._sqlcode);
   perform assert('test71_1', 'HANDLED NOT FOUND, ALL IS OK', (test71_1())._message);
-  perform assert('test71_2', '00000', test71_2(10));
-  perform assert('test71_2', '22012', test71_2(0));
+  perform assert('test71_2', 'My dynamic message 02000', (test71_1())._message);
+  perform assert('test71_3', '00000', test71_3(10));
+  perform assert('test71_3', '22012', test71_3(0));
 
   raise notice '******* All tests are ok *******';
 end;

@@ -12,6 +12,7 @@
 
 typedef struct
 {
+	bool has_resignal_stmt;
 	bool has_get_diagnostics_stmt;
 	bool has_get_stacked_diagnostics_stmt;
 } ParserStateData;
@@ -126,7 +127,8 @@ typedef enum
 	PLPSM_GDINFO_MESSAGE,
 	PLPSM_GDINFO_SQLSTATE,
 	PLPSM_GDINFO_SQLCODE,
-	PLPSM_GDINFO_ROW_COUNT
+	PLPSM_GDINFO_ROW_COUNT,
+	PLPSM_GDINFO_LEVEL
 } Plpsm_gd_info_type;
 
 typedef enum
@@ -147,6 +149,7 @@ typedef struct Plpsm_signal_info
 {
 	Plpsm_signal_info_item_type	typ;
 	char	*value;
+	Plpsm_positioned_qualid *var;
 	struct Plpsm_signal_info *next;
 } Plpsm_signal_info;
 
@@ -284,12 +287,24 @@ typedef enum
 	PCODE_HT,
 	PCODE_SIGNAL_JMP,
 	PCODE_SIGNAL_CALL,
+	PCODE_RESIGNAL_JMP,
+	PCODE_RESIGNAL_CALL,
 	PCODE_SET_SQLSTATE,
 	PCODE_DIAGNOSTICS_INIT,
 	PCODE_DIAGNOSTICS_PUSH,
 	PCODE_DIAGNOSTICS_POP,
-	PCODE_GET_DIAGNOSTICS
+	PCODE_GET_DIAGNOSTICS,
+	PCODE_SIGNAL_PROPERTY
 } Plpsm_pcode_type;
+
+typedef enum
+{
+	PLPSM_SIGNAL_PROPERTY_RESET,
+	PLPSM_SIGNAL_PROPERTY_LOAD_STACKED,
+	PLPSM_SIGNAL_PROPERTY_SET_INT,
+	PLPSM_SIGNAL_PROPERTY_SET_CSTRING,
+	PLPSM_SIGNAL_PROPERTY_COPY_TEXT_VAR
+} Plpsm_signal_property_info_type;
 
 typedef enum
 {
@@ -437,12 +452,18 @@ typedef struct
 		{
 			int		addr;
 			bool		is_undo_handler;
-			int	level;
-			int	sqlcode;
-			char	*detail;
-			char	*hint;
-			char	*message;
 		} signal_params;
+		struct
+		{
+			Plpsm_signal_property_info_type typ;
+			Plpsm_gd_info_type gdtyp;
+			union
+			{
+				char *cstr;
+				int	ival;
+				int16	offset;
+			};
+		} signal_property;
 		struct
 		{
 			Plpsm_gd_info_type typ;
