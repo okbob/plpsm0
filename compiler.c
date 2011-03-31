@@ -107,6 +107,7 @@ typedef struct
 		char		*return_expr;		/* generated result expression for function with OUT params */
 	} finfo;
 	PreparedStatement *prepared;
+	bool	use_stacked_diagnostics;		/* true when stacked diagnostics is used */
 } CompileStateData;
 
 #define CURRENT_SCOPE	(cstate->current_scope)
@@ -1272,7 +1273,7 @@ list(Plpsm_pcode_module *m)
 				appendStringInfo(&ds, "Set SQLSTATE '%s'", unpack_sql_state(VALUE(sqlstate)));
 				break;
 			case PCODE_DIAGNOSTICS_INIT:
-				appendStringInfo(&ds, "Diagnostics Init");
+				appendStringInfo(&ds, "Diagnostics Init stacked:%d", VALUE(use_stacked_diagnostics));
 				break;
 			case PCODE_DIAGNOSTICS_PUSH:
 				appendStringInfo(&ds, "Diagnostics Push");
@@ -1417,6 +1418,9 @@ list(Plpsm_pcode_module *m)
 						case PLPSM_HT_RELEASE_SUBTRANSACTION:
 							appendStringInfo(&ds, "Release Subtransaction");
 							break;
+						case PLPSM_HT_DIAGNOSTICS_POP:
+							appendStringInfo(&ds, "Diagnostics Pop");
+							break;
 						case PLPSM_HT_STOP:
 							appendStringInfo(&ds, "STOP");
 							break;
@@ -1437,6 +1441,8 @@ list(Plpsm_pcode_module *m)
 			case PCODE_EXECUTE:
 			case PCODE_SIGNAL_JMP:
 			case PCODE_SIGNAL_CALL:
+			case PCODE_RESIGNAL_JMP:
+			case PCODE_RESIGNAL_CALL:
 				appendStringInfo(&ds, ", HT[%d]", VALUE(htnum));
 			}
 		}
@@ -1465,7 +1471,7 @@ check_module_size(Plpsm_pcode_module *m)
 #define PC(m)				m->length
 
 #define SET_OPVAL(n, v)			m->code[m->length].n = v
-#define EMIT_OPCODE(t, lno)			do { \
+#define EMIT_OPCODE(t, lno)		do { \
 						m->code[m->length].lineno = lno; \
 						m->code[m->length].cframe = plpsm_debug_info ? CURRENT_SCOPE : NULL; \
 						m->code[m->length].htnum = cstate->stack.th_addr; \
@@ -1530,8 +1536,9 @@ compile_release_cursors(CompileState cstate)
 	Plpsm_object *iterator;
 
 	/* search all cursors from current compound statement */
-	Assert(scope->typ == PLPSM_STMT_COMPOUND_STATEMENT ||
-		scope->typ == PLPSM_STMT_SCHEMA);
+	if (scope->typ != PLPSM_STMT_COMPOUND_STATEMENT &&
+		scope->typ != PLPSM_STMT_SCHEMA)
+		return;
 
 	iterator = scope->inner;
 	while (iterator != NULL)
@@ -1558,11 +1565,14 @@ compile_leave_target_block(CompileState cstate, Plpsm_object *scope, Plpsm_objec
 	if (scope == NULL)
 		return;
 
-	if (scope != target_scope && scope->calls.has_release_call)
+	if (scope != target_scope)
 	{
-		scope->calls.release_calls = lappend(scope->calls.release_calls,
+		if (scope->calls.has_release_call)
+		{
+			scope->calls.release_calls = lappend(scope->calls.release_calls,
 										    makeInteger(PC(m)));
-		EMIT_OPCODE(CALL, -1);
+			EMIT_OPCODE(CALL, -1);
+		}
 
 		compile_leave_target_block(cstate, scope->outer, target_scope);
 	}
@@ -1704,7 +1714,6 @@ release_psm_object(CompileState cstate, Plpsm_object *obj, int release_call_entr
 
 	if (obj->calls.release_jmps)
 	{
-		//Assert(release_jmp_entry != 0);
 		foreach(l, obj->calls.release_jmps)
 		{
 			SET_OPVAL_ADDR(intVal(lfirst(l)), addr, release_jmp_entry);
@@ -2160,8 +2169,6 @@ compile_refresh_basic_diagnostic(CompileState cstate)
 				int	addr1 = PC(m);
 				int	addr2;
 
-// ToDo: release first, then call a handler
-
 				EMIT_OPCODE(JMP_NOT_FOUND, -1);
 				addr2 = PC(m);
 				EMIT_OPCODE(JMP, -1);
@@ -2197,13 +2204,13 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
 
 			release_call_entry = PC(m);
 			compile_release_cursors(cstate);
-			if ((bool) obj->stmt->option)
+			if ((bool) obj->stmt->option && obj->typ == PLPSM_STMT_COMPOUND_STATEMENT)
 			{
 				/* release a savepoint */
 				EMIT_OPCODE(RELEASE_SUBTRANSACTION, -1);
 			}
 
-			if (pstate->has_resignal_stmt || pstate->has_get_stacked_diagnostics_stmt)
+			if (obj->typ == PLPSM_STMT_DECLARE_HANDLER && cstate->use_stacked_diagnostics)
 			{
 				/* pop a stacked diagnostics info to first_area */
 				EMIT_OPCODE(DIAGNOSTICS_POP, -1);
@@ -2215,11 +2222,11 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
 
 		release_jmp_entry = PC(m);
 		compile_release_cursors(cstate);
-		if ((bool) obj->stmt->option)
+		if ((bool) obj->stmt->option && obj->typ == PLPSM_STMT_COMPOUND_STATEMENT)
 			/* release a savepoint */
 			EMIT_OPCODE(RELEASE_SUBTRANSACTION, -1);
 
-		if (pstate->has_resignal_stmt || pstate->has_get_stacked_diagnostics_stmt)
+		if (obj->typ == PLPSM_STMT_DECLARE_HANDLER && cstate->use_stacked_diagnostics)
 		{
 			/* pop a stacked diagnostics info to first_area */
 			EMIT_OPCODE(DIAGNOSTICS_POP, -1);
@@ -2658,9 +2665,6 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 						obj->calls.has_release_call = true;
 					}
 
-					if (pstate->has_resignal_stmt || pstate->has_get_stacked_diagnostics_stmt)
-						EMIT_OPCODE(DIAGNOSTICS_PUSH, -1);
-
 					_compile(cstate, stmt->inner_left, obj);
 
 					cstate->stack.has_sqlstate = has_sqlstate;
@@ -2698,6 +2702,12 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 
 					/* in inner code, we can use a RESIGNAL statement */
 					cstate->stack.inside_handler = true;
+
+					if (cstate->use_stacked_diagnostics)
+					{
+						EMIT_OPCODE(DIAGNOSTICS_PUSH, -1);
+						obj->calls.has_release_call = true;
+					}
 					
 					/* 
 					 * UNDO handler does ROLLBACK on entry and jumps
@@ -2707,6 +2717,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					if (stmt->option == PLPSM_HANDLER_CONTINUE)
 					{
 						_compile(cstate, stmt->inner_left, NULL);
+						finalize_block(cstate, obj);
 						EMIT_OPCODE(RET_SUBR, stmt->lineno);
 					}
 					else if (stmt->option == PLPSM_HANDLER_EXIT)
@@ -2718,6 +2729,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 						 * RELEASE stmt.
 						 */
 						_compile(cstate, stmt->inner_left, NULL);
+						finalize_block(cstate, obj);
 						parent->calls.release_jmps = lappend(parent->calls.release_jmps,
 														makeInteger(PC(m)));
 						EMIT_OPCODE(JMP, stmt->lineno);
@@ -2730,7 +2742,8 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 						 * a rollbac is done before we call a handler
 						 */
 						_compile(cstate, stmt->inner_left, NULL);
-						/* jmp from compound statement */
+						finalize_block(cstate, obj);
+						/* jmp out of parent */
 						parent->calls.leave_jmps = lappend(parent->calls.leave_jmps,
 														makeInteger(PC(m)));
 						EMIT_OPCODE(JMP, stmt->lineno);
@@ -3290,8 +3303,6 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 						 * resignal without known sqlstate, we have to put REFRESH routines
 						 * after statement.
 						 */
-						SIGNAL_PROPERTY(SET_INT, SQLCODE, ival, 0);
-
 						while (sinfo != NULL)
 						{
 							switch (sinfo->typ)
@@ -3482,7 +3493,7 @@ compile_ht(CompileState cstate, Plpsm_object *scope, int parent_addr)
 							SET_OPVAL(HT_field.addr, iterator->calls.entry_addr);
 							EMIT_OPCODE(HT, -1);
 						}
-					    	if (c->typ == PLPSM_SQLEXCEPTION)
+						if (c->typ == PLPSM_SQLEXCEPTION)
 						{
 							SET_OPVAL(HT_field.typ, PLPSM_HT_SQLEXCEPTION);
 							SET_OPVAL(HT_field.htyp, iterator->stmt->option);
@@ -3513,6 +3524,13 @@ compile_ht(CompileState cstate, Plpsm_object *scope, int parent_addr)
 							EMIT_OPCODE(HT, -1);
 						}
 						c = c->next;
+					}
+
+					/* store pop stacked diagnostics */
+					if (cstate->use_stacked_diagnostics)
+					{
+						SET_OPVAL(HT_field.typ, PLPSM_HT_DIAGNOSTICS_POP);
+						EMIT_OPCODE(HT, -1);
 					}
 				}
 				iterator = iterator->next;
@@ -3704,6 +3722,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 
 	parser_state_var.has_get_diagnostics_stmt = false;
 	parser_state_var.has_get_stacked_diagnostics_stmt = false;
+	parser_state_var.has_resignal_stmt = false;
 	pstate = &parser_state_var;
 
 	plerrcontext.callback = plpsm_compile_error_callback;
@@ -3737,6 +3756,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	cstated.stack.has_notfound_continue_handler = false;
 	cstated.stack.inside_handler = false;
 	cstated.prepared = NULL;
+	cstated.use_stacked_diagnostics = false;
 
 	cstated.finfo.result.datum.typoid = procStruct->prorettype;
 	get_typlenbyval(cstated.finfo.result.datum.typoid, &cstated.finfo.result.datum.typlen, &cstated.finfo.result.datum.typbyval);
@@ -3750,8 +3770,15 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	/*
 	 * initialise diagnostics when is used
 	 */
-	if (parser_state_var.has_get_diagnostics_stmt || parser_state_var.has_resignal_stmt)
+	if (pstate->has_resignal_stmt || pstate->has_get_stacked_diagnostics_stmt ||
+		 pstate->has_get_diagnostics_stmt)
+	{
+		if (pstate->has_resignal_stmt || pstate->has_get_stacked_diagnostics_stmt)
+			cstated.use_stacked_diagnostics = true;
+
+		SET_OPVAL(use_stacked_diagnostics, cstated.use_stacked_diagnostics);
 		EMIT_OPCODE(DIAGNOSTICS_INIT, -1);
+	}
 
 	/* 
 	 * append to scope a variables for parameters, and store 

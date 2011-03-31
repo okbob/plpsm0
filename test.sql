@@ -1749,6 +1749,77 @@ begin atomic
 end;
 $$ language psm0;
 
+create or replace function test72()
+returns text as $$
+begin atomic
+  declare r text;
+  declare s text;
+  declare undo handler for sqlexception
+    begin
+      get diagnostics r = sqlstate;
+      set s = s || ',' || r;
+      return s;
+    end;
+  begin atomic
+    declare undo handler for sqlexception
+      begin
+        get diagnostics r = sqlstate;
+        set s =  r;
+        signal sqlstate '33333';
+        resignal;
+      end;
+    signal sqlstate '66550';
+  end;
+end;
+$$ language psm0;
+
+create or replace function test72_1()
+returns text as $$
+begin atomic
+  declare r text;
+  declare s text;
+  declare undo handler for sqlexception
+    begin
+      get diagnostics r = sqlstate;
+      set s = s || ',' || r;
+      return s;
+    end;
+  begin atomic
+    declare undo handler for sqlexception
+      begin
+        get diagnostics r = sqlstate;
+        set s =  r;
+        resignal;
+      end;
+    signal sqlstate '66550';
+  end;
+end;
+$$ language psm0;
+
+create or replace function test72_2()
+returns text as $$
+begin atomic
+  declare r text;
+  declare s text;
+  declare undo handler for sqlexception
+    begin
+      get diagnostics r = sqlstate;
+      set s = s || ',' || r;
+      return s;
+    end;
+  begin atomic
+    declare undo handler for sqlexception
+      begin
+        get diagnostics r = sqlstate;
+        set s =  r;
+        resignal sqlstate '44444';
+      end;
+    signal sqlstate '66550';
+  end;
+end;
+$$ language psm0;
+
+
 /*
  * example of before trigger
 
@@ -1956,9 +2027,12 @@ begin
   perform assert('test70_2', 33554560, test70_2());
   perform assert('test71', 128, (test71())._sqlcode);
   perform assert('test71_1', 'HANDLED NOT FOUND, ALL IS OK', (test71_1())._message);
-  perform assert('test71_2', 'My dynamic message 02000', (test71_1())._message);
+  perform assert('test71_2', 'My dynamic message 02000', (test71_2())._message);
   perform assert('test71_3', '00000', test71_3(10));
   perform assert('test71_3', '22012', test71_3(0));
+  perform assert('test72','66550,33333', test72());
+  perform assert('test72_1','66550,66550', test72_1());
+  perform assert('test72_2','66550,44444', test72_2());
 
   raise notice '******* All tests are ok *******';
 end;

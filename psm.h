@@ -330,7 +330,8 @@ typedef enum
 	PLPSM_HT_SQLWARNING,
 	PLPSM_HT_SQLEXCEPTION,
 	PLPSM_HT_PARENT,
-	PLPSM_HT_RELEASE_SUBTRANSACTION, 
+	PLPSM_HT_RELEASE_SUBTRANSACTION,
+	PLPSM_HT_DIAGNOSTICS_POP,
 	PLPSM_HT_STOP
 } Plpsm_ht_type;
 
@@ -476,6 +477,7 @@ typedef struct
 		int16	ncolumns;
 		int	lineno;
 		int	sqlstate;
+		bool	use_stacked_diagnostics;
 	};
 } Plpsm_pcode;
 

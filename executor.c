@@ -58,7 +58,9 @@ static void plpsm_exec_error_callback(void *arg);
  * returns zero.
  */
 static int
-search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int *ROP, int htnum, Plpsm_handler_type *htyp)
+search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int *ROP,
+								    int htnum, Plpsm_handler_type *htyp,
+								    DiagnosticsInfoData *DInfoStack, DiagnosticsInfo first_area, int *DID)
 {
 	int handler_addr = 0;
 
@@ -121,6 +123,19 @@ search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int 
 				RollbackAndReleaseCurrentSubTransaction();
 				CurrentResourceOwner = ROstack[(*ROP)--];
 				SPI_restore_connection();
+			}
+			else if (typ == PLPSM_HT_DIAGNOSTICS_POP)
+			{
+					if (*DID == -1)
+						elog(ERROR, "runtime error, diagnostics stack is empty");
+
+					first_area->level = DInfoStack[*DID].level;
+					first_area->sqlstate = DInfoStack[*DID].sqlstate;
+					first_area->message_text = DInfoStack[*DID].message_text;
+					first_area->detail_text = DInfoStack[*DID].detail_text;
+					first_area->hint_text = DInfoStack[*DID].hint_text;
+
+					(*DID)--;
 			}
 
 			ht_item = &mod->code->code[--ht_addr];
@@ -286,6 +301,7 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	bool		rollback_nested_transactions = false;
 
 	bool 	keep_diagnostics_info = false;		/* when is true, then statement actualises first_area */
+	bool	use_stacked_diagnostics = false;	/* when is true, then system moves info between fist_area and stacked second area */
 
 	DataPtrs = mod->DataPtrs;
 
@@ -340,9 +356,11 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 next_op:
 
 /*
+
  dinfo->is_signal = true;
  elog(NOTICE, "PC %d  ... sqlstate:%d", PC, sqlstate); 
  dinfo->is_signal = false;
+
 */
 
 		if (PC == 0)
@@ -463,7 +481,8 @@ next_op:
 
 						rollback_nested_transactions = true;
 
-						handler_addr = search_handler(mod, edata, ResourceOwnerStack, &ROP, pcode->htnum, NULL);
+						handler_addr = search_handler(mod, edata, ResourceOwnerStack, &ROP, pcode->htnum, NULL,
+												DInfoStack, &first_area, &DID);
 						if (handler_addr > 0)
 						{
 							sqlstate = edata->sqlerrcode;
@@ -730,26 +749,27 @@ next_op:
 					first_area.hint_text = 0;
 
 					keep_diagnostics_info = true;
+					use_stacked_diagnostics = pcode->use_stacked_diagnostics;
 				}
 				break;
 
 			case PCODE_DIAGNOSTICS_PUSH:
 				{
-					if (DID++ == -1)
-						elog(ERROR, "runtime error, diagnostics stack is empty");
+					if (++DID == 128)
+						elog(ERROR, "runtime error, diagnostics stack overflow");
 
 					DInfoStack[DID].level = first_area.level;
 					DInfoStack[DID].sqlstate = first_area.sqlstate;
-					DInfoStack[DID].message_text = pstrdup(first_area.message_text);
-					DInfoStack[DID].detail_text = pstrdup(first_area.detail_text);
-					DInfoStack[DID].hint_text = pstrdup(first_area.hint_text);
+					DInfoStack[DID].message_text = first_area.message_text != NULL ? pstrdup(first_area.message_text) : NULL;
+					DInfoStack[DID].detail_text = first_area.detail_text != NULL ? pstrdup(first_area.detail_text) : NULL;
+					DInfoStack[DID].hint_text = first_area.hint_text != NULL ? pstrdup(first_area.hint_text) : NULL;
 				}
 				break;
 
 			case PCODE_DIAGNOSTICS_POP:
 				{
-					if (++DID == 128)
-						elog(ERROR, "runtime error, diagnostics stack overflow");
+					if (DID == -1)
+						elog(ERROR, "runtime error, diagnostics stack is empty");
 
 					first_area.level = DInfoStack[DID].level;
 					first_area.sqlstate = DInfoStack[DID].sqlstate;
@@ -1431,7 +1451,8 @@ next_op:
 						Plpsm_handler_type htyp;
 
 						edata.sqlerrcode = signal_properties.sqlstate;
-						handler_addr = search_handler(mod, &edata, ResourceOwnerStack, &ROP, pcode->htnum, &htyp);
+						handler_addr = search_handler(mod, &edata, ResourceOwnerStack, &ROP, pcode->htnum, &htyp,
+														DInfoStack, &first_area, &DID);
 						if (handler_addr > 0)
 						{
 							if (keep_diagnostics_info)
