@@ -1819,6 +1819,46 @@ begin atomic
 end;
 $$ language psm0;
 
+create or replace function test73()
+returns text as $$
+begin
+  declare result text default '';
+  declare continue handler for sqlwarning
+    begin
+      declare aux text;
+      get stacked diagnostics aux = sqlstate;
+      set result = result || ' ' || aux;
+      get current diagnostics aux = sqlstate;
+      set result = result || ' ' || aux;
+      get stacked diagnostics aux = sqlstate;
+      set result = result || ' ' || aux;
+    end;
+  signal sqlstate '02005';
+  signal sqlstate '02005';
+  return result;
+end;
+$$ language psm0;
+
+create or replace function test73_1()
+returns text as $$
+begin atomic
+  declare result text default '';
+  declare undo handler for sqlexception
+    begin
+      declare aux text;
+      get stacked diagnostics aux = sqlstate;
+      set result = result || ' ' || aux;
+      get current diagnostics aux = sqlstate;
+      set result = result || ' ' || aux;
+      get stacked diagnostics aux = sqlstate;
+      set result = result || ' ' || aux;
+      return result;
+    end;
+  signal sqlstate '45005';
+  return result; -- dead code
+end;
+$$ language psm0;
+
 
 /*
  * example of before trigger
@@ -1854,7 +1894,7 @@ create or replace function assert(text, text, text)
 returns void as $$
 begin
   if ($2 <> $3) then
-    raise exception 'test "%" broken', $1;
+    raise exception 'test "%" broken "%" <> "%"', $1, $2, $3;
   end if;
 end;
 $$ language plpgsql;
@@ -2033,6 +2073,8 @@ begin
   perform assert('test72','66550,33333', test72());
   perform assert('test72_1','66550,66550', test72_1());
   perform assert('test72_2','66550,44444', test72_2());
+  perform assert('test73', ' 02005 00000 02005 02005 00000 02005', test73());
+  perform assert('test73_1', ' 45005 00000 45005', test73_1());
 
   raise notice '******* All tests are ok *******';
 end;
