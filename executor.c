@@ -24,6 +24,7 @@ typedef struct
 	char		*message_text;
 	char		*detail_text;
 	char		*hint_text;
+	char		*condition_identifier;
 } DiagnosticsInfoData;
 
 typedef DiagnosticsInfoData *DiagnosticsInfo;
@@ -134,6 +135,7 @@ search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int 
 					first_area->message_text = DInfoStack[*DID].message_text;
 					first_area->detail_text = DInfoStack[*DID].detail_text;
 					first_area->hint_text = DInfoStack[*DID].hint_text;
+					first_area->condition_identifier = DInfoStack[*DID].condition_identifier;
 
 					(*DID)--;
 			}
@@ -231,6 +233,7 @@ set_diagnostics(DiagnosticsInfo dginfo, ErrorData *edata)
 	set_text(&dginfo->message_text, edata->message);
 	set_text(&dginfo->detail_text, edata->detail);
 	set_text(&dginfo->hint_text, edata->hint);
+	set_text(&dginfo->condition_identifier, NULL);
 }
 
 static void
@@ -242,6 +245,7 @@ diagnostics_sqlstate(DiagnosticsInfo dginfo, int sqlstate, int level, int64 row_
 	set_text(&dginfo->message_text, NULL);
 	set_text(&dginfo->detail_text, NULL);
 	set_text(&dginfo->hint_text, NULL);
+	set_text(&dginfo->condition_identifier, NULL);
 }
 
 static void
@@ -257,14 +261,18 @@ diagnostics_info_move(DiagnosticsInfo target, DiagnosticsInfo src)
 		pfree(target->detail_text);
 	if (target->hint_text != NULL)
 		pfree(target->hint_text);
+	if (target->condition_identifier != NULL)
+		pfree(target->condition_identifier);
 
 	target->message_text = src->message_text;
 	target->detail_text = src->detail_text;
 	target->hint_text = src->hint_text;
+	target->condition_identifier = src->condition_identifier;
 
 	src->message_text = NULL;
 	src->detail_text = NULL;
 	src->hint_text = NULL;
+	src->condition_identifier = NULL;
 }
 
 static Datum
@@ -312,6 +320,7 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	signal_properties.message_text = NULL;
 	signal_properties.detail_text = NULL;
 	signal_properties.hint_text = NULL;
+	signal_properties.condition_identifier = NULL;
 
 	/* 
 	 * Output functions for types used in variables are not searchable in 
@@ -746,7 +755,8 @@ next_op:
 					first_area.sqlstate = 0;
 					first_area.message_text = NULL;
 					first_area.detail_text = NULL;
-					first_area.hint_text = 0;
+					first_area.hint_text = NULL;
+					first_area.condition_identifier = NULL;
 
 					keep_diagnostics_info = true;
 					use_stacked_diagnostics = pcode->use_stacked_diagnostics;
@@ -763,6 +773,8 @@ next_op:
 					DInfoStack[DID].message_text = first_area.message_text != NULL ? pstrdup(first_area.message_text) : NULL;
 					DInfoStack[DID].detail_text = first_area.detail_text != NULL ? pstrdup(first_area.detail_text) : NULL;
 					DInfoStack[DID].hint_text = first_area.hint_text != NULL ? pstrdup(first_area.hint_text) : NULL;
+					DInfoStack[DID].condition_identifier = first_area.condition_identifier != NULL ? 
+										pstrdup(first_area.condition_identifier) : NULL;
 				}
 				break;
 
@@ -776,6 +788,7 @@ next_op:
 					first_area.message_text = DInfoStack[DID].message_text;
 					first_area.detail_text = DInfoStack[DID].detail_text;
 					first_area.hint_text = DInfoStack[DID].hint_text;
+					first_area.condition_identifier = DInfoStack[DID].condition_identifier;
 
 					DID--;
 				}
@@ -820,6 +833,13 @@ next_op:
 						case PLPSM_GDINFO_MESSAGE:
 							if (darea->message_text)
 								value = CStringGetTextDatum(darea->message_text);
+							else
+								isnull = true;
+							break;
+
+						case PLPSM_GDINFO_CONDITION_IDENTIFIER:
+							if (darea->message_text)
+								value = CStringGetTextDatum(darea->condition_identifier);
 							else
 								isnull = true;
 							break;
@@ -1380,6 +1400,7 @@ next_op:
 					{
 						/* raise a outer exception */
 						int oldinfo = dinfo->is_signal;
+						char *message_text;
 
 						/* dont append context informations to notices */
 						if (signal_properties.level == NOTICE)
@@ -1393,10 +1414,16 @@ next_op:
 								    signal_properties.level == WARNING))
 							diagnostics_info_move(&first_area, &signal_properties);
 
+						if (signal_properties.message_text != NULL)
+							message_text = signal_properties.message_text;
+						else if (signal_properties.condition_identifier != NULL)
+							message_text = signal_properties.condition_identifier;
+						else
+							message_text = "";
+
 						ereport(signal_properties.level,
 								( errcode(signal_properties.sqlstate),
-								 errmsg_internal("%s", signal_properties.message_text != NULL ? 
-												signal_properties.message_text : ""),
+								 errmsg_internal("%s", message_text),
 								 (signal_properties.detail_text != NULL) ? errdetail("%s", signal_properties.detail_text) : 0,
 								 (signal_properties.hint_text != NULL) ? errhint("%s", signal_properties.hint_text) : 0));
 						dinfo->is_signal = oldinfo;
@@ -1477,6 +1504,7 @@ next_op:
 							/* there isn't local handler, so emit outer handler */
 							/* raise a outer exception */
 							int oldinfo = dinfo->is_signal;
+							char *message_text;
 
 							/* dont append context informations to notices */
 							if (signal_properties.level == NOTICE)
@@ -1490,10 +1518,16 @@ next_op:
 									    signal_properties.level == WARNING))
 								diagnostics_info_move(&first_area, &signal_properties);
 
+							if (signal_properties.message_text != NULL)
+								message_text = signal_properties.message_text;
+							else if (signal_properties.condition_identifier != NULL)
+								message_text = signal_properties.condition_identifier;
+							else
+								message_text = "";
+
 							ereport(signal_properties.level,
 									( errcode(signal_properties.sqlstate),
-									 errmsg_internal("%s", signal_properties.message_text != NULL ? 
-													signal_properties.message_text : ""),
+									 errmsg_internal("%s", message_text),
 									 (signal_properties.detail_text != NULL) ? errdetail("%s", signal_properties.detail_text) : 0,
 									 (signal_properties.hint_text != NULL) ? errhint("%s", signal_properties.hint_text) : 0));
 							dinfo->is_signal = oldinfo;
@@ -1514,6 +1548,7 @@ next_op:
 								set_text(&signal_properties.message_text, NULL);
 								set_text(&signal_properties.detail_text, NULL);
 								set_text(&signal_properties.hint_text, NULL);
+								set_text(&signal_properties.condition_identifier, NULL);
 							}
 							break;
 
@@ -1529,6 +1564,7 @@ next_op:
 								set_text(&signal_properties.message_text, DInfoStack[DID].message_text);
 								set_text(&signal_properties.detail_text, DInfoStack[DID].detail_text);
 								set_text(&signal_properties.hint_text, DInfoStack[DID].hint_text);
+								set_text(&signal_properties.condition_identifier, DInfoStack[DID].condition_identifier);
 							}
 							break;
 
@@ -1572,6 +1608,10 @@ next_op:
 										set_text(&signal_properties.message_text,
 												pstrdup(pcode->signal_property.cstr));
 										break;
+									case PLPSM_GDINFO_CONDITION_IDENTIFIER:
+										set_text(&signal_properties.condition_identifier,
+												pstrdup(pcode->signal_property.cstr));
+										break;
 									default:
 										elog(ERROR, "internal error, diagnostics variable isn't of text type");
 								}
@@ -1601,6 +1641,9 @@ next_op:
 										break;
 									case PLPSM_GDINFO_MESSAGE:
 										set_text(&signal_properties.message_text, cstr);
+										break;
+									case PLPSM_GDINFO_CONDITION_IDENTIFIER:
+										set_text(&signal_properties.condition_identifier, cstr);
 										break;
 									default:
 										elog(ERROR, "internal error, diagnostics variable isn't of text type");

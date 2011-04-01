@@ -141,6 +141,7 @@ extern ParserState pstate;
 %token <keyword>	CASE
 %token <keyword>	CLOSE
 %token <keyword>	CONDITION
+%token <keyword>	CONDITION_IDENTIFIER
 %token <keyword>	CONTINUE
 %token <keyword>	CURSOR
 %token <keyword>	CURRENT
@@ -407,6 +408,7 @@ declaration:
 					if ($2->typ != PLPSM_STMT_DECLARE_VARIABLE)
 						yyerror("syntax error");
 					$2->lineno = plpsm_location_to_lineno(@1);
+					$2->location = @1;
 					$$ = $2;
 				}
 			| DECLARE declare_prefetch CONDITION opt_sqlstate
@@ -415,6 +417,7 @@ declaration:
 						yyerror("syntax error");
 					$2->data = $4;
 					$2->lineno = plpsm_location_to_lineno(@1);
+					$2->location = @1;
 					$$ = $2;
 				}
 			| DECLARE declare_prefetch CURSOR FOR 
@@ -432,6 +435,7 @@ declaration:
 					else
 						$2->name = yylval.word.ident;
 					$2->lineno = plpsm_location_to_lineno(@1);
+					$2->location = @1;
 					$$ = $2;
 				}
 			| DECLARE declare_prefetch HANDLER FOR condition_list dstmt
@@ -441,6 +445,7 @@ declaration:
 					$2->inner_left = $6;
 					$2->data = $5;
 					$2->lineno = plpsm_location_to_lineno(@1);
+					$2->location = @1;
 					$$ = $2;
 				}
 		;
@@ -913,12 +918,13 @@ gd_area_opt:
 		;
 
 gd_info_enum:
-			SQLSTATE		{ $$ = PLPSM_GDINFO_SQLSTATE; }
-			| SQLCODE		{ $$ = PLPSM_GDINFO_SQLCODE; }
-			| MESSAGE_TEXT		{ $$ = PLPSM_GDINFO_MESSAGE; }
-			| DETAIL_TEXT		{ $$ = PLPSM_GDINFO_DETAIL; }
-			| HINT_TEXT		{ $$ = PLPSM_GDINFO_HINT; }
-			| ROW_COUNT		{ $$ = PLPSM_GDINFO_ROW_COUNT; }
+			SQLSTATE			{ $$ = PLPSM_GDINFO_SQLSTATE; }
+			| SQLCODE			{ $$ = PLPSM_GDINFO_SQLCODE; }
+			| MESSAGE_TEXT			{ $$ = PLPSM_GDINFO_MESSAGE; }
+			| DETAIL_TEXT			{ $$ = PLPSM_GDINFO_DETAIL; }
+			| HINT_TEXT			{ $$ = PLPSM_GDINFO_HINT; }
+			| ROW_COUNT			{ $$ = PLPSM_GDINFO_ROW_COUNT; }
+			| CONDITION_IDENTIFIER		{ $$ = PLPSM_GDINFO_CONDITION_IDENTIFIER; }
 		;
 
 /*----
@@ -1745,6 +1751,7 @@ is_unreserved_keyword(int tok)
 	{
 		case ATOMIC:
 		case AS:
+		case CONDITION_IDENTIFIER:
 		case CONTINUE:
 		case CURRENT:
 		case DETAIL_TEXT:
@@ -2070,6 +2077,9 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 								break;
 							case PLPSM_GDINFO_ROW_COUNT:
 								appendStringInfoString(ds, " = ROW_COUNT");
+								break;
+							case PLPSM_GDINFO_CONDITION_IDENTIFIER:
+								appendStringInfoString(ds, " = CONDITION_IDENTIFIER");
 								break;
 							default:
 								/* be compiler quite */;

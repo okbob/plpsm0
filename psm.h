@@ -128,7 +128,8 @@ typedef enum
 	PLPSM_GDINFO_SQLSTATE,
 	PLPSM_GDINFO_SQLCODE,
 	PLPSM_GDINFO_ROW_COUNT,
-	PLPSM_GDINFO_LEVEL
+	PLPSM_GDINFO_LEVEL,
+	PLPSM_GDINFO_CONDITION_IDENTIFIER
 } Plpsm_gd_info_type;
 
 typedef enum
@@ -170,6 +171,7 @@ typedef struct Plpsm_condition_value
 		int	sqlstate;
 		char	*condition_name;
 	};
+	int		derivated_sqlstate;
 	struct Plpsm_condition_value *next;
 } Plpsm_condition_value;
 
@@ -237,6 +239,7 @@ typedef struct Plpsm_object
 		} cursor;
 		int16		offset;
 		bool	is_atomic;
+		int	sqlstate;
 	};
 	struct Plpsm_object *next;
 	struct Plpsm_object *last;

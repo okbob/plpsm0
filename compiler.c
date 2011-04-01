@@ -291,25 +291,92 @@ lookup_object_with_label_in_scope(Plpsm_object *scope, char *name)
 	return lookup_object_with_label_in_scope(scope->outer, name);
 }
 
+static int
+_lookup_condition(Plpsm_object *scope, Plpsm_condition_value *condition, bool *found)
+{
+	if (scope == NULL)
+		return 0;
+
+	/* only compound statement has a DECLARE CONDITIONs stmts */
+	if (scope->typ == PLPSM_STMT_COMPOUND_STATEMENT)
+	{
+		Plpsm_object *iterator = scope->inner;
+
+		while (iterator != NULL)
+		{
+			if (iterator->typ == PLPSM_STMT_DECLARE_CONDITION &&
+				strcmp(iterator->name, condition->condition_name) == 0)
+			{
+				*found = true;
+				return iterator->sqlstate;
+			}
+		
+			iterator = iterator->next;
+		}
+	}
+
+	/* go to outer scope */
+	return _lookup_condition(scope->outer, condition, found);
+}
+
+/*
+ * Try to search a custom condion available in scope, when it doesn't find
+ * then raise a syntax error.
+ */
+static int
+lookup_condition(Plpsm_object *scope, Plpsm_condition_value *condition)
+{
+	bool	found = false;
+	int	sqlstate;
+
+	/*
+	 * ToDo: there can be a buildin system conditions
+	 */
+
+	Assert(condition->typ == PLPSM_CONDITION_NAME);
+	sqlstate = _lookup_condition(scope, condition, &found);
+	if (!found)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("condition \"%s\" is not known", condition->condition_name),
+					parser_errposition(condition->location)));
+	return sqlstate;
+}
+
 static void
 verify_condition_list(CompileState cstate, Plpsm_condition_value *condition, bool *isnotfound, Plpsm_handler_type handler_typ)
 {
 	while (condition != NULL)
 	{
 		Plpsm_condition_value *iterator = condition->next;
+		Plpsm_condition_value_type typ = condition->typ;
+		int sqlstate = 0;
 
-		if (*isnotfound == false && (condition->typ == PLPSM_SQLWARNING || (condition->typ == PLPSM_SQLSTATE && 
-				ERRCODE_TO_CATEGORY(condition->sqlstate) == MAKE_SQLSTATE('0','2','0','0','0'))))
+		/* when condtion is specified by name, then we should to get derivated sqlstate */
+		if (typ == PLPSM_CONDITION_NAME)
+		{
+			sqlstate = lookup_condition(cstate->current_scope, condition);
+			if (sqlstate != 0)
+				condition->derivated_sqlstate = sqlstate;
+		}
+		else
+		{
+			if (typ == PLPSM_SQLSTATE)
+				sqlstate = condition->sqlstate;
+		}
+
+		if (*isnotfound == false && (typ == PLPSM_SQLWARNING || (typ == PLPSM_SQLSTATE && 
+				ERRCODE_TO_CATEGORY(sqlstate) == MAKE_SQLSTATE('0','2','0','0','0'))))
 				*isnotfound = true;
 
 		while (iterator != NULL)
 		{
-			if (condition->typ == iterator->typ && (condition->typ == PLPSM_SQLEXCEPTION || condition->typ == PLPSM_SQLWARNING))
+			if (typ == iterator->typ && (typ == PLPSM_SQLEXCEPTION || typ == PLPSM_SQLWARNING))
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("condition handling is ambigonuous"),
 						 parser_errposition(condition->location)));
-			if (iterator->typ == condition->typ && condition->typ == PLPSM_SQLSTATE && condition->sqlstate == iterator->sqlstate)
+			if (iterator->typ == typ && typ == PLPSM_SQLSTATE && sqlstate == iterator->sqlstate && sqlstate != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("condition handling is ambigonuous"),
@@ -318,10 +385,10 @@ verify_condition_list(CompileState cstate, Plpsm_condition_value *condition, boo
 		}
 
 		/* we enable only exit or continue handlers for warnings and undo handlers for errors */
-		if (!(condition->typ == PLPSM_SQLWARNING || 
-			(condition->typ == PLPSM_SQLSTATE && 
-				(ERRCODE_TO_CATEGORY(condition->sqlstate) == MAKE_SQLSTATE('0','2','0','0','0') ||
-				 ERRCODE_TO_CATEGORY(condition->sqlstate) == MAKE_SQLSTATE('0','1','0','0','0')))))
+		if (!(typ == PLPSM_SQLWARNING || 
+			((typ == PLPSM_SQLSTATE || PLPSM_CONDITION_NAME) && 
+				(ERRCODE_TO_CATEGORY(sqlstate) == MAKE_SQLSTATE('0','2','0','0','0') ||
+				 ERRCODE_TO_CATEGORY(sqlstate) == MAKE_SQLSTATE('0','1','0','0','0')))))
 		{
 			if (handler_typ != PLPSM_HANDLER_UNDO)
 				ereport(ERROR,
@@ -366,8 +433,6 @@ verify_condition_value(Plpsm_object *scope, Plpsm_condition_value *condition)
 								 errmsg("condition handling is ambigonuous"),
 								 parser_errposition(c->location)));
 					p = p->next;
-
-
 				}
 				c = c->next;
 			}
@@ -395,6 +460,57 @@ create_handler_for(Plpsm_stmt *handler_def, CompileState cstate, int handler_add
 	cstate->current_scope = handler;
 
 	return handler;
+}
+
+/*
+ * new condition
+ */
+static Plpsm_object *
+create_condition_for(Plpsm_stmt *decl_stmt, CompileState cstate)
+{
+	Plpsm_object *iterator = cstate->current_scope->inner;
+	Plpsm_condition_value *condition = (Plpsm_condition_value *) decl_stmt->data;
+	char *name;
+	Plpsm_object *obj;
+	int		location;
+
+	Assert(decl_stmt->target != NULL);
+	name = (char *)linitial(decl_stmt->target->qualId);
+	location = decl_stmt->target->location;
+
+	Assert(cstate->current_scope->typ == PLPSM_STMT_COMPOUND_STATEMENT);
+	Assert(decl_stmt->typ == PLPSM_STMT_DECLARE_CONDITION);
+
+	while (iterator != NULL)
+	{
+		if (iterator->typ == PLPSM_STMT_DECLARE_CONDITION)
+		{
+			/* condition name should be unique */
+			if (strcmp(iterator->name, name) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("condition \"%s\" is defined yet", name),
+						 parser_errposition(location)));
+
+			/* when sqlstate is defined, then sould be unique */
+			if (condition != NULL)
+			{
+				Assert(condition->typ == PLPSM_SQLSTATE);
+				if (condition->sqlstate == iterator->sqlstate)
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("condition \"%s\" has not unique SQLSTATE", name),
+							 parser_errposition(decl_stmt->location)));
+			}
+		}
+		iterator = iterator->next;
+	}
+
+	obj = new_object_for(decl_stmt, cstate->current_scope);
+	obj->name = name;
+	obj->sqlstate = condition != NULL ? condition->sqlstate : 0;
+
+	return obj;
 }
 
 /*
@@ -740,7 +856,7 @@ lookup_handler(Plpsm_object *scope, Plpsm_condition_value *condition)
 	Plpsm_object *iterator;
 	Plpsm_condition_value *c;
 
-	Assert(condition->typ == PLPSM_SQLSTATE);
+	Assert(condition->typ == PLPSM_SQLSTATE || condition->typ == PLPSM_CONDITION_NAME);
 
 	if (scope == NULL)
 		return NULL;
@@ -761,8 +877,21 @@ lookup_handler(Plpsm_object *scope, Plpsm_condition_value *condition)
 				/* search a exact match */
 				while (c != NULL)
 				{
-					if (c->typ == PLPSM_SQLSTATE && condition->sqlstate == c->sqlstate)
-						return iterator;
+					if (condition->typ == PLPSM_SQLSTATE)
+					{
+						if (c->typ == PLPSM_SQLSTATE && condition->sqlstate == c->sqlstate)
+							return iterator;
+						if (c->typ == PLPSM_CONDITION_NAME && condition->sqlstate == c->derivated_sqlstate)
+							return iterator;
+					}
+					else
+					{
+						Assert(condition->typ == PLPSM_CONDITION_NAME);
+						if (c->typ == PLPSM_CONDITION_NAME &&
+							strcmp(c->condition_name, condition->condition_name) == 0)
+							return iterator;
+					}
+
 					c = c->next;
 				}
 			}
@@ -1375,7 +1504,9 @@ list(Plpsm_pcode_module *m)
 			case PCODE_HT:
 				{
 					appendStringInfoString(&ds, "HT ");
-					if (VALUE(HT_field.typ) != PLPSM_HT_PARENT && VALUE(HT_field.typ != PLPSM_HT_STOP) && VALUE(HT_field.typ != PLPSM_HT_RELEASE_SUBTRANSACTION))
+					if (VALUE(HT_field.typ) != PLPSM_HT_PARENT && 
+							VALUE(HT_field.typ != PLPSM_HT_STOP) && VALUE(HT_field.typ != PLPSM_HT_RELEASE_SUBTRANSACTION) &&
+							VALUE(HT_field.typ != PLPSM_HT_DIAGNOSTICS_POP))
 					{
 						switch (VALUE(HT_field.htyp))
 						{
@@ -2270,12 +2401,22 @@ ht_size(Plpsm_stmt *stmt)
  * compile a signal statement
  */
 static void
-compile_signal(CompileState cstate, Plpsm_stmt *stmt, int addr, Plpsm_pcode_type typ, bool is_undo_handler, bool is_resignal)
+compile_signal(CompileState cstate, Plpsm_stmt *stmt, int addr, Plpsm_pcode_type typ,
+			 bool is_undo_handler, bool is_resignal, char *condition_name, int derivated_sqlstate)
 {
 	Plpsm_signal_info *sinfo = (Plpsm_signal_info *) stmt->data;
 	Plpsm_pcode_module *m = cstate->module;
-	int	eclass = ERRCODE_TO_CATEGORY(stmt->option);
+	int	eclass;
 	int	level;
+	int sqlstate;
+
+	if (condition_name != NULL)
+	{
+		SIGNAL_PROPERTY(SET_CSTRING, CONDITION_IDENTIFIER, cstr, pstrdup(condition_name));
+		sqlstate = derivated_sqlstate != 0 ? derivated_sqlstate : MAKE_SQLSTATE('4','5','0','0','0');
+	}
+	else
+		sqlstate = stmt->option;
 
 	SET_OPVAL(signal_params.addr, addr);
 	SET_OPVAL(signal_params.is_undo_handler, is_undo_handler);
@@ -2284,6 +2425,7 @@ compile_signal(CompileState cstate, Plpsm_stmt *stmt, int addr, Plpsm_pcode_type
 	 * SQL/PSM doesn't know a levels in PL/pgSQL semantic. We must to deduce
 	 * level from sql state.
 	 */
+	eclass = ERRCODE_TO_CATEGORY(sqlstate);
 	if (eclass == MAKE_SQLSTATE('0','0','0','0','0'))
 		level = NOTICE;
 	else if (eclass == MAKE_SQLSTATE('0','2','0','0','0') || eclass == MAKE_SQLSTATE('0','1','0','0','0'))
@@ -2291,7 +2433,7 @@ compile_signal(CompileState cstate, Plpsm_stmt *stmt, int addr, Plpsm_pcode_type
 	else
 		level = ERROR;
 
-	SIGNAL_PROPERTY(SET_INT, SQLCODE, ival, stmt->option);
+	SIGNAL_PROPERTY(SET_INT, SQLCODE, ival, sqlstate);
 	SIGNAL_PROPERTY(SET_INT, LEVEL, ival, level);
 
 	while (sinfo != NULL)
@@ -2417,6 +2559,10 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 		if (htsize > 0)
 		{
 			cstate->stack.nhtfields += htsize + 1;		/* reserve space for local handlers and stop or parent link*/
+
+			if (cstate->use_stacked_diagnostics)
+				cstate->stack.nhtfields++;		/* reserve space for POP diagnostics for any local handler */
+
 			/* reserve one instr for start transaction */
 			if (parent->stmt && (bool) parent->stmt->option)
 				cstate->stack.nhtfields++;
@@ -2781,6 +2927,17 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 							EMIT_OPCODE(SAVETO, stmt->lineno);
 						}
 					}
+				}
+				break;
+
+			case PLPSM_STMT_DECLARE_CONDITION:
+				{
+					/*
+					 * Rules:
+					 *  Condition name must be unique in compound statement,
+					 *  When SQLSTATE attribute is used, then should be unique in compound statement
+					 */
+					obj = create_condition_for(stmt, cstate);
 				}
 				break;
 
@@ -3264,14 +3421,30 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 						EMIT_OPCODE(SIGNAL_PROPERTY, -1);
 					}
 
-					if (!is_resignal || (is_resignal && stmt->option != 0))
+					if (!is_resignal || (is_resignal && (stmt->option != 0 || stmt->name != NULL)))
 					{
 						Plpsm_object *handler;
 						Plpsm_condition_value condition;
+						char *condition_name = NULL;
+						int	derivated_sqlstate = 0;
 
-						condition.typ = PLPSM_SQLSTATE;
-						condition.sqlstate = stmt->option;
-						condition.next = NULL;
+						if (stmt->name != NULL)
+						{
+							condition.typ = PLPSM_CONDITION_NAME;
+							condition.location = stmt->location;
+							condition.condition_name = stmt->name;
+							condition.derivated_sqlstate = lookup_condition(cstate->current_scope, &condition);
+
+							condition_name = condition.condition_name;
+							derivated_sqlstate = condition.derivated_sqlstate;
+						}
+						else
+						{
+							Assert(stmt->option != 0);
+							condition.typ = PLPSM_SQLSTATE;
+							condition.sqlstate = stmt->option;
+							condition.next = NULL;
+						}
 
 						handler = lookup_handler(cstate->current_scope, &condition);
 						if (handler != NULL)
@@ -3281,18 +3454,21 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 							{
 								compile_leave_target_block(cstate, cstate->current_scope, handler->outer);
 								compile_signal(cstate, stmt, handler->calls.entry_addr, PCODE_SIGNAL_JMP,
-											handler->stmt->option == PLPSM_HANDLER_UNDO, is_resignal);
+											handler->stmt->option == PLPSM_HANDLER_UNDO, is_resignal,
+												condition_name, derivated_sqlstate);
 							}
 							else
 							{
 								compile_signal(cstate, stmt, handler->calls.entry_addr, PCODE_SIGNAL_CALL,
-											handler->stmt->option == PLPSM_HANDLER_UNDO, is_resignal);
+											handler->stmt->option == PLPSM_HANDLER_UNDO, is_resignal,
+												condition_name, derivated_sqlstate);
 							}
 						}
 						else
 						{
 							/* there are no local handler */
-							compile_signal(cstate, stmt, 0, PCODE_SIGNAL_JMP, false, is_resignal);
+							compile_signal(cstate, stmt, 0, PCODE_SIGNAL_JMP, false, is_resignal,
+											condition_name, derivated_sqlstate);
 						}
 					}
 					else
@@ -3369,6 +3545,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 							case PLPSM_GDINFO_HINT:
 							case PLPSM_GDINFO_MESSAGE:
 							case PLPSM_GDINFO_SQLSTATE:
+							case PLPSM_GDINFO_CONDITION_IDENTIFIER:
 								if (var->stmt->datum.typoid != TEXTOID)
 									ereport(ERROR,
 											(errcode(ERRCODE_SYNTAX_ERROR),
@@ -3451,6 +3628,16 @@ compile_ht(CompileState cstate, Plpsm_object *scope, int parent_addr)
 					EMIT_OPCODE(HT, -1);
 					reassign_parent_addr = true;
 				}
+
+				/* 
+				 * We know, so we doesn't use this handler, so we have to POP
+				 * stacked diagnostics info.
+				 */
+				if (cstate->use_stacked_diagnostics)
+				{
+					SET_OPVAL(HT_field.typ, PLPSM_HT_DIAGNOSTICS_POP);
+					EMIT_OPCODE(HT, -1);
+				}
 				break;
 			}
 			iterator = iterator->next;
@@ -3524,13 +3711,6 @@ compile_ht(CompileState cstate, Plpsm_object *scope, int parent_addr)
 							EMIT_OPCODE(HT, -1);
 						}
 						c = c->next;
-					}
-
-					/* store pop stacked diagnostics */
-					if (cstate->use_stacked_diagnostics)
-					{
-						SET_OPVAL(HT_field.typ, PLPSM_HT_DIAGNOSTICS_POP);
-						EMIT_OPCODE(HT, -1);
 					}
 				}
 				iterator = iterator->next;

@@ -1859,6 +1859,35 @@ begin atomic
 end;
 $$ language psm0;
 
+create or replace function test74()
+returns text as $$
+begin
+  declare not_found condition for sqlstate '02000';
+  declare exit handler for not_found
+    begin
+      print 'not found handler activated';
+      return 'Signal handled';
+    end;
+  signal sqlstate '02000';
+end;
+$$ language psm0;
+
+create or replace function test74_1()
+returns text as $$
+begin
+  declare not_found condition for sqlstate '02000';
+  declare exit handler for not_found
+    begin
+      declare xx text;
+      get diagnostics xx = CONDITION_IDENTIFIER;
+      print xx, ' handler activated';
+      return 'Signal handled';
+    end;
+  signal not_found;
+end;
+$$ language psm0;
+
+
 
 /*
  * example of before trigger
@@ -2075,6 +2104,9 @@ begin
   perform assert('test72_2','66550,44444', test72_2());
   perform assert('test73', ' 02005 00000 02005 02005 00000 02005', test73());
   perform assert('test73_1', ' 45005 00000 45005', test73_1());
+  perform assert('test74', 'Signal handled', test74());
+  perform assert('test74_1', 'Signal handled', test74_1());
+
 
   raise notice '******* All tests are ok *******';
 end;
