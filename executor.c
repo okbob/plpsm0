@@ -59,25 +59,33 @@ static void plpsm_exec_error_callback(void *arg);
  * returns zero.
  */
 static int
-search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int *ROP,
+search_handler(Plpsm_module *mod, char *condition_name, int sqlstate, ResourceOwner *ROstack, int *ROP,
 								    int htnum, Plpsm_handler_type *htyp,
 								    DiagnosticsInfoData *DInfoStack, DiagnosticsInfo first_area, int *DID)
 {
 	int handler_addr = 0;
 
-	if (htnum > 0 && edata->sqlerrcode != ERRCODE_QUERY_CANCELED)
+	if (htnum > 0 && sqlstate != ERRCODE_QUERY_CANCELED)
 	{
-		int	ht_addr = mod->code->ht_addr + htnum;
-		Plpsm_pcode *ht_item = &mod->code->code[ht_addr];
+		int	ht_addr = htnum;
+		Plpsm_pcode *ht_item = &mod->ht_table->code[ht_addr];
 
 		Assert(ht_item->typ == PCODE_HT);
 		while (ht_item->HT_field.typ != PLPSM_HT_STOP)
 		{
 			Plpsm_ht_type typ = ht_item->HT_field.typ;
 
-			if (typ == PLPSM_HT_SQLCODE)
+			if (typ == PLPSM_HT_CONDITION_NAME && condition_name != NULL)
 			{
-				if (ht_item->HT_field.sqlcode == edata->sqlerrcode)
+				if (strcmp(ht_item->HT_field.condition_name, condition_name) == 0)
+				{
+					handler_addr = ht_item->HT_field.addr;
+					break;
+				}
+			}
+			else if (typ == PLPSM_HT_SQLCODE)
+			{
+				if (ht_item->HT_field.sqlcode == sqlstate)
 				{
 					handler_addr = ht_item->HT_field.addr;
 					break;
@@ -85,7 +93,7 @@ search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int 
 			}
 			else if (typ == PLPSM_HT_SQLCLASS)
 			{
-				if (ht_item->HT_field.sqlclass == ERRCODE_TO_CATEGORY(edata->sqlerrcode))
+				if (ht_item->HT_field.sqlclass == ERRCODE_TO_CATEGORY(sqlstate))
 				{
 					handler_addr = ht_item->HT_field.addr;
 					break;
@@ -93,7 +101,7 @@ search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int 
 			}
 			else if (typ == PLPSM_HT_SQLEXCEPTION)
 			{
-				int	eclass = ERRCODE_TO_CATEGORY(edata->sqlerrcode);
+				int	eclass = ERRCODE_TO_CATEGORY(sqlstate);
 
 				if (eclass != MAKE_SQLSTATE('0','2','0','0','0') &&
 					eclass != MAKE_SQLSTATE('0','1','0','0','0'))
@@ -104,7 +112,7 @@ search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int 
 			}
 			else if (typ == PLPSM_HT_SQLWARNING)
 			{
-				int	eclass = ERRCODE_TO_CATEGORY(edata->sqlerrcode);
+				int	eclass = ERRCODE_TO_CATEGORY(sqlstate);
 
 				if (eclass == MAKE_SQLSTATE('0','2','0','0','0') ||
 					eclass == MAKE_SQLSTATE('0','1','0','0','0'))
@@ -116,7 +124,7 @@ search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int 
 			else if (typ == PLPSM_HT_PARENT)
 			{
 				ht_addr = ht_item->HT_field.parent_HT_addr;
-				ht_item = &mod->code->code[--ht_addr];
+				ht_item = &mod->ht_table->code[--ht_addr];
 				continue;
 			}
 			else if (typ == PLPSM_HT_RELEASE_SUBTRANSACTION)
@@ -130,17 +138,17 @@ search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int 
 					if (*DID == -1)
 						elog(ERROR, "runtime error, diagnostics stack is empty");
 
-					first_area->level = DInfoStack[*DID].level;
-					first_area->sqlstate = DInfoStack[*DID].sqlstate;
-					first_area->message_text = DInfoStack[*DID].message_text;
-					first_area->detail_text = DInfoStack[*DID].detail_text;
-					first_area->hint_text = DInfoStack[*DID].hint_text;
-					first_area->condition_identifier = DInfoStack[*DID].condition_identifier;
+				first_area->level = DInfoStack[*DID].level;
+				first_area->sqlstate = DInfoStack[*DID].sqlstate;
+				first_area->message_text = DInfoStack[*DID].message_text;
+				first_area->detail_text = DInfoStack[*DID].detail_text;
+				first_area->hint_text = DInfoStack[*DID].hint_text;
+				first_area->condition_identifier = DInfoStack[*DID].condition_identifier;
 
-					(*DID)--;
+				(*DID)--;
 			}
 
-			ht_item = &mod->code->code[--ht_addr];
+			ht_item = &mod->ht_table->code[--ht_addr];
 		}
 
 		if (handler_addr > 0)
@@ -170,6 +178,7 @@ search_handler(Plpsm_module *mod, ErrorData *edata, ResourceOwner *ROstack, int 
 		SPI_restore_connection();
 	}
 	return 0;
+
 }
 
 static void
@@ -490,7 +499,7 @@ next_op:
 
 						rollback_nested_transactions = true;
 
-						handler_addr = search_handler(mod, edata, ResourceOwnerStack, &ROP, pcode->htnum, NULL,
+						handler_addr = search_handler(mod, NULL, edata->sqlerrcode, ResourceOwnerStack, &ROP, pcode->htnum, NULL,
 												DInfoStack, &first_area, &DID);
 						if (handler_addr > 0)
 						{
@@ -514,7 +523,23 @@ next_op:
 							goto next_op;
 						}
 						else
+						{
+							/* 
+							 * we should to release a allocated resources. The most important
+							 * is correct finishing a nested transactions.
+							 */
+							while (ROP >= 0)
+							{
+								if (rollback_nested_transactions)
+									RollbackAndReleaseCurrentSubTransaction();
+								else
+									ReleaseCurrentSubTransaction();
+
+								CurrentResourceOwner = ResourceOwnerStack[ROP--];
+							}
+
 							ReThrowError(edata);
+						}
 					}
 					PG_END_TRY();
 
@@ -798,7 +823,6 @@ next_op:
 				{
 					DiagnosticsInfo darea;
 					Datum value = (Datum) 0;
-					bool		isnull = false;
 
 					if (pcode->get_diagnostics.which_area == PLPSM_GDAREA_CURRENT)
 						darea = &first_area;
@@ -820,28 +844,28 @@ next_op:
 							if (darea->detail_text != NULL)
 								value = CStringGetTextDatum(darea->detail_text);
 							else
-								isnull = true;
+								value = CStringGetTextDatum("");
 							break;
 
 						case PLPSM_GDINFO_HINT:
 							if (darea->hint_text != NULL)
 								value = CStringGetTextDatum(darea->hint_text);
 							else
-								isnull = true;
+								value = CStringGetTextDatum("");
 							break;
 
 						case PLPSM_GDINFO_MESSAGE:
 							if (darea->message_text)
 								value = CStringGetTextDatum(darea->message_text);
 							else
-								isnull = true;
+								value = CStringGetTextDatum("");
 							break;
 
 						case PLPSM_GDINFO_CONDITION_IDENTIFIER:
-							if (darea->message_text)
+							if (darea->condition_identifier)
 								value = CStringGetTextDatum(darea->condition_identifier);
 							else
-								isnull = true;
+								value = CStringGetTextDatum("");
 							break;
 
 						case PLPSM_GDINFO_SQLSTATE:
@@ -866,13 +890,9 @@ next_op:
 						default:
 							/* be compiler quite */;
 					}
-					if (!isnull)
-					{
-						values[pcode->get_diagnostics.offset] = value;
-						nulls[pcode->get_diagnostics.offset] = ' ';
-					}
-					else
-						nulls[pcode->get_diagnostics.offset] = 'n';
+					
+					values[pcode->get_diagnostics.offset] = value;
+					nulls[pcode->get_diagnostics.offset] = ' ';
 				}
 				break;
 
@@ -1421,6 +1441,20 @@ next_op:
 						else
 							message_text = "";
 
+						/* 
+						 * we should to release a allocated resources. The most important
+						 * is correct finishing a nested transactions.
+						 */
+						while (ROP >= 0)
+						{
+							if (rollback_nested_transactions)
+								RollbackAndReleaseCurrentSubTransaction();
+							else
+								ReleaseCurrentSubTransaction();
+
+							CurrentResourceOwner = ResourceOwnerStack[ROP--];
+						}
+
 						ereport(signal_properties.level,
 								( errcode(signal_properties.sqlstate),
 								 errmsg_internal("%s", message_text),
@@ -1474,11 +1508,10 @@ next_op:
 					else
 					{
 						int		handler_addr;
-						ErrorData edata;
 						Plpsm_handler_type htyp;
 
-						edata.sqlerrcode = signal_properties.sqlstate;
-						handler_addr = search_handler(mod, &edata, ResourceOwnerStack, &ROP, pcode->htnum, &htyp,
+						handler_addr = search_handler(mod, signal_properties.condition_identifier, signal_properties.sqlstate, 
+														ResourceOwnerStack, &ROP, pcode->htnum, &htyp,
 														DInfoStack, &first_area, &DID);
 						if (handler_addr > 0)
 						{
@@ -1524,6 +1557,20 @@ next_op:
 								message_text = signal_properties.condition_identifier;
 							else
 								message_text = "";
+
+							/* 
+							 * we should to release a allocated resources. The most important
+							 * is correct finishing a nested transactions.
+							 */
+							while (ROP >= 0)
+							{
+								if (rollback_nested_transactions)
+									RollbackAndReleaseCurrentSubTransaction();
+								else
+									ReleaseCurrentSubTransaction();
+
+								CurrentResourceOwner = ResourceOwnerStack[ROP--];
+							}
 
 							ereport(signal_properties.level,
 									( errcode(signal_properties.sqlstate),
@@ -1592,7 +1639,8 @@ next_op:
 							{
 								Assert(pcode->signal_property.gdtyp == PLPSM_GDINFO_DETAIL ||
 									pcode->signal_property.gdtyp == PLPSM_GDINFO_HINT ||
-									pcode->signal_property.gdtyp == PLPSM_GDINFO_MESSAGE);
+									pcode->signal_property.gdtyp == PLPSM_GDINFO_MESSAGE ||
+									pcode->signal_property.gdtyp == PLPSM_GDINFO_CONDITION_IDENTIFIER);
 
 								switch (pcode->signal_property.gdtyp)
 								{
@@ -1641,9 +1689,6 @@ next_op:
 										break;
 									case PLPSM_GDINFO_MESSAGE:
 										set_text(&signal_properties.message_text, cstr);
-										break;
-									case PLPSM_GDINFO_CONDITION_IDENTIFIER:
-										set_text(&signal_properties.condition_identifier, cstr);
 										break;
 									default:
 										elog(ERROR, "internal error, diagnostics variable isn't of text type");

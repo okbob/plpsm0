@@ -176,6 +176,8 @@ extern ParserState pstate;
 %token <keyword>	PRINT
 %token <keyword>	REPEAT
 %token <keyword>	RESIGNAL
+%token <keyword>	RETURNED_SQLCODE
+%token <keyword>	RETURNED_SQLSTATE
 %token <keyword>	RETURN
 %token <keyword>	ROW_COUNT
 %token <keyword>	SCROLL
@@ -341,8 +343,8 @@ opt_label:
 					if (yylex() != ':')
 						ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
-								 errmsg("syntax error, bizzare label \"%s\"", $1.ident),
-									parser_errposition(@1)));
+							 errmsg("syntax error, bizzare label \"%s\"", $1.ident),
+								parser_errposition(@1)));
 				}
 			|
 				{
@@ -722,7 +724,7 @@ qual_identif:
 					/* ToDo: Plpsm_object should be a param type too */
 					char buf[32];
 					snprintf(buf, sizeof(buf), "$%d", $1);
-					$$ = $$ = new_qualid(list_make1(pstrdup(buf)), @1);
+					$$ = new_qualid(list_make1(pstrdup(buf)), @1);
 				}
 		;
 
@@ -918,8 +920,8 @@ gd_area_opt:
 		;
 
 gd_info_enum:
-			SQLSTATE			{ $$ = PLPSM_GDINFO_SQLSTATE; }
-			| SQLCODE			{ $$ = PLPSM_GDINFO_SQLCODE; }
+			RETURNED_SQLSTATE		{ $$ = PLPSM_GDINFO_SQLSTATE; }
+			| RETURNED_SQLCODE			{ $$ = PLPSM_GDINFO_SQLCODE; }
 			| MESSAGE_TEXT			{ $$ = PLPSM_GDINFO_MESSAGE; }
 			| DETAIL_TEXT			{ $$ = PLPSM_GDINFO_DETAIL; }
 			| HINT_TEXT			{ $$ = PLPSM_GDINFO_HINT; }
@@ -1763,6 +1765,8 @@ is_unreserved_keyword(int tok)
 		case MESSAGE_TEXT:
 		case NO:
 		case NOT:
+		case RETURNED_SQLCODE:
+		case RETURNED_SQLSTATE:
 		case ROW_COUNT:
 		case SCROLL:
 		case SQLEXCEPTION:

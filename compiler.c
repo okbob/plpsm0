@@ -18,6 +18,21 @@
 
 #include "parser/parse_node.h"
 
+/* ----------
+ * Lookup table for EXCEPTION condition names
+ * ----------
+ */
+typedef struct
+{
+	const char *label;
+	int			sqlerrstate;
+} ExceptionLabelMap;
+
+static const ExceptionLabelMap exception_label_map[] = {
+#include "plerrcodes.h"
+	{NULL, 0}
+};
+
 Plpsm_stmt *plpsm_parser_tree;
 bool	plpsm_debug_compiler = false;
 bool	plpsm_debug_info = true;
@@ -65,6 +80,7 @@ typedef struct
 	Plpsm_object *top_scope;
 	Plpsm_object *current_scope;			/* pointer to outer compound statement */
 	Plpsm_pcode_module *module;
+	Plpsm_ht_table *ht_table;			/* pointer to HT table if exists */
 	struct
 	{
 		int16 ndatums;				/* number of datums in current scope */
@@ -77,8 +93,7 @@ typedef struct
 		bool	has_sqlcode;			/* true, when sqlcode variable is declared */
 		bool	has_notfound_continue_handler;	/* true, when in current scope not found continue handler exists */
 		int	ndata;				/* number of data address global		*/
-		int	nhtfields;			/* number of field in handlers' table */
-		int	th_addr;			/* offset to TH table */
+		int	ht_entry;			/* entry to TH table */
 		bool inside_handler;				/* true, when we are in handler */
 	}			stack;
 	struct						/* used as data for parsing a SQL expression */
@@ -134,6 +149,9 @@ static Plpsm_module *plpsm_HashTableLookup(Plpsm_module_hashkey *func_key);
 static void plpsm_HashTableInsert(Plpsm_module *module,
 						Plpsm_module_hashkey *func_key);
 static void plpsm_HashTableDelete(Plpsm_module *module);
+
+static int compile_ht(CompileState cstate, Plpsm_stmt *compound, int parent_addr);
+
 
 /*
  * fill a array with output functions' flinfo structures
@@ -328,13 +346,26 @@ lookup_condition(Plpsm_object *scope, Plpsm_condition_value *condition)
 {
 	bool	found = false;
 	int	sqlstate;
-
-	/*
-	 * ToDo: there can be a buildin system conditions
-	 */
+	int		i;
 
 	Assert(condition->typ == PLPSM_CONDITION_NAME);
 	sqlstate = _lookup_condition(scope, condition, &found);
+
+	/* cannot to overwrite buildin conditions */
+	for (i = 0; exception_label_map[i].label != NULL; i++)
+	{
+		if (strcmp(condition->condition_name, exception_label_map[i].label) == 0)
+		{
+			if (found)
+				ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("condition \"%s\" is defined yet (buildin condition)", condition->condition_name),
+							    parser_errposition(condition->location)));
+
+			return exception_label_map[i].sqlerrstate;
+		}
+	}
+
 	if (!found)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
@@ -354,16 +385,9 @@ verify_condition_list(CompileState cstate, Plpsm_condition_value *condition, boo
 
 		/* when condtion is specified by name, then we should to get derivated sqlstate */
 		if (typ == PLPSM_CONDITION_NAME)
-		{
-			sqlstate = lookup_condition(cstate->current_scope, condition);
-			if (sqlstate != 0)
-				condition->derivated_sqlstate = sqlstate;
-		}
-		else
-		{
-			if (typ == PLPSM_SQLSTATE)
-				sqlstate = condition->sqlstate;
-		}
+			sqlstate = condition->derivated_sqlstate;
+		else if (typ == PLPSM_SQLSTATE)
+			sqlstate = condition->sqlstate;
 
 		if (*isnotfound == false && (typ == PLPSM_SQLWARNING || (typ == PLPSM_SQLSTATE && 
 				ERRCODE_TO_CATEGORY(sqlstate) == MAKE_SQLSTATE('0','2','0','0','0'))))
@@ -910,6 +934,10 @@ lookup_handler(Plpsm_object *scope, Plpsm_condition_value *condition)
 					if (c->typ == PLPSM_SQLSTATE && ERRCODE_IS_CATEGORY(c->sqlstate) &&
 						ERRCODE_TO_CATEGORY(condition->sqlstate) == c->sqlstate)
 						return iterator;
+					if (c->typ == PLPSM_CONDITION_NAME && c->derivated_sqlstate != 0 &&
+						ERRCODE_IS_CATEGORY(c->derivated_sqlstate) &&
+						ERRCODE_TO_CATEGORY(c->derivated_sqlstate) == c->sqlstate)
+						return iterator;
 					c = c->next;
 				}
 			}
@@ -1184,6 +1212,90 @@ init_module(void)
 
 #define VALUE(x)	m->code[pc].x
 
+static void
+list_ht_table(Plpsm_ht_table *m)
+{
+	StringInfoData ds;
+	int pc;
+
+	initStringInfo(&ds);
+
+	if (m == NULL)
+		return;
+
+	for (pc = 1; pc < m->length; pc++)
+	{
+		appendStringInfo(&ds, "%5d", pc);
+		appendStringInfoChar(&ds, '\t');
+
+		Assert(VALUE(typ) == PCODE_HT);
+
+		appendStringInfoString(&ds, "HT ");
+		if (VALUE(HT_field.typ) != PLPSM_HT_PARENT && 
+				VALUE(HT_field.typ != PLPSM_HT_STOP) && VALUE(HT_field.typ != PLPSM_HT_RELEASE_SUBTRANSACTION) &&
+				VALUE(HT_field.typ != PLPSM_HT_DIAGNOSTICS_POP))
+		{
+			switch (VALUE(HT_field.htyp))
+			{
+				case PLPSM_HANDLER_CONTINUE:
+					appendStringInfoString(&ds, "CONTINUE ");
+					break;
+				case PLPSM_HANDLER_EXIT:
+					appendStringInfoString(&ds, "EXIT ");
+					break;
+				case PLPSM_HANDLER_UNDO:
+					appendStringInfoString(&ds, "UNDO ");
+					break;
+			}
+		}
+
+		switch (VALUE(HT_field.typ))
+		{
+			case PLPSM_HT_SQLCODE:
+				appendStringInfo(&ds, "SQLCODE: %s, addr:%d", 
+							unpack_sql_state(VALUE(HT_field.sqlcode)),
+							VALUE(HT_field.addr));
+				break;
+			case PLPSM_HT_CONDITION_NAME:
+				appendStringInfo(&ds, "CONDITION_NAME: %s, addr:%d",
+							VALUE(HT_field.condition_name),
+							VALUE(HT_field.addr));
+				break;
+			case PLPSM_HT_SQLCLASS:
+				appendStringInfo(&ds, "SQLCLASS: %s, addr:%d", 
+							unpack_sql_state(VALUE(HT_field.sqlclass)),
+							VALUE(HT_field.addr));
+				break;						
+			case PLPSM_HT_SQLWARNING:
+				appendStringInfo(&ds, "SQLWARNING, addr:%d", 
+							VALUE(HT_field.addr));
+				break;						
+			case PLPSM_HT_SQLEXCEPTION:
+				appendStringInfo(&ds, "SQLEXCEPTION, addr:%d", 
+							VALUE(HT_field.addr));
+				break;						
+			case PLPSM_HT_PARENT:
+				appendStringInfo(&ds, "Parent tab: %d", 
+							VALUE(HT_field.parent_HT_addr));
+				break;
+			case PLPSM_HT_RELEASE_SUBTRANSACTION:
+				appendStringInfo(&ds, "Release Subtransaction");
+				break;
+			case PLPSM_HT_DIAGNOSTICS_POP:
+				appendStringInfo(&ds, "Diagnostics Pop");
+				break;
+			case PLPSM_HT_STOP:
+				appendStringInfo(&ds, "STOP");
+				break;
+		}
+		
+		appendStringInfoChar(&ds, '\n');
+	}
+
+	elog(NOTICE, "Handler table:\n\n%s", ds.data);
+	pfree(ds.data);
+}
+
 static void 
 list(Plpsm_pcode_module *m)
 {
@@ -1195,7 +1307,6 @@ list(Plpsm_pcode_module *m)
 	appendStringInfo(&ds, "\n   Datums: %d variable(s) \n", m->ndatums);
 	appendStringInfo(&ds, "   Local data size: %d pointers\n", m->ndata);
 	appendStringInfo(&ds, "   Size: %d instruction(s)\n", m->length - 1);
-	appendStringInfo(&ds, "   HT addr: %d\n\n", m->ht_addr);
 
 	for (pc = 1; pc < m->length; pc++)
 	{
@@ -1445,6 +1556,9 @@ list(Plpsm_pcode_module *m)
 									appendStringInfo(&ds, "LEVEL = %d", 
 										VALUE(signal_property.ival));
 									break;
+								case PLPSM_GDINFO_CONDITION_IDENTIFIER:
+									appendStringInfo(&ds, "CONDITION_IDENTIFIER = %s", 
+										VALUE(signal_property.cstr));
 								default:
 									/* be compiler quite */;
 							}
@@ -1489,92 +1603,38 @@ list(Plpsm_pcode_module *m)
 						appendStringInfoString(&ds, "MESSAGE_TEXT");
 						break;
 					case PLPSM_GDINFO_SQLSTATE:
-						appendStringInfoString(&ds, "SQLSTATE");
+						appendStringInfoString(&ds, "RETURNED_SQLSTATE");
 						break;
 					case PLPSM_GDINFO_SQLCODE:
-						appendStringInfoString(&ds, "SQLCODE");
+						appendStringInfoString(&ds, "RETURNED_SQLCODE");
 						break;
 					case PLPSM_GDINFO_ROW_COUNT:
-						appendStringInfoString(&ds, "ROWCOUNT");
+						appendStringInfoString(&ds, "ROW_COUNT");
+						break;
+					case PLPSM_GDINFO_CONDITION_IDENTIFIER:
+						appendStringInfoString(&ds, "CONDITION_IDENTIFIER");
 						break;
 					default:
 						/* be compiler quite */;
 				}
 				break;
-			case PCODE_HT:
-				{
-					appendStringInfoString(&ds, "HT ");
-					if (VALUE(HT_field.typ) != PLPSM_HT_PARENT && 
-							VALUE(HT_field.typ != PLPSM_HT_STOP) && VALUE(HT_field.typ != PLPSM_HT_RELEASE_SUBTRANSACTION) &&
-							VALUE(HT_field.typ != PLPSM_HT_DIAGNOSTICS_POP))
-					{
-						switch (VALUE(HT_field.htyp))
-						{
-							case PLPSM_HANDLER_CONTINUE:
-								appendStringInfoString(&ds, "CONTINUE ");
-								break;
-							case PLPSM_HANDLER_EXIT:
-								appendStringInfoString(&ds, "EXIT ");
-								break;
-							case PLPSM_HANDLER_UNDO:
-								appendStringInfoString(&ds, "UNDO ");
-								break;
-						}
-					}
-
-					switch (VALUE(HT_field.typ))
-					{
-						case PLPSM_HT_SQLCODE:
-							appendStringInfo(&ds, "SQLCODE: %s, addr:%d", 
-											unpack_sql_state(VALUE(HT_field.sqlcode)),
-											VALUE(HT_field.addr));
-							break;
-						case PLPSM_HT_SQLCLASS:
-							appendStringInfo(&ds, "SQLCLASS: %s, addr:%d", 
-											unpack_sql_state(VALUE(HT_field.sqlclass)),
-											VALUE(HT_field.addr));
-							break;						
-						case PLPSM_HT_SQLWARNING:
-							appendStringInfo(&ds, "SQLWARNING, addr:%d", 
-											VALUE(HT_field.addr));
-							break;						
-						case PLPSM_HT_SQLEXCEPTION:
-							appendStringInfo(&ds, "SQLEXCEPTION, addr:%d", 
-											VALUE(HT_field.addr));
-							break;						
-						case PLPSM_HT_PARENT:
-							appendStringInfo(&ds, "Parent tab: %d", 
-											VALUE(HT_field.parent_HT_addr));
-							break;
-						case PLPSM_HT_RELEASE_SUBTRANSACTION:
-							appendStringInfo(&ds, "Release Subtransaction");
-							break;
-						case PLPSM_HT_DIAGNOSTICS_POP:
-							appendStringInfo(&ds, "Diagnostics Pop");
-							break;
-						case PLPSM_HT_STOP:
-							appendStringInfo(&ds, "STOP");
-							break;
-					}
-					break;
-				}
 		}
 
 		if (VALUE(htnum) != 0)
 		{
 			switch (VALUE(typ))
 			{
-			case PCODE_EXEC_EXPR:
-			case PCODE_EXEC_QUERY:
-			case PCODE_EXECUTE_IMMEDIATE:
-			case PCODE_PREPARE:
-			case PCODE_PARAMBUILDER:
-			case PCODE_EXECUTE:
-			case PCODE_SIGNAL_JMP:
-			case PCODE_SIGNAL_CALL:
-			case PCODE_RESIGNAL_JMP:
-			case PCODE_RESIGNAL_CALL:
-				appendStringInfo(&ds, ", HT[%d]", VALUE(htnum));
+				case PCODE_EXEC_EXPR:
+				case PCODE_EXEC_QUERY:
+				case PCODE_EXECUTE_IMMEDIATE:
+				case PCODE_PREPARE:
+				case PCODE_PARAMBUILDER:
+				case PCODE_EXECUTE:
+				case PCODE_SIGNAL_JMP:
+				case PCODE_SIGNAL_CALL:
+				case PCODE_RESIGNAL_JMP:
+				case PCODE_RESIGNAL_CALL:
+					appendStringInfo(&ds, ", HT[%d]", VALUE(htnum));
 			}
 		}
 		
@@ -1599,13 +1659,20 @@ check_module_size(Plpsm_pcode_module *m)
 	return m;
 }
 
+static void 
+check_ht_table_size(Plpsm_ht_table *m)
+{
+	if (m->length == 129)
+		elog(ERROR, "handler's table is full");
+}
+
 #define PC(m)				m->length
 
 #define SET_OPVAL(n, v)			m->code[m->length].n = v
 #define EMIT_OPCODE(t, lno)		do { \
 						m->code[m->length].lineno = lno; \
 						m->code[m->length].cframe = plpsm_debug_info ? CURRENT_SCOPE : NULL; \
-						m->code[m->length].htnum = cstate->stack.th_addr; \
+						m->code[m->length].htnum = cstate->stack.ht_entry; \
 						m->code[m->length++].typ = PCODE_ ## t; \
 						m = check_module_size(m); \
 					} while (0)
@@ -1658,6 +1725,14 @@ check_module_size(Plpsm_pcode_module *m)
 						SET_OPVAL(signal_property.f, v); \
 						EMIT_OPCODE(SIGNAL_PROPERTY, -1); \
 					} while (0);
+
+#define EMIT_HT_FIELD(t, lno)		do { \
+						SET_OPVAL(HT_field.typ, PLPSM_HT_ ## t); \
+						m->code[m->length].lineno = lno; \
+						m->code[m->length++].typ = PCODE_HT; \
+						check_ht_table_size(m); \
+					} while (0)
+
 
 static void
 compile_release_cursors(CompileState cstate)
@@ -2370,34 +2445,6 @@ finalize_block(CompileState cstate, Plpsm_object *obj)
 }
 
 /*
- * calculate a number of entries in HT for compound statement
- */
-static int
-ht_size(Plpsm_stmt *stmt)
-{
-	Plpsm_stmt *iterator = stmt->inner_left;
-	Plpsm_condition_value *c;
-	int result = 0;
-
-	Assert(stmt->typ == PLPSM_STMT_COMPOUND_STATEMENT);
-	while (iterator != NULL)
-	{
-		if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
-		{
-			c = (Plpsm_condition_value *) iterator->data;
-			while (c != NULL)
-			{
-				result++;
-				c = c->next;
-			}
-		}
-
-		iterator = iterator->next;
-	}
-	return result;
-}
-
-/*
  * compile a signal statement
  */
 static void
@@ -2544,33 +2591,12 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 	Plpsm_object *obj, *var;
 	Plpsm_pcode_module *m = cstate->module;
 	bool		should_insert_subtransaction;		/* true, when start of subtransaction will be inserted after declare statements */
-	bool		reassign_th_addr = false;
+	bool		handlers_table_refreshed = false;
 
-	int old_th_addr = cstate->stack.th_addr;
-	int local_th_addr = 0;
+	int old_th_addr = cstate->stack.ht_entry;
 	bool	inside_handler = cstate->stack.inside_handler;
 
 	should_insert_subtransaction = parent != NULL && parent->typ == PLPSM_STMT_COMPOUND_STATEMENT && parent->is_atomic;
-
-	if (parent != NULL && parent->typ == PLPSM_STMT_COMPOUND_STATEMENT)
-	{
-		int htsize = ht_size(parent->stmt);
-
-		if (htsize > 0)
-		{
-			cstate->stack.nhtfields += htsize + 1;		/* reserve space for local handlers and stop or parent link*/
-
-			if (cstate->use_stacked_diagnostics)
-				cstate->stack.nhtfields++;		/* reserve space for POP diagnostics for any local handler */
-
-			/* reserve one instr for start transaction */
-			if (parent->stmt && (bool) parent->stmt->option)
-				cstate->stack.nhtfields++;
-
-			reassign_th_addr = true;
-			local_th_addr = cstate->stack.nhtfields - 1;
-		}
-	}
 
 	while (stmt != NULL)
 	{
@@ -2585,12 +2611,15 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 			should_insert_subtransaction = false;
 		}
 
-		if (reassign_th_addr &&
-			stmt->typ != PLPSM_STMT_DECLARE_VARIABLE && 
-			stmt->typ != PLPSM_STMT_DECLARE_CURSOR &&
-			stmt->typ != PLPSM_STMT_DECLARE_HANDLER)
+		/* 
+		 * we have to generate HT_tab after last DECLARE CONDTION statement and 
+		 * before first DECLARE HANDLER statement.
+		 */
+		if (stmt->typ == PLPSM_STMT_DECLARE_HANDLER && !handlers_table_refreshed)
 		{
-			cstate->stack.th_addr = local_th_addr;
+			Assert(parent != NULL && parent->typ == PLPSM_STMT_COMPOUND_STATEMENT);
+			handlers_table_refreshed = true;
+			cstate->stack.ht_entry = compile_ht(cstate, parent->stmt, cstate->stack.ht_entry);
 		}
 
 		switch (stmt->typ)
@@ -2831,12 +2860,16 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 			case PLPSM_STMT_DECLARE_HANDLER:
 				{
 					bool	isnotfound = false;
+					int	curr_ht_entry = cstate->stack.ht_entry;
 
 					addr1 = PC(m);
 					EMIT_OPCODE(JMP, stmt->lineno);
 					addr2 = PC(m);
 
 					obj = create_handler_for(stmt, cstate, PC(m), &isnotfound);
+
+					/* inside handler use a parent HT entry */
+					cstate->stack.ht_entry = old_th_addr;
 
 					/* 
 					 * handler object is used as barier against to lookup
@@ -2897,6 +2930,14 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 
 					SET_OPVAL_ADDR(addr1, addr, PC(m));
 
+					Assert(cstate->ht_table != NULL);
+					Assert(stmt->ht_info.addr1 != 0);
+
+					cstate->ht_table->code[stmt->ht_info.addr1].HT_field.addr = addr2;
+					if (stmt->ht_info.addr2 != 0)
+						cstate->ht_table->code[stmt->ht_info.addr2].HT_field.addr = addr2;
+
+					cstate->stack.ht_entry = curr_ht_entry;
 					cstate->current_scope = obj->outer;
 				}
 				break;
@@ -3577,189 +3618,221 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 	}
 
 	/* returns back TH pointer */
-	cstate->stack.th_addr = old_th_addr;
+	cstate->stack.ht_entry = old_th_addr;
 
 	/* return back info about handler's compilation */
 	cstate->stack.inside_handler = inside_handler;
 }
 
 /*
- * Compile a Handler's table.
+ * Prepare Handler's table fields for compound statement
  */
-static void
-compile_ht(CompileState cstate, Plpsm_object *scope, int parent_addr)
+static int
+compile_ht(CompileState cstate, Plpsm_stmt *compound, int parent_addr)
 {
-	Plpsm_pcode_module *m = cstate->module;
-	int	last_pc = parent_addr;
-
-	if (scope == NULL)
-		return;
-
-	cstate->stack.th_addr = 0;
-
-	/*
-	 * we have to detect a handler's in scope 
-	 */
-	if (scope->typ == PLPSM_STMT_COMPOUND_STATEMENT)
-	{
-		Plpsm_object *iterator;
-		bool	with_HT_entry = false;
-		bool	reassign_parent_addr = false;
-
-		/* we should to store a stop or link to parent when we found a some handler */
-		iterator = scope->inner;
-		while (iterator != NULL)
-		{
-			if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
-			{
-				with_HT_entry = true; 	/* there will be a HT entry */
-				if (parent_addr != 0)
-				{
-					SET_OPVAL(HT_field.typ, PLPSM_HT_PARENT);
-					SET_OPVAL(HT_field.parent_HT_addr, parent_addr);
-					EMIT_OPCODE(HT, -1);
-					reassign_parent_addr = true;
-				}
-				else
-				{
-					/* when this is most outer handled compound statement */
-					SET_OPVAL(HT_field.typ, PLPSM_HT_STOP);
-					parent_addr = PC(m);
-					EMIT_OPCODE(HT, -1);
-					reassign_parent_addr = true;
-				}
-
-				/* 
-				 * We know, so we doesn't use this handler, so we have to POP
-				 * stacked diagnostics info.
-				 */
-				if (cstate->use_stacked_diagnostics)
-				{
-					SET_OPVAL(HT_field.typ, PLPSM_HT_DIAGNOSTICS_POP);
-					EMIT_OPCODE(HT, -1);
-				}
-				break;
-			}
-			iterator = iterator->next;
-		}
-
-		/* release a subtransaction when leave a ATOMIC compound statement */
-		if (scope->stmt && (bool) scope->stmt->option)
-		{
-			if (reassign_parent_addr)
-				parent_addr = PC(m);
-
-			SET_OPVAL(HT_field.typ, PLPSM_HT_RELEASE_SUBTRANSACTION);
-			EMIT_OPCODE(HT, -1);
-		}
-
-		if (with_HT_entry)
-		{
+	Plpsm_ht_table *m = cstate->ht_table;	
+	Plpsm_stmt *iterator;
+	bool	handler_found = false;
 			Plpsm_condition_value *c;
 
-			/*
-			 * there should be two independent itereation, because there are
-			 * two different orders. First we iterate over handler in this
-			 * statement in order from less general to general conditions.
-			 * Second, we should to iterate over nested Plpsm_objects.
-			 *
-			 * Seraching a generic handlers
-			 */
-			iterator = scope->inner;
-			while (iterator != NULL)
-			{
-				if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
-				{
-					c = (Plpsm_condition_value *) iterator->stmt->data;
-					while (c != NULL)
-					{
-						if (c->typ == PLPSM_SQLWARNING)
-						{
-							SET_OPVAL(HT_field.typ, PLPSM_HT_SQLWARNING);
-							SET_OPVAL(HT_field.htyp, iterator->stmt->option);
-							SET_OPVAL(HT_field.addr, iterator->calls.entry_addr);
-							EMIT_OPCODE(HT, -1);
-						}
-						if (c->typ == PLPSM_SQLEXCEPTION)
-						{
-							SET_OPVAL(HT_field.typ, PLPSM_HT_SQLEXCEPTION);
-							SET_OPVAL(HT_field.htyp, iterator->stmt->option);
-							SET_OPVAL(HT_field.addr, iterator->calls.entry_addr);
-							EMIT_OPCODE(HT, -1);
-						}
-						c = c->next;
-					}
-				}
-				iterator = iterator->next;
-			}
+	Assert(compound->typ == PLPSM_STMT_COMPOUND_STATEMENT);
 
-			/* searching a class handlers */
-			iterator = scope->inner;
-			while (iterator != NULL)
-			{
-				if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
-				{
-					c = (Plpsm_condition_value *) iterator->stmt->data;
-					while (c != NULL)
-					{
-						if (c->typ == PLPSM_SQLSTATE && ERRCODE_IS_CATEGORY(c->sqlstate))
-						{
-							SET_OPVAL(HT_field.typ, PLPSM_HT_SQLCLASS);
-							SET_OPVAL(HT_field.htyp, iterator->stmt->option);
-							SET_OPVAL(HT_field.sqlclass, c->sqlstate);
-							SET_OPVAL(HT_field.addr, iterator->calls.entry_addr);
-							EMIT_OPCODE(HT, -1);
-						}
-						c = c->next;
-					}
-				}
-				iterator = iterator->next;
-			}
-
-			/* searching a sqlstate handlers */
-			iterator = scope->inner;
-			while (iterator != NULL)
-			{
-				if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
-				{
-					c = (Plpsm_condition_value *) iterator->stmt->data;
-					while (c != NULL)
-					{
-						if (c->typ == PLPSM_SQLSTATE && !ERRCODE_IS_CATEGORY(c->sqlstate))
-						{
-							SET_OPVAL(HT_field.typ, PLPSM_HT_SQLCODE);
-							SET_OPVAL(HT_field.htyp, iterator->stmt->option);
-							SET_OPVAL(HT_field.sqlcode, c->sqlstate);
-							SET_OPVAL(HT_field.addr, iterator->calls.entry_addr);
-							EMIT_OPCODE(HT, -1);
-						}
-						c = c->next;
-					}
-				}
-				iterator = iterator->next;
-			}
-			last_pc = m->length - 1;
-		}
-
-		/* 
-		 * now we can iterate over nested Plpsm_objects in compiled time order.
-		 * we need to iterate over all compound statements.
-		 */
-		iterator = scope->inner;
-		while (iterator != NULL)
+	/* we have to detect, if there are handlers */
+	iterator = compound->inner_left;
+	while (iterator != NULL)
+	{
+		if (iterator->typ == PLPSM_STMT_DECLARE_VARIABLE || iterator->typ == PLPSM_STMT_DECLARE_CURSOR || 
+				iterator->typ == PLPSM_STMT_DECLARE_CONDITION)
 		{
-			if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
+			iterator = iterator->next;
+			continue;
+		}
+		else if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
+		{
+			Plpsm_condition_value *condition = (Plpsm_condition_value *) iterator->data;
+			handler_found = true;
+
+			/* search conditions */
+			while (condition != NULL)
 			{
-				compile_ht(cstate, iterator, parent_addr);
+				/* when condtion is specified by name, then we should to get derivated sqlstate */
+				if (condition->typ == PLPSM_CONDITION_NAME)
+					condition->derivated_sqlstate = lookup_condition(cstate->current_scope, condition);
+				condition = condition->next;
 			}
-			else
-				compile_ht(cstate, iterator, last_pc);
+
+			iterator->ht_info.addr1 = 0;
+			iterator->ht_info.addr2 = 0;
 
 			iterator = iterator->next;
 		}
+		else
+			break;
+	}
+
+	if (!handler_found)
+		return parent_addr;
+
+	/* there is some handlers */
+	if (m == NULL)
+	{
+		m = palloc0(128 * sizeof(Plpsm_pcode) + offsetof(Plpsm_ht_table, code));
+		m->mlength = 128;
+		m->length = 1;
+		cstate->ht_table = m;
+
+		EMIT_HT_FIELD(STOP, -1);
 	}
 	else
-		compile_ht(cstate, scope->inner, parent_addr);
+	{
+		SET_OPVAL(HT_field.parent_HT_addr, parent_addr);
+		EMIT_HT_FIELD(PARENT, -1);
+	}
+
+	/* 
+	 * We know, so we doesn't use any handler from compound statement, 
+	 * so we have to POP stacked diagnostics info.
+	 */
+	if (cstate->use_stacked_diagnostics)
+	{
+		EMIT_HT_FIELD(DIAGNOSTICS_POP, -1);
+	}
+
+	/* release a subtransaction when leave a ATOMIC compound statement */
+	if ((bool) compound->option)
+	{
+		EMIT_HT_FIELD(RELEASE_SUBTRANSACTION, -1);
+	}
+
+	/*
+	 * there should be two independent itereation, because there are
+	 * two different orders. First we iterate over handler in this
+	 * statement in order from less general to general conditions.
+	 * Second, we should to iterate over nested Plpsm_objects.
+	 *
+	 * Seraching a generic handlers
+	 */
+	iterator = compound->inner_left;
+	while (iterator != NULL)
+	{
+		if (iterator->typ == PLPSM_STMT_DECLARE_VARIABLE || iterator->typ == PLPSM_STMT_DECLARE_CURSOR ||
+			iterator->typ == PLPSM_STMT_DECLARE_CONDITION)
+		{
+			iterator = iterator->next;
+			continue;
+		}
+		else if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
+		{
+			c = (Plpsm_condition_value *) iterator->data;
+			while (c != NULL)
+			{
+				if (c->typ == PLPSM_SQLWARNING)
+				{
+					SET_OPVAL(HT_field.htyp, iterator->option);
+					iterator->ht_info.addr1 = PC(m);
+					EMIT_HT_FIELD(SQLWARNING, iterator->lineno);
+				}
+				else if (c->typ == PLPSM_SQLEXCEPTION)
+				{
+					SET_OPVAL(HT_field.htyp, iterator->option);
+					iterator->ht_info.addr1 = PC(m);
+					EMIT_HT_FIELD(SQLEXCEPTION, iterator->lineno);
+				}
+				c = c->next;
+			}
+			iterator = iterator->next;
+		}
+		else
+			break;
+	}
+
+	/* searching a class handlers */
+	iterator = compound->inner_left;
+	while (iterator != NULL)
+	{
+		if (iterator->typ == PLPSM_STMT_DECLARE_VARIABLE || iterator->typ == PLPSM_STMT_DECLARE_CURSOR ||
+			iterator->typ == PLPSM_STMT_DECLARE_CONDITION)
+		{
+			iterator = iterator->next;
+			continue;
+		}
+		else if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
+		{
+			c = (Plpsm_condition_value *) iterator->data;
+			while (c != NULL)
+			{
+				if (c->typ == PLPSM_SQLSTATE && ERRCODE_IS_CATEGORY(c->sqlstate))
+				{
+					SET_OPVAL(HT_field.htyp, iterator->option);
+					SET_OPVAL(HT_field.sqlclass, c->sqlstate);
+					iterator->ht_info.addr1 = PC(m);
+					EMIT_HT_FIELD(SQLCLASS, iterator->lineno);
+				}
+				else if (c->typ == PLPSM_CONDITION_NAME && c->derivated_sqlstate != 0 &&
+					ERRCODE_IS_CATEGORY(c->derivated_sqlstate))
+				{
+					SET_OPVAL(HT_field.htyp, iterator->option);
+					SET_OPVAL(HT_field.sqlclass, c->derivated_sqlstate);
+					iterator->ht_info.addr1 = PC(m);
+					EMIT_HT_FIELD(SQLCLASS, iterator->lineno);
+				}
+				c = c->next;
+			}
+			iterator = iterator->next;
+		}
+		else
+			break;
+	}
+
+	/* searching a sqlstate handlers */
+	iterator = compound->inner_left;
+	while (iterator != NULL)
+	{
+		if (iterator->typ == PLPSM_STMT_DECLARE_VARIABLE || iterator->typ == PLPSM_STMT_DECLARE_CURSOR ||
+			iterator->typ == PLPSM_STMT_DECLARE_CONDITION)
+		{
+			iterator = iterator->next;
+			continue;
+		}
+		else if (iterator->typ == PLPSM_STMT_DECLARE_HANDLER)
+		{
+			c = (Plpsm_condition_value *) iterator->data;
+			while (c != NULL)
+			{
+				if (c->typ == PLPSM_SQLSTATE && !ERRCODE_IS_CATEGORY(c->sqlstate))
+				{
+					SET_OPVAL(HT_field.htyp, iterator->option);
+					SET_OPVAL(HT_field.sqlcode, c->sqlstate);
+					iterator->ht_info.addr1 = PC(m);
+					EMIT_HT_FIELD(SQLCODE, iterator->lineno);
+				}
+				else if (c->typ == PLPSM_CONDITION_NAME && c->derivated_sqlstate != 0
+					&& !ERRCODE_IS_CATEGORY(c->derivated_sqlstate))
+				{
+					SET_OPVAL(HT_field.htyp, iterator->option);
+					SET_OPVAL(HT_field.sqlcode, c->derivated_sqlstate);
+					iterator->ht_info.addr1 = PC(m);
+					EMIT_HT_FIELD(SQLCODE, iterator->lineno);
+				}
+
+				/* special entry, when handler is described by condition name */
+				if (c->typ == PLPSM_CONDITION_NAME)
+				{
+					SET_OPVAL(HT_field.htyp, iterator->option);
+					SET_OPVAL(HT_field.condition_name, pstrdup(c->condition_name));
+					iterator->ht_info.addr2 = PC(m);
+					EMIT_HT_FIELD(CONDITION_NAME, iterator->lineno);
+				}
+				c = c->next;
+			}
+
+			iterator = iterator->next;
+		}
+		else
+			break;
+	}
+
+	return m->length - 1;
 }
 
 Plpsm_module *
@@ -3892,6 +3965,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	module->tid = procTup->t_self;
 	module->cxt = func_cxt;
 	module->with_cframe_debug = plpsm_debug_info;
+	module->ht_table = NULL;
 
 	m = init_module();
 	cstated.module = m;
@@ -3926,8 +4000,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	cstated.top_scope->name = outer_scope->name;
 	cstated.current_scope = cstated.top_scope;
 	cstated.stack.ndata = 0;
-	cstated.stack.th_addr = 0;
-	cstated.stack.nhtfields = 0;		/* there are no handler */
+	cstated.stack.ht_entry = 0;
 	cstated.stack.ndatums = 0;
 	cstated.stack.oids.size = 128;
 	cstated.stack.oids.data = (Oid *) palloc(cstated.stack.oids.size * sizeof(Oid));
@@ -3936,6 +4009,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	cstated.stack.has_notfound_continue_handler = false;
 	cstated.stack.inside_handler = false;
 	cstated.prepared = NULL;
+	cstated.ht_table = NULL;
 	cstated.use_stacked_diagnostics = false;
 
 	cstated.finfo.result.datum.typoid = procStruct->prorettype;
@@ -4059,19 +4133,21 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	_compile(&cstated, plpsm_parser_tree, NULL);
 	compile_done(&cstated);
 
-	m->ht_addr = cstated.stack.nhtfields ? m->length : 0;
-	compile_ht(&cstated, outer_scope, 0);
-
 	m->ndatums = cstated.stack.ndatums;
 	m->ndata = cstated.stack.ndata;
 
 	module->code = m;
+	module->ht_table = cstated.ht_table;
 
 	/* prepare a persistent memory */
 	module->DataPtrs = palloc0((m->ndata + 1) * sizeof(void*) );
 
 	if (plpsm_debug_compiler)
+	{
 		list(m);
+		if (module->ht_table != NULL)
+			list_ht_table(module->ht_table);
+	}
 
 	plpsm_HashTableInsert(module, hashkey);
 

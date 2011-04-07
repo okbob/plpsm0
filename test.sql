@@ -1633,7 +1633,7 @@ $$ language psm0;
 create or replace function test70(out r text) as $$
 begin
   declare exit handler for sqlwarning
-      get diagnostics r = sqlstate;
+      get diagnostics r = returned_sqlstate;
   signal sqlstate '02002';
 end;
 $$ language psm0;
@@ -1645,7 +1645,7 @@ begin
   declare exit handler for sqlwarning
     begin
       print sqlstate, sqlcode;
-      get diagnostics r = sqlcode;
+      get diagnostics r = returned_sqlcode;
     end;
   signal sqlstate '02002';
 end;
@@ -1660,7 +1660,7 @@ begin
   declare sqlcode int;
   declare exit handler for sqlwarning
     begin
-      get diagnostics r = sqlcode;
+      get diagnostics r = returned_sqlcode;
       print sqlstate, sqlcode;
     end;
   signal sqlstate '02002';
@@ -1674,7 +1674,7 @@ begin
   declare c1 cursor for select a from footab;
   declare exit handler for not found
     begin
-      get diagnostics _sqlcode = sqlcode, _sqlstate = sqlstate;
+      get diagnostics _sqlcode = returned_sqlcode, _sqlstate = returned_sqlstate;
     end;
   set s = 0;
   open c1;
@@ -1694,7 +1694,7 @@ begin atomic
   declare c1 cursor for select a from footab;
   declare undo handler for sqlstate '55001'
     begin
-      get diagnostics _sqlcode = sqlcode, _sqlstate = sqlstate, _message = message_text;
+      get diagnostics _sqlcode = returned_sqlcode, _sqlstate = returned_sqlstate, _message = message_text;
     end;
   set s = 0;
   open c1;
@@ -1718,13 +1718,13 @@ begin atomic
   declare c1 cursor for select a from footab;
   declare undo handler for sqlstate '55001'
     begin
-      get diagnostics _sqlcode = sqlcode, _sqlstate = sqlstate, _message = message_text;
+      get diagnostics _sqlcode = returned_sqlcode, _sqlstate = returned_sqlstate, _message = message_text;
     end;
   set s = 0;
   open c1;
   loop
     fetch c1 into aux;
-    get diagnostics _sqlcode = sqlcode, _sqlstate = sqlstate;
+    get diagnostics _sqlcode = returned_sqlcode, _sqlstate = returned_sqlstate;
     if _sqlcode <> 0 then
       set msg = msg || ' ' || _sqlstate;
       signal sqlstate '55001' set message_text = msg;
@@ -1741,7 +1741,7 @@ begin atomic
   declare aux int;
   declare undo handler for sqlexception
   begin
-    get diagnostics _sqlstate = sqlstate;
+    get diagnostics _sqlstate = returned_sqlstate;
     return _sqlstate;
   end;
   set aux = 10 / a;
@@ -1756,14 +1756,14 @@ begin atomic
   declare s text;
   declare undo handler for sqlexception
     begin
-      get diagnostics r = sqlstate;
+      get diagnostics r = returned_sqlstate;
       set s = s || ',' || r;
       return s;
     end;
   begin atomic
     declare undo handler for sqlexception
       begin
-        get diagnostics r = sqlstate;
+        get diagnostics r = returned_sqlstate;
         set s =  r;
         signal sqlstate '33333';
         resignal;
@@ -1780,14 +1780,14 @@ begin atomic
   declare s text;
   declare undo handler for sqlexception
     begin
-      get diagnostics r = sqlstate;
+      get diagnostics r = returned_sqlstate;
       set s = s || ',' || r;
       return s;
     end;
   begin atomic
     declare undo handler for sqlexception
       begin
-        get diagnostics r = sqlstate;
+        get diagnostics r = returned_sqlstate;
         set s =  r;
         resignal;
       end;
@@ -1803,18 +1803,67 @@ begin atomic
   declare s text;
   declare undo handler for sqlexception
     begin
-      get diagnostics r = sqlstate;
+      get diagnostics r = returned_sqlstate;
       set s = s || ',' || r;
       return s;
     end;
   begin atomic
     declare undo handler for sqlexception
       begin
-        get diagnostics r = sqlstate;
+        get diagnostics r = returned_sqlstate;
         set s =  r;
         resignal sqlstate '44444';
       end;
     signal sqlstate '66550';
+  end;
+end;
+$$ language psm0;
+
+-- signaling via condition and HT
+create or replace function test72_3()
+returns text as $$
+begin atomic
+  declare r text;
+  declare s text;
+  declare custom_condition condition;
+  declare undo handler for sqlexception
+    begin
+      get diagnostics r = returned_sqlstate;
+      set s = s || ',' || r;
+      return s;
+    end;
+  begin atomic
+    declare undo handler for sqlexception
+      begin
+        get diagnostics r = returned_sqlstate;
+        set s =  r;
+        resignal;
+      end;
+    signal custom_condition;
+  end;
+end;
+$$ language psm0;
+
+create or replace function test72_4()
+returns text as $$
+begin atomic
+  declare r text;
+  declare s text;
+  declare custom_condition condition for sqlstate '56444';
+  declare undo handler for sqlexception
+    begin
+      get diagnostics r = returned_sqlstate;
+      set s = s || ',' || r;
+      return s;
+    end;
+  begin atomic
+    declare undo handler for sqlexception
+      begin
+        get diagnostics r = returned_sqlstate;
+        set s =  r;
+        resignal;
+      end;
+    signal custom_condition;
   end;
 end;
 $$ language psm0;
@@ -1826,11 +1875,11 @@ begin
   declare continue handler for sqlwarning
     begin
       declare aux text;
-      get stacked diagnostics aux = sqlstate;
+      get stacked diagnostics aux = returned_sqlstate;
       set result = result || ' ' || aux;
-      get current diagnostics aux = sqlstate;
+      get current diagnostics aux = returned_sqlstate;
       set result = result || ' ' || aux;
-      get stacked diagnostics aux = sqlstate;
+      get stacked diagnostics aux = returned_sqlstate;
       set result = result || ' ' || aux;
     end;
   signal sqlstate '02005';
@@ -1846,11 +1895,11 @@ begin atomic
   declare undo handler for sqlexception
     begin
       declare aux text;
-      get stacked diagnostics aux = sqlstate;
+      get stacked diagnostics aux = returned_sqlstate;
       set result = result || ' ' || aux;
-      get current diagnostics aux = sqlstate;
+      get current diagnostics aux = returned_sqlstate;
       set result = result || ' ' || aux;
-      get stacked diagnostics aux = sqlstate;
+      get stacked diagnostics aux = returned_sqlstate;
       set result = result || ' ' || aux;
       return result;
     end;
@@ -1879,14 +1928,35 @@ begin
   declare exit handler for not_found
     begin
       declare xx text;
-      get diagnostics xx = CONDITION_IDENTIFIER;
-      print xx, ' handler activated';
-      return 'Signal handled';
+      get diagnostics xx = condition_identifier;
+      return xx || ' Signal handled';
     end;
   signal not_found;
 end;
 $$ language psm0;
 
+create or replace function test74_2()
+returns text as $$
+begin atomic
+  declare not_found condition for sqlstate '03000';
+  declare undo handler for not_found
+    begin
+      declare xx, yy text;
+      get stacked diagnostics xx = condition_identifier, yy = returned_sqlstate;
+      return xx || ' Signal handled ' || yy;
+    end;
+  signal not_found;
+end;
+$$ language psm0;
+
+-- check buildin conditions
+create or replace function test75(in a int)
+returns int as $$
+begin atomic
+  declare undo handler for division_by_zero
+    return null;
+  return 10 / a;
+end $$ language psm0;
 
 
 /*
@@ -1918,6 +1988,16 @@ begin
   end if;
 end;
 $$ language plpgsql;
+
+create or replace function assert(text, bool, bool)
+returns void as $$
+begin
+  if ($2 <> $3) then
+    raise exception 'test "%" broken. %<>%', $1, $2, $3;
+  end if;
+end;
+$$ language plpgsql;
+
 
 create or replace function assert(text, text, text)
 returns void as $$
@@ -2102,11 +2182,15 @@ begin
   perform assert('test72','66550,33333', test72());
   perform assert('test72_1','66550,66550', test72_1());
   perform assert('test72_2','66550,44444', test72_2());
+  perform assert('test72_3','45000,45000', test72_3());
+  perform assert('test72_4','56444,56444', test72_4());
   perform assert('test73', ' 02005 00000 02005 02005 00000 02005', test73());
   perform assert('test73_1', ' 45005 00000 45005', test73_1());
   perform assert('test74', 'Signal handled', test74());
-  perform assert('test74_1', 'Signal handled', test74_1());
-
+  perform assert('test74_1', 'not_found Signal handled', test74_1());
+  perform assert('test74_2', 'not_found Signal handled 03000', test74_2());
+  perform assert('test75', 1, test75(10));
+  perform assert('test75', true, test75(0) is null);
 
   raise notice '******* All tests are ok *******';
 end;

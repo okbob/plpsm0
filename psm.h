@@ -186,7 +186,6 @@ typedef struct Plpsm_stmt
 	List	*variables;		/* list of quals used almost in USAGE clause */
 	union
 	{
-		void *data;
 		struct
 		{
 			Oid	typoid;
@@ -200,6 +199,11 @@ typedef struct Plpsm_stmt
 			char *loopvar_name;
 			char *cursor_name;
 		} stmtfor;
+		struct
+		{
+			int addr1;			/* put entry address of handler to these two addresses */
+			int addr2;
+		} ht_info;
 		Plpsm_ESQL *from_clause;
 	};
 	void			*data;
@@ -335,6 +339,7 @@ typedef enum
 	PLPSM_HT_PARENT,
 	PLPSM_HT_RELEASE_SUBTRANSACTION,
 	PLPSM_HT_DIAGNOSTICS_POP,
+	PLPSM_HT_CONDITION_NAME,
 	PLPSM_HT_STOP
 } Plpsm_ht_type;
 
@@ -449,6 +454,7 @@ typedef struct
 				int	sqlcode;
 				int	sqlclass;
 				int	parent_HT_addr;
+				char 		*condition_name;
 			};
 			int addr;
 		} HT_field;
@@ -502,13 +508,20 @@ typedef struct
 {
 	int mlength;
 	int	length;
+	Plpsm_pcode	code[1];
+} Plpsm_ht_table;
+
+typedef struct
+{
+	int mlength;
+	int	length;
 	int		ndatums;		/* max number of used Datums */
 	int		ndata;			/* number of data address used for module's instance */
 	char *name;
 	bool		is_read_only;
-	int		ht_addr;		/* address of Handlers' table */
 	Plpsm_pcode code[1];
 } Plpsm_pcode_module;
+
 
 typedef struct
 {
@@ -520,6 +533,7 @@ typedef struct
 	unsigned long use_count;
 	bool		is_read_only;
 	Plpsm_pcode_module *code;
+	Plpsm_ht_table *ht_table;		/* pointer to ht_table */
 	void	**DataPtrs;			/* Pointer to persistent allocated pointers */
 	bool	with_cframe_debug;		/* true, when statements contains a pointer to current frame */
 } Plpsm_module; 
