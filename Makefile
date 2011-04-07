@@ -33,7 +33,7 @@ uninstall: uninstall-lib
 
 
 # Force these dependencies to be known even without dependency info built:
-gram.o handler.o scanner.o: psm.h gram.h
+gram.o handler.o scanner.o: psm.h gram.h plerrcodes.h
 
 # See notes in src/backend/parser/Makefile about the following two rules
 
@@ -45,6 +45,11 @@ ifdef BISON
 else
 	@$(missing) bison $< $@
 endif
+
+# generate plerrcodes.h from src/backend/utils/errcodes.txt
+plerrcodes.h: $(top_srcdir)/src/backend/utils/errcodes.txt generate-plerrcodes.pl
+	$(PERL) $(srcdir)/generate-plerrcodes.pl $< > $@
+
 
 # so they are not cleaned here.
 clean distclean: clean-lib

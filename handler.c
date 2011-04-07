@@ -36,7 +36,7 @@ _PG_init(void)
 						&plpsm_debug_parser,
 						false,
 						PGC_SUSET, 0,
-						NULL, NULL);
+						NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("plpsm.debug_compiler",
 						"when is true, then compiler output is raised",
@@ -44,7 +44,7 @@ _PG_init(void)
 						&plpsm_debug_compiler,
 						false,
 						PGC_SUSET, 0,
-						NULL, NULL);
+						NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("plpsm.debug_info",
 						"when is true, then debug data is attached",
@@ -52,7 +52,7 @@ _PG_init(void)
 						&plpsm_debug_info,
 						true,
 						PGC_SUSET, 0,
-						NULL, NULL);
+						NULL, NULL, NULL);
 
 	plpsm_HashTableInit();
 
