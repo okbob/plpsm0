@@ -1958,6 +1958,58 @@ begin atomic
   return 10 / a;
 end $$ language psm0;
 
+-- basic array support
+create or replace function test76(a int)
+returns int[] as $$
+begin
+  declare x int[];
+  set x[10] = a;
+  return x;
+end;
+$$ language psm0;
+
+create or replace function test76_1()
+returns int[] as $$
+begin
+  declare x int[];
+  for select i from generate_series(1,10) g(i) do
+    set x[i] = i;
+  end for;
+  return x;
+end;
+$$ language psm0;
+
+create or replace function test76_2()
+returns int[] as $$
+begin
+  declare x int[];
+    set x[1] = 1, x[2] = 2, x[3] = 3;
+  return x;
+end;
+$$ language psm0;
+
+create or replace function test76_3()
+returns int[] as $$
+begin
+  declare x int[] default array_fill(0, array[2,2]);
+  set x[1][1] = 2, x[2][2] = 2;
+  return x;
+end;
+$$ language psm0;
+
+create or replace function test76_4()
+returns varchar(5)[] as $$
+begin
+  declare x varchar(5)[];
+  set x[1] = 'Hello World';
+  return x;
+end;
+$$ language psm0;
+
+
+
+
+
 
 /*
  * example of before trigger
@@ -2191,6 +2243,11 @@ begin
   perform assert('test74_2', 'not_found Signal handled 03000', test74_2());
   perform assert('test75', 1, test75(10));
   perform assert('test75', true, test75(0) is null);
+  perform assert('test76', 10, (test76(10))[10]);
+  perform assert('test76_1', 55, (select sum(v)::int from unnest(test76_1()) g(v)));
+  perform assert('test76_2',  6, (select sum(v)::int from unnest(test76_2()) g(v)));
+  perform assert('test76_3',  4, (select sum(v)::int from unnest(test76_3()) g(v)));
+  perform assert('test76_4', 'Hello', (test76_4())[1]);
 
   raise notice '******* All tests are ok *******';
 end;

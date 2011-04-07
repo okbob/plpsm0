@@ -94,14 +94,14 @@ extern ParserState pstate;
 %type <stmt>	function stmt dstmt statements stmt_compound
 %type <stmt>	stmt_repeat_until stmt_loop stmt_while
 %type <stmt>	stmt_iterate stmt_leave
-%type <stmt>	assign_item assign_list stmt_set target
+%type <stmt>	assign_item assign_list stmt_set target assign_var
 %type <stmt>	stmt_print stmt_return
 %type <stmt>	declaration declarations declare_prefetch
 %type <stmt>	stmt_if stmt_else
 %type <list>	qual_identif_list 
 %type <qualid>	qual_identif
 %type <esql>	expr_until_semi_or_coma expr_until_semi expr_until_do expr_until_end
-%type <esql>	expr_until_semi_into_using expr_until_then
+%type <esql>	expr_until_semi_into_using expr_until_then expr_until_right_bracket
 %type <str>	opt_label opt_end_label
 %type <condition>	condition condition_list opt_sqlstate
 %type <list>	expr_list expr_list_into
@@ -626,7 +626,7 @@ case_when:
 					new->last = new;
 					$$ = new;
 				}
-			;
+		;
 
 opt_case_else:
 				{
@@ -636,7 +636,7 @@ opt_case_else:
 				{
 					$$ = $2;
 				}
-			;
+		;
 
 /*----
  * (multi) assign statement 
@@ -676,11 +676,34 @@ assign_list:
 					$$ = $1;
 				}
 
-assign_item:		target '=' expr_until_semi_or_coma
+assign_item:		assign_var '=' expr_until_semi_or_coma
 				{
-					$1->typ = PLPSM_STMT_SET;
 					$1->esql = $3;
 					$$ = $1;
+				}
+		;
+
+assign_var:
+			target
+				{
+					$1->typ = PLPSM_STMT_SET;
+					$$ = $1;
+				}
+			| assign_var '[' expr_until_right_bracket
+				{
+					int	i = 0;
+
+					$$ = $1;
+					if ($1->subscripts == NULL)
+						$1->subscripts = palloc0(sizeof(Plpsm_ESQL *) * MAXDIM);
+
+					while ($1->subscripts[i] != NULL)
+					{
+						if (++i == MAXDIM)
+							yyerror("too much subscripts");
+					}
+
+					$1->subscripts[i] = $3;
 				}
 		;
 
@@ -1375,7 +1398,17 @@ expr_list:
 				{
 					$$ = lappend($1, $3);
 				}
-			;
+		;
+
+expr_until_right_bracket:
+				{
+					Plpsm_ESQL *esql = read_embeded_sql(']', -1, -1, "]", 
+												PLPSM_ESQL_EXPR, true, 
+														    NULL, -1, 
+															    NULL, NULL);
+					$$ = esql;
+				}
+		;
 
 expr_until_semi_or_coma:
 				{
@@ -1960,6 +1993,19 @@ stmt_out(StringInfo ds, Plpsm_stmt *stmt, int nested_level)
 	appendStringInfo(ds, "%s| Name: %s\n", ident, stmt->name);
 	appendStringInfo(ds, "%s| Target: ", ident);
 	pqualid_out(ds, stmt->target);
+
+	if (stmt->typ == PLPSM_STMT_SET && stmt->subscripts != NULL)
+	{
+		int	i = 0;
+		while (i < MAXDIM && stmt->subscripts[i] != NULL)
+		{
+			appendStringInfoChar(ds, '[');
+			esql_out(ds, stmt->subscripts[i]);
+			appendStringInfoChar(ds, ']');
+			i++;
+		}
+	}
+
 	appendStringInfoChar(ds, '\n');
 	appendStringInfo(ds, "%s| Compound target: ", ident);
 	pqualid_list_out(ds,stmt->compound_target);
@@ -2169,6 +2215,7 @@ read_embeded_sql(int until1,
 			/* don't want to leave early - etc SET a = (10,20), b = .. */
 			if (tok == ';' || tok == 0 || parenlevel == 0 || 
 					(tok == ')' && parenlevel == 0) ||
+					(tok == ']' && parenlevel == 0) ||
 					(tok == ',' && parenlevel == 0))
 				break;
 		}

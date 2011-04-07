@@ -1411,6 +1411,15 @@ list(Plpsm_pcode_module *m)
 											VALUE(update_field.typoid), 
 											VALUE(update_field.typmod));
 				break;
+			case PCODE_ARRAY_UPDATE:
+				appendStringInfo(&ds, "ArrayUpdate @%d, len:%d, elemlen: %d, elembyval:%d, elemalign:%c. elemoid:%d",
+											VALUE(array_update.offset),
+											VALUE(array_update.arraytyplen),
+											VALUE(array_update.elemtyplen),
+											VALUE(array_update.elemtypbyval),
+											VALUE(array_update.elemtypalign),
+											VALUE(array_update.arrayelemtypid));
+				break;
 			case PCODE_COPY_PARAM:
 				appendStringInfo(&ds, "CopyParam %d, @%d, size:%d, byval:%s", 
 											VALUE(copyto.src),
@@ -1521,6 +1530,12 @@ list(Plpsm_pcode_module *m)
 			case PCODE_DIAGNOSTICS_POP:
 				appendStringInfo(&ds, "Diagnostics Pop");
 				break;
+			case PCODE_SUBSCRIPTS_RESET:
+				appendStringInfo(&ds, "Subscripts Reset");
+				break;
+			case PCODE_SUBSCRIPTS_APPEND:
+				appendStringInfo(&ds, "Subscripts Append");
+				break;
 			case PCODE_SIGNAL_PROPERTY:
 				{
 					appendStringInfoString(&ds, "Signal Property ");
@@ -1541,7 +1556,7 @@ list(Plpsm_pcode_module *m)
 										VALUE(signal_property.cstr));
 									break;
 								case PLPSM_GDINFO_DETAIL:
-									appendStringInfo(&ds, "DETAIL_TEXT = %s", 
+								appendStringInfo(&ds, "DETAIL_TEXT = %s", 
 										VALUE(signal_property.cstr));
 									break;
 								case PLPSM_GDINFO_HINT:
@@ -2254,6 +2269,58 @@ compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid target
 		/* Restore former ereport callback */
 		error_context_stack = syntax_errcontext.previous;
 	}
+
+	/*
+	 * refresh state variables
+	 */
+	if (refresh_state_vars)
+	{
+		if (cstate->stack.has_sqlstate)
+		{
+			Plpsm_object *var = lookup_var(cstate->current_scope, "sqlstate");
+			Assert(var != NULL);
+			SET_OPVALS_DATUM_COPY(target, var);
+			EMIT_OPCODE(SQLSTATE_REFRESH, -1);
+		}
+
+		if (cstate->stack.has_sqlcode)
+		{
+			Plpsm_object *var = lookup_var(cstate->current_scope, "sqlcode");
+			Assert(var != NULL);
+			SET_OPVALS_DATUM_COPY(target, var);
+			EMIT_OPCODE(SQLCODE_REFRESH, -1);
+		}
+	}
+}
+
+/*
+ * emit simple expression
+ */
+static void 
+compile_cast_var(CompileState cstate, int offset, Oid targetoid, int16 typmod, 
+										bool is_array, 
+										bool refresh_state_vars,
+										int lineno)
+{
+	StringInfoData	ds;
+	Plpsm_pcode_module *m = cstate->module;
+	Oid	*argtypes;
+
+	initStringInfo(&ds);
+	appendStringInfo(&ds, "SELECT ($%d)::%s%s", offset,
+								format_type_with_typemod(targetoid, typmod),
+								is_array ? "[]" : "");
+
+	SET_OPVAL(expr.without_diagnostics, !refresh_state_vars);
+
+	argtypes = palloc(cstate->stack.ndatums * sizeof(Oid));
+	memcpy(argtypes, cstate->stack.oids.data, cstate->stack.ndatums * sizeof(Oid));
+
+	SET_OPVAL(expr.nparams, cstate->stack.ndatums);
+	SET_OPVAL(expr.typoids, argtypes);
+	SET_OPVAL(expr.data, cstate->stack.ndata++);
+	SET_OPVAL(expr.is_multicol, false);
+	EMIT_OPCODE(EXEC_EXPR, lineno);
 
 	/*
 	 * refresh state variables
@@ -3310,9 +3377,71 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 						}
 						else
 						{
-							compile_expr(cstate, stmt->esql, NULL, var->stmt->datum.typoid, var->stmt->datum.typmod, true);
-							SET_OPVALS_DATUM_COPY(target, var);
-							EMIT_OPCODE(SAVETO, stmt->lineno);
+							if (stmt->subscripts != NULL)
+							{
+								int	i = 0;
+								Oid	arraytypeid = var->stmt->datum.typoid;
+								int32	arraytypmod = var->stmt->datum.typmod;
+								Oid		arrayelemtypid;
+								int16		arraytyplen,
+												elemtyplen;
+								bool		elemtypbyval;
+								char		elemtypalign;
+
+								/* If target is domain over array, reduce to base type */
+								arraytypeid = getBaseTypeAndTypmod(arraytypeid, &arraytypmod);
+
+								/* ... and identify the element type */
+								arrayelemtypid = get_element_type(arraytypeid);
+								if (!OidIsValid(arrayelemtypid))
+									ereport(ERROR,
+											(errcode(ERRCODE_DATATYPE_MISMATCH),
+											 errmsg("subscripted object is not an array"),
+												parser_errposition(stmt->target->location)));
+
+								get_typlenbyvalalign(arrayelemtypid,
+													 &elemtyplen,
+													 &elemtypbyval,
+													 &elemtypalign);
+								arraytyplen = get_typlen(arraytypeid);
+
+								EMIT_OPCODE(SUBSCRIPTS_RESET, -1);
+								while (i < MAXDIM)
+								{
+									if (stmt->subscripts[i] == NULL)
+										break;
+									compile_expr(cstate, stmt->subscripts[i++], NULL, INT4OID, -1, true);
+									EMIT_OPCODE(SUBSCRIPTS_APPEND, -1);
+								}
+
+								/* target type should be a element of array */
+								compile_expr(cstate, stmt->esql, NULL, arrayelemtypid, arraytypmod, true);
+
+								SET_OPVAL(array_update.offset, var->offset);
+								
+								SET_OPVAL(array_update.arrayelemtypid, arrayelemtypid);
+								SET_OPVAL(array_update.elemtyplen, elemtyplen);
+								SET_OPVAL(array_update.elemtypbyval, elemtypbyval);
+								SET_OPVAL(array_update.elemtypalign, elemtypalign);
+								SET_OPVAL(array_update.arraytyplen, arraytyplen);
+
+								EMIT_OPCODE(ARRAY_UPDATE, -1);
+
+								/* cast to domains when it is necessary */
+								if (arraytypeid != var->stmt->datum.typoid || arraytypmod != var->stmt->datum.typmod)
+								{
+									compile_cast_var(cstate, var->offset, var->stmt->datum.typoid, var->stmt->datum.typmod,
+																	    true, true, stmt->lineno);
+									SET_OPVALS_DATUM_COPY(target, var);
+									EMIT_OPCODE(SAVETO, stmt->lineno);
+								}
+							}
+							else
+							{
+								compile_expr(cstate, stmt->esql, NULL, var->stmt->datum.typoid, var->stmt->datum.typmod, true);
+								SET_OPVALS_DATUM_COPY(target, var);
+								EMIT_OPCODE(SAVETO, stmt->lineno);
+							}
 						}
 					}
 					else

@@ -205,6 +205,7 @@ typedef struct Plpsm_stmt
 			int addr2;
 		} ht_info;
 		Plpsm_ESQL *from_clause;
+		Plpsm_ESQL **subscripts;
 	};
 	void			*data;
 	int	option;
@@ -301,7 +302,11 @@ typedef enum
 	PCODE_DIAGNOSTICS_PUSH,
 	PCODE_DIAGNOSTICS_POP,
 	PCODE_GET_DIAGNOSTICS,
-	PCODE_SIGNAL_PROPERTY
+	PCODE_SIGNAL_PROPERTY,
+	PCODE_SAVE_SPI_RESULT,
+	PCODE_SUBSCRIPTS_RESET,
+	PCODE_SUBSCRIPTS_APPEND,
+	PCODE_ARRAY_UPDATE
 } Plpsm_pcode_type;
 
 typedef enum
@@ -406,6 +411,15 @@ typedef struct
 			int	fnumber;
 			int	data;
 		} saveto_field;
+		struct
+		{
+			int16	arraytyplen;
+			int16	elemtyplen;
+			bool	elemtypbyval;
+			char	elemtypalign;
+			Oid	arrayelemtypid;
+			int		offset;
+		} array_update;
 		struct
 		{
 			int	offset;

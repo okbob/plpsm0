@@ -9,6 +9,7 @@
 #include "executor/spi.h"
 #include "nodes/bitmapset.h"
 #include "parser/parse_coerce.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -310,6 +311,8 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	bool		is_read_only = module->is_read_only;
 	char	*src = NULL;
 	FmgrInfo	*out_funcs = NULL;
+	int			subscripts[MAXDIM];
+	int			nsubscript = 0;		/* number of subscripts in array */
 
 	MemoryContext	exec_ctx;
 	MemoryContext	oldctx;
@@ -1697,6 +1700,75 @@ next_op:
 							break;
 					}
 				}
+				break;
+
+			case PCODE_SUBSCRIPTS_RESET:
+				{
+					nsubscript = 0;
+				}
+				break;
+
+			case PCODE_SUBSCRIPTS_APPEND:
+				{
+					Assert(nsubscript < MAXDIM);
+					if (SPI_processed == 0)
+						elog(ERROR, "internal error, subscript value is empty");
+
+					if (isnull)
+						ereport(ERROR,
+								(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+								 errmsg("array subscript in assignment must not be null")));
+
+					subscripts[nsubscript++] = result;
+				}
+				break;
+
+			case PCODE_ARRAY_UPDATE:
+				{
+					ArrayType  *oldarrayval;
+					ArrayType  *newarrayval;
+					bool	oldarrayisnull = nulls[pcode->array_update.offset] == 'n';
+
+					Assert(nsubscript > 0);
+
+					/*
+					 * If the original array is null, cons up an empty array so
+					 * that the assignment can proceed; we'll end with a
+					 * one-element array containing just the assigned-to
+					 * subscript.  This only works for varlena arrays, though; for
+					 * fixed-length array types we skip the assignment.  We can't
+					 * support assignment of a null entry into a fixed-length
+					 * array, either, so that's a no-op too.  This is all ugly but
+					 * corresponds to the current behavior of ExecEvalArrayRef().
+					 */
+					if (pcode->array_update.arraytyplen > 0 && (oldarrayisnull || isnull))
+						goto finish_update;
+
+					if (oldarrayisnull)
+						oldarrayval = construct_empty_array(pcode->array_update.arrayelemtypid);
+					else
+						oldarrayval = (ArrayType *) values[pcode->array_update.offset];
+
+					/*
+					 * Build the modified array value.
+					 */
+					newarrayval = array_set(oldarrayval,
+											nsubscript,
+											subscripts,
+											result,
+											isnull,
+											pcode->array_update.arraytyplen,
+											pcode->array_update.elemtyplen,
+											pcode->array_update.elemtypbyval,
+											pcode->array_update.elemtypalign);
+
+					if (!oldarrayisnull)
+						pfree(DatumGetPointer(values[pcode->array_update.offset]));
+
+					values[pcode->array_update.offset] = PointerGetDatum(newarrayval);
+					nulls[pcode->array_update.offset] = ' ';
+				}
+				finish_update:
 				break;
 
 			default:
