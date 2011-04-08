@@ -98,6 +98,7 @@ static const ScanKeyword reserved_keywords[] = {
 	PG_KEYWORD("value", VALUE, RESERVED_KEYWORD)
 	PG_KEYWORD("when", WHEN, RESERVED_KEYWORD)
 	PG_KEYWORD("while", WHILE, RESERVED_KEYWORD)
+	PG_KEYWORD("with", WITH, RESERVED_KEYWORD)
 };
 
 static const int num_reserved_keywords = lengthof(reserved_keywords);

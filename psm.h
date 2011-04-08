@@ -90,6 +90,12 @@ typedef enum
 	PLPSM_ESQL_DATATYPE
 } Plpsm_esql_type;
 
+typedef enum
+{
+	PLPSM_RETURN_EXPR,
+	PLPSM_RETURN_QUERY
+} Plpsm_return_type;
+
 typedef struct 
 {							/* used for embeded SQL expressions and SQL queries */
 	Plpsm_esql_type		typ;

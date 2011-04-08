@@ -3584,15 +3584,20 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 								 errmsg("using RETURN expr in function with OUT arguments"),
 									parser_errposition(stmt->location)));
 
-						if (stmt->esql != NULL)
-							compile_expr(cstate, stmt->esql, NULL, cstate->finfo.result.datum.typoid, -1, false);
-						else
-							compile_expr(cstate, NULL, cstate->finfo.return_expr,
-											cstate->finfo.result.datum.typoid, -1, false);
+						if (stmt->option == PLPSM_RETURN_EXPR)
+						{
+							if (stmt->esql != NULL)
+								compile_expr(cstate, stmt->esql, NULL, cstate->finfo.result.datum.typoid, -1, false);
+							else
+								compile_expr(cstate, NULL, cstate->finfo.return_expr,
+												cstate->finfo.result.datum.typoid, -1, false);
 
-						SET_OPVAL(target.typlen, cstate->finfo.result.datum.typlen);
-						SET_OPVAL(target.typbyval, cstate->finfo.result.datum.typbyval);
-						EMIT_OPCODE(RETURN, stmt->lineno);
+							SET_OPVAL(target.typlen, cstate->finfo.result.datum.typlen);
+							SET_OPVAL(target.typbyval, cstate->finfo.result.datum.typbyval);
+							EMIT_OPCODE(RETURN, stmt->lineno);
+						}
+						else
+							elog(ERROR, "unsupported yet");
 					}
 					else
 					{

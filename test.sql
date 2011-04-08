@@ -2006,6 +2006,14 @@ begin
 end;
 $$ language psm0;
 
+create or replace function test77()
+returns table (a int, b int) as $$
+begin
+  return select i, i + 1
+            from generate_series(1,3) g(i);
+end;
+$$ language psm0;
+
 
 
 

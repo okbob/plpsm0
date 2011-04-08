@@ -196,6 +196,7 @@ extern ParserState pstate;
 %token <keyword>	VALUE
 %token <keyword>	WHEN
 %token <keyword>	WHILE
+%token <keyword>	WITH
 
 %token <keyword>	INSERT
 %token <keyword>	UPDATE
@@ -782,10 +783,36 @@ stmt_return:
 					{
 						plpsm_push_back_token(tok);
 					}
+					else if (tok == SELECT || tok == WITH)
+					{
+						plpsm_push_back_token(tok);
+						new->esql = read_embeded_sql(';', 0, 0,
+											";",
+											PLPSM_ESQL_QUERY,
+											true,
+											NULL,
+											-1,
+											NULL,
+											NULL);
+						new->option = PLPSM_RETURN_QUERY;
+					}
+					else if (tok == '(')
+					{
+						new->esql = read_embeded_sql(')', 0, 0,
+											")",
+											PLPSM_ESQL_EXPR,
+											true,
+											NULL,
+											-1,
+											NULL,
+											NULL);
+						new->option = PLPSM_RETURN_EXPR;
+					}
 					else
 					{
 						plpsm_push_back_token(tok);
 						new->esql = read_expr_until_semi();
+						new->option = PLPSM_RETURN_EXPR;
 					}
 					$$ = new;
 				}
@@ -1504,8 +1531,8 @@ make_stmt_sql(int location)
 	return new;
 }
 
-static Plpsm_ESQL
-*read_expr_until_semi(void)
+static Plpsm_ESQL *
+read_expr_until_semi(void)
 {
 	return read_embeded_sql(';', 0, 0, ";", PLPSM_ESQL_EXPR, true, NULL, -1, NULL, NULL);
 }
@@ -2209,6 +2236,8 @@ read_embeded_sql(int until1,
 			first_token = false;
 			esql->typ = PLPSM_ESQL_QUERY;
 		}
+		else
+			first_token = false;
 
 		if (startlocation < 0)
 			startlocation = yylloc;
