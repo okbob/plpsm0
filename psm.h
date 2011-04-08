@@ -556,6 +556,7 @@ typedef struct
 {
 	int		location;
 	int		leaderlen;
+	int		lineno;
 } Plpsm_sql_error_callback_arg;
 
 extern Plpsm_stmt *plpsm_parser_tree;

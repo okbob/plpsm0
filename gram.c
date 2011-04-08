@@ -4615,6 +4615,7 @@ read_embeded_sql(int until1,
 	int tok;
 	StringInfoData		ds;
 	Plpsm_ESQL	*esql = palloc(sizeof(Plpsm_ESQL));
+	bool	first_token = true;
 
 	esql->typ = expected_type;
 
@@ -4624,6 +4625,14 @@ read_embeded_sql(int until1,
 	{
 		/* read a current location before you read a next tag */
 		tok = yylex();
+
+		if (first_token && tok == SELECT)
+		{
+			/* comma isn't separator in end tag in this case */
+			until2 = -1;
+			first_token = false;
+			esql->typ = PLPSM_ESQL_QUERY;
+		}
 
 		if (startlocation < 0)
 			startlocation = yylloc;
@@ -4707,7 +4716,7 @@ read_embeded_sql(int until1,
 			 * SQL expression, then try to verify expression first, there
 			 * can be more early detected missing symbol.
 			 */
-			if (expected_type == PLPSM_ESQL_EXPR)
+			if (esql->typ == PLPSM_ESQL_EXPR)
 			{
 				StringInfoData	bexpr;
 
@@ -4735,7 +4744,7 @@ read_embeded_sql(int until1,
 	if (endtoken)
 		*endtoken = tok;
 
-	if (expected_type == PLPSM_ESQL_EXPR)
+	if (esql->typ == PLPSM_ESQL_EXPR)
 	{
 		StringInfoData	bexpr;
 
@@ -4754,7 +4763,7 @@ read_embeded_sql(int until1,
 			pfree(bexpr.data);
 		}
 	}
-	else if (expected_type == PLPSM_ESQL_DATATYPE)
+	else if (esql->typ == PLPSM_ESQL_DATATYPE)
 	{
 		if (startlocation >= yylloc)
 			yyerror("missing data type");

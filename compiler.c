@@ -152,6 +152,9 @@ static void plpsm_HashTableDelete(Plpsm_module *module);
 
 static int compile_ht(CompileState cstate, Plpsm_stmt *compound, int parent_addr);
 
+static void compile_refresh_basic_diagnostic(CompileState cstate);
+
+
 
 /*
  * fill a array with output functions' flinfo structures
@@ -1965,12 +1968,14 @@ plpsm_parser_setup(struct ParseState *pstate, CompileState cstate)
  * Transform a query string - replace vars's identifiers by placeholders
  */
 static char *
-replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs, TupleDesc *tupdesc)
+replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs, TupleDesc *tupdesc, int location)
 {
 	Oid	*newargtypes;
 	ListCell *l;
 	List       *raw_parsetree_list;
 	MemoryContext oldctx, tmpctx;
+	ErrorContextCallback  			syntax_errcontext;
+	Plpsm_sql_error_callback_arg 		cbarg;
 
 	cstate->pdata.maxvars = 128;
 	cstate->pdata.vars = (SQLHostVar *) palloc(cstate->pdata.maxvars * sizeof(SQLHostVar));
@@ -1988,6 +1993,17 @@ replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs, Tupl
 										   ALLOCSET_DEFAULT_MAXSIZE);
 
 	oldctx = MemoryContextSwitchTo(tmpctx);
+
+	if (location != -1)
+	{
+		cbarg.location = location;
+		cbarg.leaderlen = strlen(sqlstr);
+
+		syntax_errcontext.callback = plpsm_sql_error_callback;
+		syntax_errcontext.arg = &cbarg;
+		syntax_errcontext.previous = error_context_stack;
+		error_context_stack = &syntax_errcontext;
+	}
 
 	raw_parsetree_list = pg_parse_query(sqlstr);
 
@@ -2009,6 +2025,12 @@ replace_vars(CompileState cstate, char *sqlstr, Oid **argtypes, int *nargs, Tupl
 	}
 
 	MemoryContextSwitchTo(oldctx);
+
+	if (location != -1)
+	{
+		/* Restore former ereport callback */
+		error_context_stack = syntax_errcontext.previous;
+	}
 
 	if (!cstate->pdata.has_external_params)
 	{
@@ -2161,9 +2183,6 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, Plpsm_ESQL *from_cl
 
 	initStringInfo(&ds);
 
-	if (list_length(stmt->compound_target) != list_length(stmt->esql_list))
-		elog(ERROR, "there are different number of target variables and expressions in list");
-
 	/* 
 	 * now we doesn't a know a properties of generated query, so only emit
 	 * opcode now. The property will be reasigned later.
@@ -2172,55 +2191,144 @@ compile_multiset_stmt(CompileState cstate, Plpsm_stmt *stmt, Plpsm_ESQL *from_cl
 	SET_OPVAL(expr.data, cstate->stack.ndata++);
 	SET_OPVAL(expr.is_multicol, true);
 	EMIT_OPCODE(EXEC_EXPR, stmt->lineno);
-	appendStringInfoString(&ds, "SELECT ");
 
-	forboth (l1, stmt->compound_target, l2, stmt->esql_list)
+	/*
+	 * Check a variant, where esql_list has one item and it is a embeded query
+	 * type.
+	 */
+	if (list_length(stmt->esql_list) == 1 && (((Plpsm_ESQL *)(linitial(stmt->esql_list)))->typ == PLPSM_ESQL_QUERY))
 	{
 		const char *fieldname;
 		Plpsm_object *var;
 		Plpsm_ESQL *esql;
-		Plpsm_positioned_qualid *qualid = (Plpsm_positioned_qualid *) lfirst(l1);
+		int		param_number = 1;
+		int		ta_number = cstate->stack.ndata - 1;
 
-		var = resolve_target(cstate, qualid, &fieldname, PLPSM_STMT_DECLARE_VARIABLE);
-		esql = (Plpsm_ESQL *) lfirst(l2);
+		StringInfoData target_list;
+		StringInfoData alias_list;
 
-		if (!isfirst)
-			appendStringInfoChar(&ds, ',');
-		else
-			isfirst = false;
+		initStringInfo(&target_list);
+		initStringInfo(&alias_list);
 
-		if (fieldname != NULL)
+		/*
+		 * We have to inject query with explicit casting to taget types. It can be done
+		 * with derivated table - and alias type descriptions
+		 */
+		foreach (l1, stmt->compound_target)
 		{
-			int16	typmod = -1;
-			Oid	typoid = InvalidOid;
-			int	fno;
+			Plpsm_positioned_qualid *qualid = (Plpsm_positioned_qualid *) lfirst(l1);
 
-			fno = resolve_composite_field(var->stmt->datum.typoid, var->stmt->datum.typmod, fieldname,
-														    &typoid,
-														    &typmod,
-															qualid->location);
-			appendStringInfo(&ds, "(%s)::%s", esql->sqlstr, format_type_with_typemod(typoid, typmod));
-			SET_OPVAL(update_field.fno, fno);
-			SET_OPVAL(update_field.typoid, var->stmt->datum.typoid);
-			SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
-			SET_OPVAL(update_field.offset, var->offset);
-			SET_OPVAL(update_field.fnumber, i++);
-			EMIT_OPCODE(UPDATE_FIELD, stmt->lineno);
+			if (!isfirst)
+			{
+				appendStringInfoChar(&target_list, ',');
+				appendStringInfoChar(&alias_list, ',');
+			}
+			else
+				isfirst = false;
+
+			var = resolve_target(cstate, qualid, &fieldname, PLPSM_STMT_DECLARE_VARIABLE);
+			esql = (Plpsm_ESQL *) lfirst(l2);
+
+			if (fieldname != NULL)
+			{
+				int16	typmod = -1;
+				Oid	typoid = InvalidOid;
+				int	fno;
+
+				fno = resolve_composite_field(var->stmt->datum.typoid, var->stmt->datum.typmod, fieldname,
+															    &typoid,
+															    &typmod,
+																qualid->location);
+
+				appendStringInfo(&target_list, "___ta_%d.___%d::%s", ta_number, param_number,
+											    format_type_with_typemod(typoid, typmod));
+				appendStringInfo(&alias_list, "___%d", param_number++);
+
+				SET_OPVAL(update_field.fno, fno);
+				SET_OPVAL(update_field.typoid, var->stmt->datum.typoid);
+				SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
+				SET_OPVAL(update_field.offset, var->offset);
+				SET_OPVAL(update_field.fnumber, i++);
+				EMIT_OPCODE(UPDATE_FIELD, stmt->lineno);
+			}
+			else
+			{
+
+				appendStringInfo(&target_list, "___ta_%d.___%d::%s", ta_number, param_number,
+											    format_type_with_typemod(var->stmt->datum.typoid, var->stmt->datum.typmod));
+				appendStringInfo(&alias_list, "___%d", param_number++);
+
+				SET_OPVALS_DATUM_INFO(saveto_field, var);
+				SET_OPVAL(saveto_field.fnumber, i++);
+				EMIT_OPCODE(SAVETO_FIELD, stmt->lineno);
+			}
 		}
-		else
+		appendStringInfo(&ds, "SELECT %s FROM (%s) ___ta_%d(%s)", 
+											target_list.data,
+											((Plpsm_ESQL *)(linitial(stmt->esql_list)))->sqlstr,
+											ta_number,
+											alias_list.data);
+		pfree(alias_list.data);
+		pfree(target_list.data);
+
+		compile_refresh_basic_diagnostic(cstate);
+
+	}
+	else
+	{
+		if (list_length(stmt->compound_target) != list_length(stmt->esql_list))
+			elog(ERROR, "there are different number of target variables and expressions in list");
+
+		appendStringInfoString(&ds, "SELECT ");
+
+		forboth (l1, stmt->compound_target, l2, stmt->esql_list)
 		{
-			appendStringInfo(&ds, "(%s)::%s", esql->sqlstr, 
-							format_type_with_typemod(var->stmt->datum.typoid, var->stmt->datum.typmod));
-			SET_OPVALS_DATUM_INFO(saveto_field, var);
-			SET_OPVAL(saveto_field.fnumber, i++);
-			EMIT_OPCODE(SAVETO_FIELD, stmt->lineno);
+			const char *fieldname;
+			Plpsm_object *var;
+			Plpsm_ESQL *esql;
+			Plpsm_positioned_qualid *qualid = (Plpsm_positioned_qualid *) lfirst(l1);
+
+			var = resolve_target(cstate, qualid, &fieldname, PLPSM_STMT_DECLARE_VARIABLE);
+			esql = (Plpsm_ESQL *) lfirst(l2);
+
+			if (!isfirst)
+				appendStringInfoChar(&ds, ',');
+			else
+				isfirst = false;
+
+			if (fieldname != NULL)
+			{
+				int16	typmod = -1;
+				Oid	typoid = InvalidOid;
+				int	fno;
+
+				fno = resolve_composite_field(var->stmt->datum.typoid, var->stmt->datum.typmod, fieldname,
+															    &typoid,
+															    &typmod,
+																qualid->location);
+				appendStringInfo(&ds, "(%s)::%s", esql->sqlstr, format_type_with_typemod(typoid, typmod));
+				SET_OPVAL(update_field.fno, fno);
+				SET_OPVAL(update_field.typoid, var->stmt->datum.typoid);
+				SET_OPVAL(update_field.typmod, var->stmt->datum.typmod);
+				SET_OPVAL(update_field.offset, var->offset);
+				SET_OPVAL(update_field.fnumber, i++);
+				EMIT_OPCODE(UPDATE_FIELD, stmt->lineno);
+			}
+			else
+			{
+				appendStringInfo(&ds, "(%s)::%s", esql->sqlstr, 
+								format_type_with_typemod(var->stmt->datum.typoid, var->stmt->datum.typmod));
+				SET_OPVALS_DATUM_INFO(saveto_field, var);
+				SET_OPVAL(saveto_field.fnumber, i++);
+				EMIT_OPCODE(SAVETO_FIELD, stmt->lineno);
+			}
 		}
+
+		if (from_clause != NULL)
+			appendStringInfo(&ds, " %s", from_clause->sqlstr);
 	}
 
-	if (from_clause != NULL)
-		appendStringInfo(&ds, " %s", from_clause->sqlstr);
-
-	SET_OPVAL_ADDR(addr, expr.expr, replace_vars(cstate, ds.data, &locargtypes, &nargs, NULL));
+	SET_OPVAL_ADDR(addr, expr.expr, replace_vars(cstate, ds.data, &locargtypes, &nargs, NULL, stmt->location));
 	SET_OPVAL_ADDR(addr, expr.nparams, nargs);
 	SET_OPVAL_ADDR(addr, expr.typoids, locargtypes);
 }
@@ -2257,7 +2365,7 @@ compile_expr(CompileState cstate, Plpsm_ESQL *esql, const char *expr, Oid target
 
 	initStringInfo(&ds);
 	appendStringInfo(&ds, "SELECT (%s)::%s", expr, format_type_with_typemod(targetoid, typmod));
-	SET_OPVAL(expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs, NULL));
+	SET_OPVAL(expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs, NULL, -1));
 	SET_OPVAL(expr.nparams, nargs);
 	SET_OPVAL(expr.typoids, argtypes);
 	SET_OPVAL(expr.data, cstate->stack.ndata++);
@@ -2758,7 +2866,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					cursor->cursor.data_addr = PC(m);
 					cursor->cursor.is_dynamic = false;
 
-					SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->esql->sqlstr), &argtypes, &nargs, &tupdesc));
+					SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->esql->sqlstr), &argtypes, &nargs, &tupdesc, stmt->esql->location));
 					SET_OPVAL(expr.nparams, nargs);
 					SET_OPVAL(expr.typoids, argtypes);
 					SET_OPVAL(expr.data, cstate->stack.ndata++);
@@ -3060,7 +3168,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 						var->cursor.data_addr = PC(m);
 						var->cursor.is_dynamic = false;
 
-						SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->esql->sqlstr), &argtypes, &nargs, NULL));
+						SET_OPVAL(expr.expr, replace_vars(cstate, pstrdup(stmt->esql->sqlstr), &argtypes, &nargs, NULL, stmt->esql->location));
 						SET_OPVAL(expr.nparams, nargs);
 						SET_OPVAL(expr.typoids, argtypes);
 						SET_OPVAL(expr.data, cstate->stack.ndata++);
@@ -3334,7 +3442,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 							appendStringInfo(&ds, "(%s)::text", ((Plpsm_ESQL *)(lfirst(l)))->sqlstr);
 						}
 
-						SET_OPVAL_ADDR(addr1, expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs, NULL));
+						SET_OPVAL_ADDR(addr1, expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs, NULL, stmt->location));
 						SET_OPVAL_ADDR(addr1, expr.nparams, nargs);
 						SET_OPVAL_ADDR(addr1, expr.typoids, argtypes);
 
@@ -3509,7 +3617,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 					Oid	*argtypes;
 					int	nargs;
 				
-					SET_OPVAL(expr.expr, replace_vars(cstate, stmt->esql->sqlstr, &argtypes, &nargs, NULL));
+					SET_OPVAL(expr.expr, replace_vars(cstate, stmt->esql->sqlstr, &argtypes, &nargs, NULL, stmt->esql->location));
 					SET_OPVAL(expr.nparams, nargs);
 					SET_OPVAL(expr.typoids, argtypes);
 					SET_OPVAL(expr.data, cstate->stack.ndata++);

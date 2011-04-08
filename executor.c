@@ -568,8 +568,10 @@ next_op:
 					}
 					else if (SPI_processed != 1)
 					{
-						elog(ERROR, "query \"%s\" returned more than one row",
-												pcode->expr.expr);
+						ereport(ERROR,
+								(errcode(ERRCODE_TOO_MANY_ROWS),
+								 errmsg("query \"%s\" returned more than one row",
+											    pcode->expr.expr)));
 					}
 					else
 					{
