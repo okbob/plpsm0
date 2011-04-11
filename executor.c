@@ -3,10 +3,12 @@
 #include "postgres.h"
 #include "funcapi.h"
 
+#include "access/tupconvert.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/prepare.h"
 #include "executor/spi.h"
+#include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "parser/parse_coerce.h"
 #include "utils/array.h"
@@ -314,6 +316,11 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 	int			subscripts[MAXDIM];
 	int			nsubscript = 0;		/* number of subscripts in array */
 
+	Tuplestorestate *tuple_store = NULL;		/* SRFs accumulate results here */
+	MemoryContext tuple_store_cxt = NULL;
+	ResourceOwner tuple_store_owner = NULL;
+	ReturnSetInfo *rsi = NULL;
+
 	MemoryContext	exec_ctx;
 	MemoryContext	oldctx;
 	MemoryContext	func_cxt = mod->cxt;
@@ -552,7 +559,7 @@ next_op:
 
 					/* check if returned expression is only one value */
 					if (SPI_tuptable->tupdesc->natts != 1 && !pcode->expr.is_multicol)
-						elog(ERROR, "EEEEquery returned %d column", 
+						elog(ERROR, "query returned %d column", 
 										SPI_tuptable->tupdesc->natts);
 
 					sqlstate = SPI_processed > 0 ? ERRCODE_SUCCESSFUL_COMPLETION : ERRCODE_NO_DATA;
@@ -1773,6 +1780,254 @@ next_op:
 				finish_update:
 				break;
 
+			case PCODE_RETURN_QUERY:
+				{
+					MemoryContext oldctx;
+					ResourceOwner oldowner;
+					SPIPlanPtr plan = DataPtrs[pcode->expr.data];
+					Portal		portal = NULL;
+
+					Assert(tuple_store == NULL);
+					Assert(tuple_store_cxt != NULL);
+
+					if (clean_result)
+					{
+						SPI_freetuptable(SPI_tuptable);
+						MemoryContextReset(exec_ctx);
+						clean_result = false;
+					}
+
+					oldctx = CurrentMemoryContext;
+
+					PG_TRY();
+					{
+						if (plan == NULL)
+						{
+							plan =  SPI_prepare_cursor(pcode->expr.expr, pcode->expr.nparams, pcode->expr.typoids,
+																		CURSOR_OPT_NO_SCROLL);
+							if (plan == NULL)
+								elog(ERROR, "query \"%s\" cannot be prepared", pcode->expr.expr);
+
+							oldctx = MemoryContextSwitchTo(func_cxt);
+							DataPtrs[pcode->expr.data] = SPI_saveplan(plan);
+							MemoryContextSwitchTo(oldctx);
+						}
+
+						oldctx = MemoryContextSwitchTo(exec_ctx);
+						portal = SPI_cursor_open(NULL, plan, values, nulls, is_read_only);
+						MemoryContextSwitchTo(oldctx);
+					}
+					PG_CATCH();
+					{
+						ErrorData *edata;
+						int		handler_addr;
+						
+						MemoryContextSwitchTo(oldctx);
+						edata = CopyErrorData();
+						FlushErrorState();
+
+						rollback_nested_transactions = true;
+
+						handler_addr = search_handler(mod, NULL, edata->sqlerrcode, ResourceOwnerStack, &ROP, pcode->htnum, NULL,
+												DInfoStack, &first_area, &DID);
+						if (handler_addr > 0)
+						{
+							sqlstate = edata->sqlerrcode;
+							/* 
+							 * before we jump to handler, we should to set
+							 * a state variables. A addresses of these variables
+							 * are stored in next two instructions - if are used
+							 */
+							set_state_variable(mod, sqlstate, PC + 1, values, nulls);
+							set_state_variable(mod, sqlstate, PC + 2, values, nulls);
+
+							if (keep_diagnostics_info)
+								set_diagnostics(&first_area, edata);
+
+							FreeErrorData(edata);
+
+							/* go to handler */
+							rollback_nested_transactions = false;
+							PC = handler_addr;
+							goto next_op;
+						}
+						else
+						{
+							/* 
+							 * we should to release a allocated resources. The most important
+							 * is correct finishing a nested transactions.
+							 */
+							while (ROP >= 0)
+							{
+								if (rollback_nested_transactions)
+									RollbackAndReleaseCurrentSubTransaction();
+								else
+									ReleaseCurrentSubTransaction();
+
+								CurrentResourceOwner = ResourceOwnerStack[ROP--];
+							}
+
+							ReThrowError(edata);
+						}
+					}
+					PG_END_TRY();
+
+					/* 
+					 * now we have opened portal. When we fetch a tuple, then we can fill a returned set
+					 */
+					PG_TRY();
+					{
+						MemoryContext ecxt;
+						bool	isfirst = true;
+						TupleConversionMap *tupmap;
+
+						SPI_cursor_fetch(portal, true, 50);
+						if (SPI_processed > 0)
+						{
+							/*
+							 * copy portal to output tuple store
+							 */
+							ecxt = MemoryContextSwitchTo(tuple_store_cxt);
+							oldowner = CurrentResourceOwner;
+							CurrentResourceOwner = tuple_store_owner;
+
+							/*
+							 * Switch to the right memory context and resource owner for storing the
+							 * tuplestore for return set. If we're within a subtransaction opened for
+							 * an exception-block, for example, we must still create the tuplestore in
+							 * the resource owner that was active when this function was entered, and
+							 * not in the subtransaction resource owner.
+							 */
+							tuple_store = tuplestore_begin_heap(rsi->allowedModes & SFRM_Materialize_Random,
+															  false, work_mem);
+
+							CurrentResourceOwner = oldowner;
+							MemoryContextSwitchTo(ecxt);
+
+							tupmap = convert_tuples_by_position(portal->tupDesc,
+														rsi->expectedDesc,
+									"structure of query does not match function result type");
+
+							while (true)
+							{
+								int		i;
+
+								if (isfirst)
+									isfirst = false;
+								else
+									SPI_cursor_fetch(portal, true, 50);
+								if (SPI_processed == 0)
+									break;
+
+								for (i = 0; i < SPI_processed; i++)
+								{
+									HeapTuple	tuple = SPI_tuptable->vals[i];
+
+									if (tupmap)
+										tuple = do_convert_tuple(tuple, tupmap);
+									tuplestore_puttuple(tuple_store, tuple);
+									if (tupmap)
+										heap_freetuple(tuple);
+								}
+
+								SPI_freetuptable(SPI_tuptable);
+							}
+
+							if (tupmap)
+								free_conversion_map(tupmap);
+
+							isnull = false;
+							rsi->returnMode = SFRM_Materialize;
+							rsi->setResult = tuple_store;
+
+							ecxt = MemoryContextSwitchTo(tuple_store_cxt);
+							rsi->setDesc = CreateTupleDescCopy(rsi->expectedDesc);
+							MemoryContextSwitchTo(ecxt);
+						}
+						else
+							isnull = true;
+					}
+					PG_CATCH();
+					{
+						ErrorData *edata;
+						int		handler_addr;
+						
+						MemoryContextSwitchTo(oldctx);
+						edata = CopyErrorData();
+						FlushErrorState();
+
+						rollback_nested_transactions = true;
+
+						handler_addr = search_handler(mod, NULL, edata->sqlerrcode, ResourceOwnerStack, &ROP, pcode->htnum, NULL,
+												DInfoStack, &first_area, &DID);
+						if (handler_addr > 0)
+						{
+							sqlstate = edata->sqlerrcode;
+							/* 
+							 * before we jump to handler, we should to set
+							 * a state variables. A addresses of these variables
+							 * are stored in next two instructions - if are used
+							 */
+							set_state_variable(mod, sqlstate, PC + 1, values, nulls);
+							set_state_variable(mod, sqlstate, PC + 2, values, nulls);
+
+							if (keep_diagnostics_info)
+								set_diagnostics(&first_area, edata);
+
+							FreeErrorData(edata);
+
+							/* go to handler */
+							rollback_nested_transactions = false;
+							PC = handler_addr;
+							goto next_op;
+						}
+						else
+						{
+							/* 
+							 * we should to release a allocated resources. The most important
+							 * is correct finishing a nested transactions.
+							 */
+							while (ROP >= 0)
+							{
+								if (rollback_nested_transactions)
+									RollbackAndReleaseCurrentSubTransaction();
+								else
+									ReleaseCurrentSubTransaction();
+
+								CurrentResourceOwner = ResourceOwnerStack[ROP--];
+							}
+
+							ReThrowError(edata);
+						}
+					}
+					PG_END_TRY();
+
+					SPI_freetuptable(SPI_tuptable);
+					SPI_cursor_close(portal);
+					MemoryContextSwitchTo(oldctx);
+
+					goto leave_process;
+				}
+				break;
+
+			case PCODE_INIT_TUPLESTORE:
+				{
+					rsi = (ReturnSetInfo *) fcinfo->resultinfo;
+					tuple_store_cxt = rsi->econtext->ecxt_per_query_memory;
+					tuple_store_owner = CurrentResourceOwner;
+
+					/*
+					 * Check caller can handle a set result in the way we want
+					 */
+					if (!rsi || !IsA(rsi, ReturnSetInfo) ||
+						(rsi->allowedModes & SFRM_Materialize) == 0 ||
+						rsi->expectedDesc == NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("set-valued function called in context that cannot accept a set")));
+				}
+				break;
+
 			default:
 				elog(ERROR, "unknown pcode %d %d", pcode->typ, PC);
 		}
@@ -1950,3 +2205,4 @@ plpsm_exec_error_callback(void *arg)
 	errcontext("%s", ds.data);
 	pfree(ds.data);
 }
+

@@ -2014,6 +2014,22 @@ begin
 end;
 $$ language psm0;
 
+create or replace function test77_1()
+returns table (a int) as $$
+begin
+  return select i
+            from generate_series(1,3) g(i);
+end;
+$$ language psm0;
+
+create or replace function test77_2()
+returns table (a int, b text) as $$
+begin
+  return select i, 'aaaa' || i + 1
+            from generate_series(1,3) g(i);
+end;
+$$ language psm0;
+
 
 
 
@@ -2256,6 +2272,10 @@ begin
   perform assert('test76_2',  6, (select sum(v)::int from unnest(test76_2()) g(v)));
   perform assert('test76_3',  4, (select sum(v)::int from unnest(test76_3()) g(v)));
   perform assert('test76_4', 'Hello', (test76_4())[1]);
+
+  perform assert('test77', 6, (select sum(a)::int from test77()));
+  perform assert('test77_1', 6, (select sum(a)::int from test77_1()));
+  perform assert('test77_2', 'aaaa2,aaaa3,aaaa4', (select string_agg(b,',') from test77_2()));
 
   raise notice '******* All tests are ok *******';
 end;

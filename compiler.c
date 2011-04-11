@@ -120,9 +120,11 @@ typedef struct
 			} datum;
 		} result;
 		char		*return_expr;		/* generated result expression for function with OUT params */
+		TupleDesc	result_desc;
 	} finfo;
 	PreparedStatement *prepared;
 	bool	use_stacked_diagnostics;		/* true when stacked diagnostics is used */
+	bool	allow_return_query;			/* true, when function returns setof tuples */
 } CompileStateData;
 
 #define CURRENT_SCOPE	(cstate->current_scope)
@@ -1354,6 +1356,23 @@ list(Plpsm_pcode_module *m)
 					pfree(ds2.data);
 				}
 				break;
+			case PCODE_RETURN_QUERY:
+				{
+					StringInfoData ds2;
+					int	i;
+					initStringInfo(&ds2);
+					for (i = 0; i < VALUE(expr.nparams); i++)
+					{
+						if (i > 0)
+							appendStringInfoChar(&ds2, ',');
+						appendStringInfo(&ds2,"%d", VALUE(expr.typoids[i]));
+					}
+					
+					appendStringInfo(&ds, "Return Query \"%s\",{%s}, data[%d]", VALUE(expr.expr),ds2.data,
+											VALUE(expr.data));
+					pfree(ds2.data);
+				}
+				break;
 			case PCODE_EXEC_QUERY:
 				{
 					StringInfoData ds2;
@@ -1538,6 +1557,9 @@ list(Plpsm_pcode_module *m)
 				break;
 			case PCODE_SUBSCRIPTS_APPEND:
 				appendStringInfo(&ds, "Subscripts Append");
+				break;
+			case PCODE_INIT_TUPLESTORE:
+				appendStringInfo(&ds, "Tuplestore Init");
 				break;
 			case PCODE_SIGNAL_PROPERTY:
 				{
@@ -3597,7 +3619,86 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 							EMIT_OPCODE(RETURN, stmt->lineno);
 						}
 						else
-							elog(ERROR, "unsupported yet");
+						{
+							int	nargs;
+							Oid	*argtypes;
+							StringInfoData ds;
+							StringInfoData		aliases;
+							StringInfoData 		targets;
+							int	i;
+							bool		isfirst = true;
+
+							if (!cstate->allow_return_query)
+								ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("RETURN SELECT is allowed only for SET returning functions"),
+											parser_errposition(stmt->location)));
+
+							Assert(cstate->finfo.result_desc != NULL);
+
+							initStringInfo(&ds);
+							initStringInfo(&aliases);
+							initStringInfo(&targets);
+
+							for(i = 0; i < cstate->finfo.result_desc->natts; i++)
+							{
+								Form_pg_attribute att;
+
+								if (!isfirst)
+								{
+									appendStringInfoChar(&aliases, ',');
+									appendStringInfoChar(&targets, ',');
+								}
+								else
+									isfirst = false;
+
+								/*
+								 * initialize the attribute fields
+								 */
+								att = cstate->finfo.result_desc->attrs[i];
+								appendStringInfo(&targets, "___rt_%d.___%d::%s", cstate->stack.ndata, i, 
+																format_type_with_typemod(att->atttypid,
+																			 att->atttypmod));
+								appendStringInfo(&aliases, "___%d", i);
+							}
+
+							appendStringInfo(&ds, "SELECT %s FROM (%s) ___rt_%d (%s)",
+														targets.data,
+														stmt->esql->sqlstr, 
+														cstate->stack.ndata,
+														aliases.data);
+
+							/* I don't convert query, because tuple convertor is used */
+							SET_OPVAL(expr.expr, replace_vars(cstate, ds.data, &argtypes, &nargs, NULL, -1));
+							SET_OPVAL(expr.nparams, nargs);
+							SET_OPVAL(expr.typoids, argtypes);
+							SET_OPVAL(expr.data, cstate->stack.ndata++);
+							SET_OPVAL(expr.is_multicol, true);
+
+							pfree(aliases.data);
+							pfree(targets.data);
+
+							/*
+							 * refresh state variables
+							 */
+							if (cstate->stack.has_sqlstate)
+							{
+								Plpsm_object *var = lookup_var(cstate->current_scope, "sqlstate");
+								Assert(var != NULL);
+								SET_OPVALS_DATUM_COPY(target, var);
+								EMIT_OPCODE(SQLSTATE_REFRESH, -1);
+							}
+
+							if (cstate->stack.has_sqlcode)
+							{
+								Plpsm_object *var = lookup_var(cstate->current_scope, "sqlcode");
+								Assert(var != NULL);
+								SET_OPVALS_DATUM_COPY(target, var);
+								EMIT_OPCODE(SQLCODE_REFRESH, -1);
+							}
+
+							EMIT_OPCODE(RETURN_QUERY, stmt->lineno);
+						}
 					}
 					else
 					{
@@ -4172,6 +4273,9 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	ErrorContextCallback	plerrcontext;
 	MemoryContext	func_cxt;
 	Plpsm_pcode_module *m;
+	Oid rettypeid;
+	int		out_nargs = 0;
+	TupleDesc	out_tupdesc = NULL;
 
 	ParserStateData parser_state_var;
 
@@ -4276,6 +4380,13 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 		EMIT_OPCODE(DIAGNOSTICS_INIT, -1);
 	}
 
+	/* initialise a output tuple store */
+	if (procStruct->proretset)
+	{
+		cstated.allow_return_query = true;
+		EMIT_OPCODE(INIT_TUPLESTORE, -1);
+	}
+
 	/* 
 	 * append to scope a variables for parameters, and store 
 	 * instruction for copy from fcinfo
@@ -4286,6 +4397,10 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	cstated.finfo.name = m->name;
 	cstated.finfo.source = proc_source;
 
+	rettypeid = procStruct->prorettype;
+	if (rettypeid == RECORDOID)
+		out_tupdesc = CreateTemplateTupleDesc(numargs, false);
+
 	for (i = 0; i < numargs; i++)
 	{
 		Oid			argtypid = argtypes[i];
@@ -4295,13 +4410,23 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 		Plpsm_object *var;
 		Plpsm_object *alias;
 
+		if (argmode == PROARGMODE_TABLE)
+		{
+			Assert(argnames && argnames[i][0] != '\0');
+			TupleDescInitEntry(out_tupdesc, 1 + out_nargs++, argnames[i],
+										argtypid, 
+											-1, 0);
+			continue;
+		}
+
+		get_typlenbyval(argtypid, &typlen, &typbyval);
+
 		/* Create $n name for variable */
 		snprintf(buf, sizeof(buf), "$%d", i + 1);
 
 		/* append a fake statements for parameter variable */
 		decl_stmt = plpsm_new_stmt(PLPSM_STMT_DECLARE_VARIABLE, -1);
 		decl_stmt->target = new_qualid(list_make1(pstrdup(buf)), -1);
-		get_typlenbyval(argtypid, &typlen, &typbyval);
 
 		decl_stmt->datum.typoid = argtypid;
 		decl_stmt->datum.typmod = -1;
@@ -4339,6 +4464,13 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 			SET_OPVAL(target.offset, var->offset);
 			EMIT_OPCODE(SET_NULL, -1);
 		}
+	}
+
+	if (out_nargs > 0)
+	{
+		Assert(out_tupdesc != 0);
+		out_tupdesc->natts = out_nargs;
+		cstated.finfo.result_desc = out_tupdesc;
 	}
 
 	if (outargs != NULL)
