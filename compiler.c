@@ -4398,8 +4398,6 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	cstated.finfo.source = proc_source;
 
 	rettypeid = procStruct->prorettype;
-	if (rettypeid == RECORDOID)
-		out_tupdesc = CreateTemplateTupleDesc(numargs, false);
 
 	for (i = 0; i < numargs; i++)
 	{
@@ -4413,6 +4411,10 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 		if (argmode == PROARGMODE_TABLE)
 		{
 			Assert(argnames && argnames[i][0] != '\0');
+
+			if (out_tupdesc == NULL)
+				out_tupdesc = CreateTemplateTupleDesc(numargs, false);
+
 			TupleDescInitEntry(out_tupdesc, 1 + out_nargs++, argnames[i],
 										argtypid, 
 											-1, 0);
