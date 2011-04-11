@@ -2006,6 +2006,7 @@ begin
 end;
 $$ language psm0;
 
+-- returns query support
 create or replace function test77()
 returns table (a int, b int) as $$
 begin
