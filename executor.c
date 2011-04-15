@@ -7,6 +7,7 @@
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/prepare.h"
+#include "commands/trigger.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
@@ -383,13 +384,13 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 		Plpsm_pcode *pcode;
 next_op:
 
-/*
+
 
  dinfo->is_signal = true;
  elog(NOTICE, "PC %d  ... sqlstate:%d", PC, sqlstate); 
  dinfo->is_signal = false;
 
-*/
+
 
 		if (PC == 0)
 			elog(ERROR, "invalid memory reference");
@@ -2022,9 +2023,48 @@ next_op:
 					if (!rsi || !IsA(rsi, ReturnSetInfo) ||
 						(rsi->allowedModes & SFRM_Materialize) == 0 ||
 						rsi->expectedDesc == NULL)
-						ereport(ERROR,
+							ereport(ERROR,
 								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 								 errmsg("set-valued function called in context that cannot accept a set")));
+				}
+				break;
+
+			case PCODE_INIT_TRIGGER_VAR:
+				{
+					TriggerData *trigdata;
+					HeapTuple	tuple;
+
+					if (!CALLED_AS_TRIGGER(fcinfo))
+						elog(ERROR, "you cannot to call this function directly");
+
+					trigdata =  (TriggerData *) fcinfo->context;
+
+					if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
+						elog(ERROR, "this triggered isn't fired per row");
+
+					if (pcode->trigger_var.typ == PLPSM_TRIGGER_VARIABLE_NEW)
+					{
+						if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event))
+							elog(ERROR, "cannot use a NEW trigger variable for DELETE event");
+						else if (TRIGGER_FIRED_BY_TRUNCATE(trigdata->tg_event))
+							elog(ERROR, "cannot use a NEW trigger variable for TRUNCATE event");
+
+						tuple = trigdata->tg_newtuple;
+
+						values[pcode->trigger_var.offset] = PointerGetDatum(trigdata->tg_trigtuple);
+						nulls[pcode->trigger_var.offset] = ' ';
+					}
+
+					if (pcode->trigger_var.typ == PLPSM_TRIGGER_VARIABLE_OLD)
+					{
+						if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
+							elog(ERROR, "cannot use a OLD trigger variable for INSERT event");
+						else if (TRIGGER_FIRED_BY_TRUNCATE(trigdata->tg_event))
+							elog(ERROR, "cannot use a OLD trigger variable for TRUNCATE event");
+
+						values[pcode->trigger_var.offset] = PointerGetDatum(trigdata->tg_trigtuple);
+						nulls[pcode->trigger_var.offset] = ' ';
+					}
 				}
 				break;
 
