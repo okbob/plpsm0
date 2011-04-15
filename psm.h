@@ -15,6 +15,8 @@ typedef struct
 	bool has_resignal_stmt;
 	bool has_get_diagnostics_stmt;
 	bool has_get_stacked_diagnostics_stmt;
+	bool has_trigger_variable_new;
+	bool has_trigger_variable_old;
 } ParserStateData;
 
 typedef ParserStateData *ParserState;
@@ -48,6 +50,13 @@ typedef enum
 	PLPSM_VARIABLE = 0,
 	PLPSM_REFERENCE = 1
 } Plpsm_usage_variable_type;
+
+typedef enum
+{
+	PLPSM_LOCAL_VARIABLE = 0,
+	PLPSM_TRIGGER_VARIABLE_NEW = 1,
+	PLPSM_TRIGGER_VARIABLE_OLD = 2
+} Plpsm_scope_variable_type;
 
 typedef enum
 {
@@ -314,7 +323,8 @@ typedef enum
 	PCODE_SUBSCRIPTS_APPEND,
 	PCODE_ARRAY_UPDATE,
 	PCODE_INIT_TUPLESTORE,
-	PCODE_RETURN_QUERY
+	PCODE_RETURN_QUERY,
+	PCODE_INIT_TRIGGER_VAR
 } Plpsm_pcode_type;
 
 typedef enum
@@ -366,6 +376,15 @@ typedef struct
 	{
 		int addr;
 		char *str;
+		struct
+		{
+			Plpsm_scope_variable_type typ;
+			int16	typlen;
+			bool	typbyval;
+			Oid	typoid;
+			int16	typmod;
+			int	offset;
+		} trigger_var;
 		struct 
 		{
 			char *expr;

@@ -2032,27 +2032,20 @@ end;
 $$ language psm0;
 
 
-
-
-
-
-/*
- * example of before trigger
-
 create or replace function trg01()
 returns trigger as $$
 begin
   declare n footab as new;
   declare o footab as old;
-  if n.i <> o.i then
-    -- skip this record
-    signal sqlstate '02099';
+  if n.a <> o.a then
+    return NULL;
   end if;
-  set n.j = o.j;
+  set n.a = o.a;
+  return n;
 end;
 $$ language psm0;
 
-*/
+
 
 /*************************************************
  * Assert functions - sure, it is in plgsql :)

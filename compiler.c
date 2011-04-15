@@ -106,6 +106,13 @@ typedef struct
 	} pdata;
 	struct
 	{
+		int	addr1;				/* address for trigger variable initialisation */
+		int	addr2;				/* address for trigger variable initialisation */
+		Plpsm_object *var_new;			/* ref on NEW variable's object */
+		Plpsm_object *var_old;			/* ref on OLD variable's object */
+	} trigger;
+	struct
+	{
 		int	nargs;
 		char *name;
 		char	*source;
@@ -1419,6 +1426,15 @@ list(Plpsm_pcode_module *m)
 			case PCODE_SAVETO:
 				appendStringInfo(&ds, "SaveTo @%d, size:%d, byval:%s", VALUE(target.offset), VALUE(target.typlen),
 											VALUE(target.typbyval) ? "BYVAL" : "BYREF");
+				break;
+			case PCODE_INIT_TRIGGER_VAR:
+				appendStringInfo(&ds, "InitTriggerVar %s @%d, size:%d, byval:%s oid:%d typmod %d", 
+																VALUE(trigger_var.typ) == PLPSM_TRIGGER_VARIABLE_NEW ? "NEW" : "OLD",
+											VALUE(trigger_var.offset),
+											VALUE(trigger_var.typlen),
+											VALUE(trigger_var.typbyval) ? "BYVAL" : "BYREF",
+											VALUE(trigger_var.typoid), 
+											VALUE(trigger_var.typmod));
 				break;
 			case PCODE_SAVETO_FIELD:
 				appendStringInfo(&ds, "SaveToField #%d @%d, data[%d] size:%d, byval:%s oid:%d typmod %d", VALUE(saveto_field.fnumber), VALUE(saveto_field.offset),
@@ -3152,17 +3168,90 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 
 						var = create_variable_for(stmt, cstate, qualid, NULL, PLPSM_VARIABLE);
 
-						/* 
-						 * every variable must be initialised to NULL, because
-						 * save_to will to try free a not null value.
-						 */
-						SET_OPVAL(target.offset, var->offset);
-						EMIT_OPCODE(SET_NULL, stmt->lineno);
-
-						if (stmt->esql != NULL)
+						if (stmt->option == PLPSM_LOCAL_VARIABLE)
 						{
-							SET_OPVALS_DATUM_COPY(target, var);
-							EMIT_OPCODE(SAVETO, stmt->lineno);
+							/* 
+							 * every variable must be initialised to NULL, because
+							 * save_to will to try free a not null value.
+							 */
+							SET_OPVAL(target.offset, var->offset);
+							EMIT_OPCODE(SET_NULL, stmt->lineno);
+
+							if (stmt->esql != NULL)
+							{
+								SET_OPVALS_DATUM_COPY(target, var);
+								EMIT_OPCODE(SAVETO, stmt->lineno);
+							}
+						}
+						else
+						{
+							Assert(stmt->option == PLPSM_TRIGGER_VARIABLE_OLD || stmt->option == PLPSM_TRIGGER_VARIABLE_NEW);
+
+							/*
+							 * Can be used only in trigger function
+							 */
+							if (cstate->finfo.result.datum.typoid != TRIGGEROID)
+								ereport(ERROR,
+										(errcode(ERRCODE_SYNTAX_ERROR),
+										 errmsg("cannot use a trigger variables outside trigger function"),
+												parser_errposition(stmt->location)));
+
+							if (stmt->option == PLPSM_TRIGGER_VARIABLE_OLD)
+							{
+								if (cstate->trigger.var_old != NULL)
+									ereport(ERROR,
+											(errcode(ERRCODE_SYNTAX_ERROR),
+											 errmsg("trigger variable should be declared only one times in function"),
+													parser_errposition(stmt->location)));
+
+								if (cstate->trigger.var_new != NULL)
+								{
+									if (var->stmt->datum.typoid != cstate->trigger.var_new->stmt->datum.typoid ||
+										var->stmt->datum.typmod != cstate->trigger.var_new->stmt->datum.typmod)
+										ereport(ERROR,
+											(errcode(ERRCODE_SYNTAX_ERROR),
+											 errmsg("OLD and NEW trigger variables should have same type"),
+												parser_errposition(stmt->location)));
+								}
+
+								cstate->trigger.var_old = var;
+								Assert(cstate->trigger.addr2 != 0);
+
+								SET_OPVAL_ADDR(cstate->trigger.addr2, trigger_var.typ, stmt->option);
+								SET_OPVAL_ADDR(cstate->trigger.addr2, trigger_var.offset, var->offset); 
+								SET_OPVAL_ADDR(cstate->trigger.addr2, trigger_var.typlen, var->stmt->datum.typlen); 
+								SET_OPVAL_ADDR(cstate->trigger.addr2, trigger_var.typbyval, var->stmt->datum.typbyval); 
+								SET_OPVAL_ADDR(cstate->trigger.addr2, trigger_var.typoid, var->stmt->datum.typoid); 
+								SET_OPVAL_ADDR(cstate->trigger.addr2, trigger_var.typmod, var->stmt->datum.typmod); 
+							}
+							else
+							{
+								if (cstate->trigger.var_new != NULL)
+									ereport(ERROR,
+											(errcode(ERRCODE_SYNTAX_ERROR),
+											 errmsg("trigger variable should be declared only one times in function"),
+												parser_errposition(stmt->location)));
+
+								if (cstate->trigger.var_old != NULL)
+								{
+									if (var->stmt->datum.typoid != cstate->trigger.var_old->stmt->datum.typoid ||
+										var->stmt->datum.typmod != cstate->trigger.var_old->stmt->datum.typmod)
+										ereport(ERROR,
+											(errcode(ERRCODE_SYNTAX_ERROR),
+											 errmsg("OLD and NEW trigger variables should have same type"),
+												parser_errposition(stmt->location)));
+								}
+
+								cstate->trigger.var_new = var;
+								Assert(cstate->trigger.addr1 != 0);
+
+								SET_OPVAL_ADDR(cstate->trigger.addr2, trigger_var.typ, stmt->option);
+								SET_OPVAL_ADDR(cstate->trigger.addr1, trigger_var.offset, var->offset); 
+								SET_OPVAL_ADDR(cstate->trigger.addr1, trigger_var.typlen, var->stmt->datum.typlen); 
+								SET_OPVAL_ADDR(cstate->trigger.addr1, trigger_var.typbyval, var->stmt->datum.typbyval); 
+								SET_OPVAL_ADDR(cstate->trigger.addr1, trigger_var.typoid, var->stmt->datum.typoid); 
+								SET_OPVAL_ADDR(cstate->trigger.addr1, trigger_var.typmod, var->stmt->datum.typmod); 
+							}
 						}
 					}
 				}
@@ -3608,14 +3697,44 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 
 						if (stmt->option == PLPSM_RETURN_EXPR)
 						{
+							Oid	typoid = cstate->finfo.result.datum.typoid;
+							int16	typmod = -1;
+							int16	typlen = cstate->finfo.result.datum.typlen;
+							bool	typbyval = cstate->finfo.result.datum.typbyval;
+
+							if (cstate->finfo.result.datum.typoid == TRIGGEROID)
+							{
+								/* old or new trigger var should be declared */
+								if (cstate->trigger.var_new != NULL)
+								{
+									typoid = cstate->trigger.var_new->stmt->datum.typoid; 
+									typmod = cstate->trigger.var_new->stmt->datum.typmod; 
+									typlen = -1;
+									typbyval = false;
+								}
+								else if (cstate->trigger.var_old != NULL)
+								{
+									typoid = cstate->trigger.var_old->stmt->datum.typoid; 
+									typmod = cstate->trigger.var_old->stmt->datum.typmod; 
+									typlen = -1;
+									typbyval = false;
+								}
+								else
+									ereport(ERROR,
+											(errcode(ERRCODE_SYNTAX_ERROR),
+											 errmsg("target type of this trigger function isn't known yet"),
+											 errhint("Declare OLD or NEW trigger variables."),
+													parser_errposition(stmt->location)));
+							}
+						
 							if (stmt->esql != NULL)
-								compile_expr(cstate, stmt->esql, NULL, cstate->finfo.result.datum.typoid, -1, false);
+								compile_expr(cstate, stmt->esql, NULL, typoid, typmod, false);
 							else
 								compile_expr(cstate, NULL, cstate->finfo.return_expr,
-												cstate->finfo.result.datum.typoid, -1, false);
+												typoid, typmod, false);
 
-							SET_OPVAL(target.typlen, cstate->finfo.result.datum.typlen);
-							SET_OPVAL(target.typbyval, cstate->finfo.result.datum.typbyval);
+							SET_OPVAL(target.typlen, typlen);
+							SET_OPVAL(target.typbyval, typbyval);
 							EMIT_OPCODE(RETURN, stmt->lineno);
 						}
 						else
@@ -4323,6 +4442,8 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	parser_state_var.has_get_diagnostics_stmt = false;
 	parser_state_var.has_get_stacked_diagnostics_stmt = false;
 	parser_state_var.has_resignal_stmt = false;
+	parser_state_var.has_trigger_variable_new = false;
+	parser_state_var.has_trigger_variable_old = false;
 	pstate = &parser_state_var;
 
 	plerrcontext.callback = plpsm_compile_error_callback;
@@ -4345,6 +4466,7 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	cstated.top_scope = outer_scope;
 	cstated.top_scope->name = outer_scope->name;
 	cstated.current_scope = cstated.top_scope;
+
 	cstated.stack.ndata = 0;
 	cstated.stack.ht_entry = 0;
 	cstated.stack.ndatums = 0;
@@ -4354,6 +4476,12 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	cstated.stack.has_sqlcode = false;
 	cstated.stack.has_notfound_continue_handler = false;
 	cstated.stack.inside_handler = false;
+
+	cstated.trigger.addr1 = 0;
+	cstated.trigger.addr2 = 0;
+	cstated.trigger.var_new = NULL;
+	cstated.trigger.var_old = NULL;
+
 	cstated.prepared = NULL;
 	cstated.ht_table = NULL;
 	cstated.use_stacked_diagnostics = false;
@@ -4398,6 +4526,18 @@ compile(FunctionCallInfo fcinfo, HeapTuple procTup, Plpsm_module *module, Plpsm_
 	cstated.finfo.source = proc_source;
 
 	rettypeid = procStruct->prorettype;
+
+	if (parser_state_var.has_trigger_variable_new)
+	{
+		cstated.trigger.addr1 = PC(m);
+		EMIT_OPCODE(INIT_TRIGGER_VAR, -1);
+	}
+
+	if (parser_state_var.has_trigger_variable_old)
+	{
+		cstated.trigger.addr2 = PC(m);
+		EMIT_OPCODE(INIT_TRIGGER_VAR, -1);
+	}
 
 	for (i = 0; i < numargs; i++)
 	{

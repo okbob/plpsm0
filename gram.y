@@ -169,8 +169,10 @@ extern ParserState pstate;
 %token <keyword>	LEAVE
 %token <keyword>	LOOP
 %token <keyword>	MESSAGE_TEXT
+%token <keyword>	NEW
 %token <keyword>	NO
 %token <keyword>	NOT
+%token <keyword>	OLD
 %token <keyword>	OPEN
 %token <keyword>	PREPARE
 %token <keyword>	PRINT
@@ -1594,10 +1596,11 @@ declare_prefetch(void)
 			 * because it raise a error to late. Datatype must not contains
 			 * a keywords, special chars etc
 			 */
-			datatype = read_embeded_sql(';', DEFAULT, -1, "; or \"DEFAULT\"", PLPSM_ESQL_DATATYPE, false, &endtok, 
+			datatype = read_embeded_sql(';', DEFAULT, AS, "; or \"DEFAULT\" or \"AS\"", PLPSM_ESQL_DATATYPE, false, &endtok, 
 															    startlocation,
 																&typoid,
 																&typmod);
+
 			get_typlenbyval(typoid, &typlen, &typbyval);
 
 			result->datum.typoid = typoid;
@@ -1607,11 +1610,40 @@ declare_prefetch(void)
 			result->datum.typbyval = typbyval;
 
 			if (endtok == ';')
+			{
+				result->option = PLPSM_LOCAL_VARIABLE;
 				break;
+			}
+			else if (endtok == DEFAULT)
+			{
+				/* when DEFAULT value is specified, then read a expression until semicolon */
+				result->option = PLPSM_LOCAL_VARIABLE;
+				result->esql = read_expr_until_semi();
+				break;
+			}
+			else if (endtok == AS)
+			{
+				/* only one variable is allowed with trigger variable mark */
+				if (list_length(varnames) != 1)
+					yyerror("cannot use trigger variable mark for more than one variable");
 
-			/* when DEFAULT value is specified, then read a expression until semicolon */
-			result->esql = read_expr_until_semi();
-			break;
+				/* next token should be OLD or NEW */
+				tok = yylex();
+				if (tok == OLD)
+				{
+					result->option = PLPSM_TRIGGER_VARIABLE_OLD;
+					pstate->has_trigger_variable_old = true;
+					break;
+				}
+				else if (tok == NEW)
+				{
+					result->option = PLPSM_TRIGGER_VARIABLE_NEW;
+					pstate->has_trigger_variable_new = true;
+					break;
+				}
+				else
+					yyerror("expected \"OLD\" or \"NEW\"");
+			}
 		}
 
 		if (state == EXPECTED_CURSOR)
@@ -1621,7 +1653,7 @@ declare_prefetch(void)
 			Assert(tok == CURSOR);
 
 			result->typ = PLPSM_STMT_DECLARE_CURSOR;
-			
+
 			result->target = linitial(varnames);
 			result->option = option;
 
@@ -1823,8 +1855,10 @@ is_unreserved_keyword(int tok)
 		case HINT_TEXT:
 		case IMMEDIATE:
 		case MESSAGE_TEXT:
+		case NEW:
 		case NO:
 		case NOT:
+		case OLD:
 		case RETURNED_SQLCODE:
 		case RETURNED_SQLSTATE:
 		case ROW_COUNT:
