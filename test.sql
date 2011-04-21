@@ -2037,10 +2037,8 @@ returns trigger as $$
 begin
   declare n footab as new;
   declare o footab as old;
-  if n.a <> o.a then
-    return NULL;
-  end if;
-  set n.a = o.a;
+  set n.a = n.a - o.a;
+  print o.a, n.a;
   return n;
 end;
 $$ language psm0;
@@ -2270,6 +2268,16 @@ begin
   perform assert('test77', 6, (select sum(a)::int from test77()));
   perform assert('test77_1', 6, (select sum(a)::int from test77_1()));
   perform assert('test77_2', 'aaaa2,aaaa3,aaaa4', (select string_agg(b,',') from test77_2()));
+  
+create trigger xxx_trg 
+   BEFORE UPDATE 
+   ON footab
+  FOR EACH ROW 
+   EXECUTE PROCEDURE trg01();
+
+  update footab set a = 5;
+
+  perform assert('trigger_01', 10, (select sum(a)::int from footab));
 
   raise notice '******* All tests are ok *******';
 end;

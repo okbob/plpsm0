@@ -3245,7 +3245,7 @@ _compile(CompileState cstate, Plpsm_stmt *stmt, Plpsm_object *parent)
 								cstate->trigger.var_new = var;
 								Assert(cstate->trigger.addr1 != 0);
 
-								SET_OPVAL_ADDR(cstate->trigger.addr2, trigger_var.typ, stmt->option);
+								SET_OPVAL_ADDR(cstate->trigger.addr1, trigger_var.typ, stmt->option);
 								SET_OPVAL_ADDR(cstate->trigger.addr1, trigger_var.offset, var->offset); 
 								SET_OPVAL_ADDR(cstate->trigger.addr1, trigger_var.typlen, var->stmt->datum.typlen); 
 								SET_OPVAL_ADDR(cstate->trigger.addr1, trigger_var.typbyval, var->stmt->datum.typbyval); 

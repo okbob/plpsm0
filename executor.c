@@ -384,13 +384,13 @@ execute_module(Plpsm_module *mod, FunctionCallInfo fcinfo, DebugInfo dinfo)
 		Plpsm_pcode *pcode;
 next_op:
 
-
+/*
 
  dinfo->is_signal = true;
  elog(NOTICE, "PC %d  ... sqlstate:%d", PC, sqlstate); 
  dinfo->is_signal = false;
 
-
+*/
 
 		if (PC == 0)
 			elog(ERROR, "invalid memory reference");
@@ -1129,7 +1129,7 @@ next_op:
 							newtup = heap_form_tuple(tupdesc, _values, _nulls);
 						}
 
-						result = (HeapTupleHeader) palloc(newtup->t_len);
+						result = (HeapTupleHeader) palloc0(newtup->t_len);
 						memcpy(result, newtup->t_data, newtup->t_len);
 						heap_freetuple(newtup);
 
@@ -2032,7 +2032,9 @@ next_op:
 			case PCODE_INIT_TRIGGER_VAR:
 				{
 					TriggerData *trigdata;
-					HeapTuple	tuple;
+					HeapTupleData		tuple;
+					HeapTupleHeader tuphead;
+					TupleDesc tupdesc;
 
 					if (!CALLED_AS_TRIGGER(fcinfo))
 						elog(ERROR, "you cannot to call this function directly");
@@ -2042,6 +2044,13 @@ next_op:
 					if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
 						elog(ERROR, "this triggered isn't fired per row");
 
+					tupdesc = trigdata->tg_relation->rd_att;
+
+					if (pcode->trigger_var.typoid != tupdesc->tdtypeid)
+						ereport(ERROR,
+								(errcode(ERRCODE_DATATYPE_MISMATCH),
+								 errmsg("trigger variable and trigger relations has different type")));
+
 					if (pcode->trigger_var.typ == PLPSM_TRIGGER_VARIABLE_NEW)
 					{
 						if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event))
@@ -2049,9 +2058,16 @@ next_op:
 						else if (TRIGGER_FIRED_BY_TRUNCATE(trigdata->tg_event))
 							elog(ERROR, "cannot use a NEW trigger variable for TRUNCATE event");
 
-						tuple = trigdata->tg_newtuple;
+						heap_copytuple_with_tuple(trigdata->tg_newtuple, &tuple);
 
-						values[pcode->trigger_var.offset] = PointerGetDatum(trigdata->tg_trigtuple);
+						tuphead = (HeapTupleHeader) SPI_palloc(tuple.t_len);
+						memcpy((char *) tuphead, (char *) tuple.t_data, tuple.t_len);
+
+						HeapTupleHeaderSetDatumLength(tuphead, tuple.t_len);
+						HeapTupleHeaderSetTypeId(tuphead, tupdesc->tdtypeid);
+						HeapTupleHeaderSetTypMod(tuphead, tupdesc->tdtypmod);
+
+						values[pcode->trigger_var.offset] = PointerGetDatum(tuphead);
 						nulls[pcode->trigger_var.offset] = ' ';
 					}
 
@@ -2062,7 +2078,16 @@ next_op:
 						else if (TRIGGER_FIRED_BY_TRUNCATE(trigdata->tg_event))
 							elog(ERROR, "cannot use a OLD trigger variable for TRUNCATE event");
 
-						values[pcode->trigger_var.offset] = PointerGetDatum(trigdata->tg_trigtuple);
+						heap_copytuple_with_tuple(trigdata->tg_trigtuple, &tuple);
+
+						tuphead = (HeapTupleHeader) SPI_palloc(tuple.t_len);
+						memcpy((char *) tuphead, (char *) tuple.t_data, tuple.t_len);
+
+						HeapTupleHeaderSetDatumLength(tuphead, tuple.t_len);
+						HeapTupleHeaderSetTypeId(tuphead, tupdesc->tdtypeid);
+						HeapTupleHeaderSetTypMod(tuphead, tupdesc->tdtypmod);
+
+						values[pcode->trigger_var.offset] = PointerGetDatum(tuphead);
 						nulls[pcode->trigger_var.offset] = ' ';
 					}
 				}
@@ -2116,6 +2141,30 @@ plpsm_func_execute(Plpsm_module *mod, FunctionCallInfo fcinfo)
 	error_context_stack = &plerrcontext;
 
 	result = execute_module(mod, fcinfo, &dinfo);
+	if (CALLED_AS_TRIGGER(fcinfo))
+	{
+		/* process a result */
+		if (fcinfo->isnull)
+		{
+			fcinfo->isnull = false;
+			result = (Datum) 0;
+		}
+		else
+		{
+			HeapTupleData		tuple;
+			HeapTupleHeader		td;
+
+			td = DatumGetHeapTupleHeader(result);
+
+			/* Build a temporary HeapTuple control structure */
+			tuple.t_len = HeapTupleHeaderGetDatumLength(td);
+			ItemPointerSetInvalid(&(tuple.t_self));
+			tuple.t_tableOid = InvalidOid;
+			tuple.t_data = td;
+
+			result = PointerGetDatum(SPI_copytuple(&tuple));
+		}
+	}
 
 	error_context_stack = plerrcontext.previous;
 
