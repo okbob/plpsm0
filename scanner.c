@@ -1,18 +1,22 @@
-/*-------------------------------------------------------------------------
+/*
+ * Copyright (c) 2011 CZ.NIC, z. s. p. o.
+ * All rights reserved.
  *
- * scanner.c
- *	  lexical scanning for PSM0
+ * Redistribution and use in source and binary forms are permitted
+ * provided that the above copyright notice and this paragraph are
+ * duplicated in all such forms and that any documentation,
+ * advertising materials, and other materials related to such
+ * distribution and use acknowledge that the software was developed
+ * by the CZ.NIC, z. s. p. o.. The name of the CZ.NIC, z. s. p. o.
+ * organization may not be used to endorse or promote products derived
+ * from this software without specific prior written permission.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
- * Portions Copyright (c) 1994, Regents of the University of California
- *
- *
- * IDENTIFICATION
- *	  src/pl/plpsm/src/pl_scanner.c
- *
- *-------------------------------------------------------------------------
  */
+
 #include "psm.h"
 
 #include "mb/pg_wchar.h"

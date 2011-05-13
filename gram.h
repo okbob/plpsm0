@@ -129,7 +129,7 @@ typedef union YYSTYPE
 {
 
 /* Line 1685 of yacc.c  */
-#line 73 "gram.y"
+#line 92 "gram.y"
 
 		core_YYSTYPE		core_yystype;
 		/* these fields must match core_YYSTYPE */
